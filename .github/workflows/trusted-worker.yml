@@ -1,0 +1,44 @@
+name: Trusted Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run reproduction checks without posting trusted-pass"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      limit:
+        description: "Maximum pending submissions to process"
+        required: false
+        default: "1"
+
+concurrency:
+  group: trusted-worker-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  trusted-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ECDLP_API_URL: ${{ secrets.ECDLP_API_URL }}
+      ECDLP_TRUSTED_WORKER_TOKEN: ${{ secrets.ECDLP_TRUSTED_WORKER_TOKEN }}
+      ECDLP_WORKER_LIMIT: ${{ github.event.inputs.limit }}
+      ECDLP_WORKER_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
+      - name: Reproduce pending point-add submission
+        run: node tools/trusted-worker.mjs
