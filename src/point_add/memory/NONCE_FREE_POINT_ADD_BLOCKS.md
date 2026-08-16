@@ -8,7 +8,7 @@ the reversible arithmetic stream.
 Both inverse applications use the conservative Kaliski bound
 `2N - 1 = 511` for `N = 256`. This correctness-first schedule avoids the
 truncated-walk failures seen in shorter experimental schedules under the
-9,024-shot court.
+102,400-shot court.
 
 ## Circuit blocks
 
@@ -34,7 +34,7 @@ from the trusted evaluator.
 
 | Metric | Value |
 | --- | ---: |
-| Shots | 9,024/9,024 |
+| Shots | 102,400/102,400 |
 | Classical mismatches | 0 |
 | Phase-garbage batches | 0 |
 | Ancilla-garbage batches | 0 |
@@ -43,6 +43,8 @@ from the trusted evaluator.
 | Emitted operations | 40,922,100 |
 | Score | 14,718,613,026 |
 | `ops.bin` SHA-256 | `962f5c2c1e7a8f3fe4c65230af910e638870d914c50452ef71c7fa197e9e51a5` |
+| Evaluation layout | 100 waves × 16 workers × 64 bit-sliced shots |
+| Measured wall time | 4m 11.70s on Apple M1 |
 
 This result was produced by the unchanged native `benchmark.sh` contract. The
 server must reproduce it before promotion.

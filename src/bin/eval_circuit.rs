@@ -42,7 +42,9 @@ const OP_BYTES: usize = OP_FIELDS * FIELD_BYTES;
 // Real circuits sit ~3k qubits and a few hundred million ops; caps are
 // generous compared to that.
 const MAX_OPS: u64 = 4_000_000_000;
-const NUM_TESTS: usize = 9024;
+const NUM_TESTS: usize = 100 * 1_024;
+const SHOTS_PER_BATCH: usize = 64;
+const DEFAULT_EVAL_WORKERS: usize = 16;
 
 // ─── Bounded ops.bin loader ────────────────────────────────────────────────
 //
@@ -198,12 +200,13 @@ fn secp256k1() -> WeierstrassEllipticCurve {
 
 // ─── Fiat-Shamir seed ──────────────────────────────────────────────────────
 //
-// SHAKE256 over the op stream. Determines test inputs, simulator RNG for
-// R/Hmr phase randomization, etc.
+// SHAKE256 commitment over the op stream. Separate derived domains determine
+// test inputs and each batch's simulator RNG, so parallel scheduling cannot
+// change the validation cases or R/Hmr phase randomization.
 
-fn fiat_shamir_seed(ops: &[Op]) -> sha3::Shake256Reader {
+fn fiat_shamir_commitment(ops: &[Op]) -> [u8; 32] {
     let mut hasher = Shake256::default();
-    hasher.update(b"quantum_ecc-fiat-shamir-v2");
+    hasher.update(b"quantum_ecc-fiat-shamir-parallel-v3");
     hasher.update(&(ops.len() as u64).to_le_bytes());
     for op in ops {
         hasher.update(&[op.kind as u8]);
@@ -214,6 +217,24 @@ fn fiat_shamir_seed(ops: &[Op]) -> sha3::Shake256Reader {
         hasher.update(&op.c_condition.0.to_le_bytes());
         hasher.update(&op.r_target.0.to_le_bytes());
     }
+    let mut xof = hasher.finalize_xof();
+    let mut commitment = [0u8; 32];
+    XofReader::read(&mut xof, &mut commitment);
+    commitment
+}
+
+fn input_xof(commitment: &[u8; 32]) -> sha3::Shake256Reader {
+    let mut hasher = Shake256::default();
+    hasher.update(b"quantum_ecc-fiat-shamir-parallel-inputs-v3");
+    hasher.update(commitment);
+    hasher.finalize_xof()
+}
+
+fn batch_xof(commitment: &[u8; 32], batch: usize) -> sha3::Shake256Reader {
+    let mut hasher = Shake256::default();
+    hasher.update(b"quantum_ecc-fiat-shamir-parallel-batch-v3");
+    hasher.update(commitment);
+    hasher.update(&(batch as u64).to_le_bytes());
     hasher.finalize_xof()
 }
 
@@ -232,20 +253,156 @@ struct SeedReport {
     fail_reason: Option<String>,
 }
 
+fn empty_report() -> SeedReport {
+    SeedReport {
+        ok: true,
+        avg_cliff: 0.0,
+        avg_tof: 0.0,
+        tot_tof: 0,
+        tot_cliff: 0,
+        n_shots: 0,
+        classical_failures: 0,
+        phase_garbage_batches: 0,
+        ancilla_garbage_batches: 0,
+        fail_reason: None,
+    }
+}
+
+fn finalize_report(mut report: SeedReport) -> SeedReport {
+    let denom = report.n_shots.max(1) as f64;
+    report.avg_cliff = report.tot_cliff as f64 / denom;
+    report.avg_tof = report.tot_tof as f64 / denom;
+    report
+}
+
+fn merge_reports(reports: Vec<SeedReport>) -> SeedReport {
+    let mut merged = empty_report();
+    for report in reports {
+        merged.ok &= report.ok;
+        merged.tot_tof += report.tot_tof;
+        merged.tot_cliff += report.tot_cliff;
+        merged.n_shots += report.n_shots;
+        merged.classical_failures += report.classical_failures;
+        merged.phase_garbage_batches += report.phase_garbage_batches;
+        merged.ancilla_garbage_batches += report.ancilla_garbage_batches;
+        if merged.fail_reason.is_none() {
+            merged.fail_reason = report.fail_reason;
+        }
+    }
+    finalize_report(merged)
+}
+
+fn requested_eval_workers(num_batches: usize) -> usize {
+    std::env::var("ECDLP_EVAL_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_EVAL_WORKERS)
+        .min(num_batches.max(1))
+}
+
+fn run_test_batch(
+    ops: &[Op],
+    layout_regs: &[Vec<QubitOrBit>],
+    total_qubits: u64,
+    num_bits: u64,
+    targets: &[(U256, U256)],
+    offsets: &[(U256, U256)],
+    expected: &[(U256, U256)],
+    commitment: &[u8; 32],
+    batch: usize,
+) -> SeedReport {
+    let start = batch * SHOTS_PER_BATCH;
+    let bs = SHOTS_PER_BATCH.min(targets.len() - start);
+    let cond_mask = if bs == SHOTS_PER_BATCH {
+        u64::MAX
+    } else {
+        (1u64 << bs) - 1
+    };
+
+    let mut xof = batch_xof(commitment, batch);
+    let mut sim = Simulator::new(total_qubits as usize, num_bits as usize, &mut xof);
+    let mut report = empty_report();
+    report.n_shots = bs;
+
+    for shot in 0..bs {
+        let i = start + shot;
+        sim.set_register(&layout_regs[0], targets[i].0, shot);
+        sim.set_register(&layout_regs[1], targets[i].1, shot);
+        sim.set_register(&layout_regs[2], offsets[i].0, shot);
+        sim.set_register(&layout_regs[3], offsets[i].1, shot);
+    }
+
+    sim.apply_iter_masked(ops.iter(), cond_mask);
+
+    for shot in 0..bs {
+        let i = start + shot;
+        let gx = sim.get_register(&layout_regs[0], shot);
+        let gy = sim.get_register(&layout_regs[1], shot);
+        if gx != expected[i].0 || gy != expected[i].1 {
+            report.classical_failures += 1;
+            if report.fail_reason.is_none() {
+                report.fail_reason = Some(format!(
+                    "CLASSICAL MISMATCH shot {i}: got ({:#x},{:#x}) exp ({:#x},{:#x})",
+                    gx, gy, expected[i].0, expected[i].1
+                ));
+            }
+            report.ok = false;
+        }
+    }
+
+    let phase = sim.phase & cond_mask;
+    if phase != 0 {
+        report.phase_garbage_batches += 1;
+        if report.fail_reason.is_none() {
+            report.fail_reason = Some(format!(
+                "PHASE GARBAGE: global_phase = {phase:#018x} across {bs} live shots (must be 0)"
+            ));
+        }
+        report.ok = false;
+    }
+
+    for register in layout_regs {
+        for qb in register {
+            if let QubitOrBit::Qubit(q) = *qb {
+                *sim.qubit_mut(q) = 0;
+            }
+        }
+    }
+    for q in 0..total_qubits {
+        let value = sim.qubit(QubitId(q)) & cond_mask;
+        if value != 0 {
+            report.ancilla_garbage_batches += 1;
+            if report.fail_reason.is_none() {
+                report.fail_reason = Some(format!(
+                    "ANCILLA GARBAGE: qubit {q} = {value:#018x} (live shots); every non-register qubit must be |0>"
+                ));
+            }
+            report.ok = false;
+            break;
+        }
+    }
+
+    report.tot_tof = sim.stats.toffoli_gates;
+    report.tot_cliff = sim.stats.clifford_gates;
+    finalize_report(report)
+}
+
 fn run_tests(
     ops: &[Op],
     layout_regs: &[Vec<QubitOrBit>],
     total_qubits: u64,
     num_bits: u64,
-    mut xof: sha3::Shake256Reader,
+    commitment: [u8; 32],
     target_shots: usize,
 ) -> SeedReport {
     let curve = secp256k1();
+    let mut xof = input_xof(&commitment);
 
     let mut targets = Vec::with_capacity(target_shots);
     let mut offsets = Vec::with_capacity(target_shots);
     let mut expected = Vec::with_capacity(target_shots);
-    for _ in 0..target_shots {
+    while targets.len() < target_shots {
         let mut rb = [[0u8; 32]; 2];
         // Disambiguate from std::io::Read (in scope for the zstd loader).
         XofReader::read(&mut xof, &mut rb[0]);
@@ -269,104 +426,43 @@ fn run_tests(
         expected.push(e);
     }
     let n = targets.len();
+    let num_batches = n.div_ceil(SHOTS_PER_BATCH);
+    let workers = requested_eval_workers(num_batches);
+    println!("  eval workers            : {workers}");
+    println!("  shots per worker batch  : {SHOTS_PER_BATCH}");
 
-    let mut sim = Simulator::new(total_qubits as usize, num_bits as usize, &mut xof);
-    let mut ok = true;
-    let mut fail_reason: Option<String> = None;
-    let mut classical_failures = 0usize;
-    let mut phase_garbage_batches = 0usize;
-    let mut ancilla_garbage_batches = 0usize;
-
-    const BATCH: usize = 64;
-    let num_batches = (n + BATCH - 1) / BATCH;
-    for batch in 0..num_batches {
-        let bs = BATCH.min(n - batch * BATCH);
-        let cond_mask: u64 = if bs == 64 { u64::MAX } else { (1u64 << bs) - 1 };
-
-        sim.clear_for_shot();
-        for shot in 0..bs {
-            let i = batch * BATCH + shot;
-            sim.set_register(&layout_regs[0], targets[i].0, shot);
-            sim.set_register(&layout_regs[1], targets[i].1, shot);
-            sim.set_register(&layout_regs[2], offsets[i].0, shot);
-            sim.set_register(&layout_regs[3], offsets[i].1, shot);
-        }
-
-        sim.apply_iter(ops.iter());
-
-        for shot in 0..bs {
-            let i = batch * BATCH + shot;
-            let gx = sim.get_register(&layout_regs[0], shot);
-            let gy = sim.get_register(&layout_regs[1], shot);
-            if gx != expected[i].0 || gy != expected[i].1 {
-                classical_failures += 1;
-                if fail_reason.is_none() {
-                    fail_reason = Some(format!(
-                        "CLASSICAL MISMATCH shot {i}: got ({:#x},{:#x}) exp ({:#x},{:#x})",
-                        gx, gy, expected[i].0, expected[i].1
+    let reports = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let commitment = &commitment;
+            let targets = &targets;
+            let offsets = &offsets;
+            let expected = &expected;
+            handles.push(scope.spawn(move || {
+                let mut reports = Vec::new();
+                for batch in (worker..num_batches).step_by(workers) {
+                    reports.push(run_test_batch(
+                        ops,
+                        layout_regs,
+                        total_qubits,
+                        num_bits,
+                        targets,
+                        offsets,
+                        expected,
+                        commitment,
+                        batch,
                     ));
                 }
-                ok = false;
-            }
+                reports
+            }));
         }
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("eval worker panicked"))
+            .collect::<Vec<_>>()
+    });
 
-        let phase = sim.phase & cond_mask;
-        if phase != 0 {
-            phase_garbage_batches += 1;
-            let msg = format!(
-                "PHASE GARBAGE: global_phase = {:#018x} across {} live shots (must be 0)",
-                phase, bs
-            );
-            if fail_reason.is_none() {
-                fail_reason = Some(msg);
-            }
-            ok = false;
-        }
-
-        for register in layout_regs {
-            for qb in register {
-                if let QubitOrBit::Qubit(q) = *qb {
-                    *sim.qubit_mut(q) = 0;
-                }
-            }
-        }
-        let mut garbage_q: Option<u64> = None;
-        for q in 0..total_qubits {
-            let v = sim.qubit(QubitId(q)) & cond_mask;
-            if v != 0 {
-                garbage_q = Some(q);
-                break;
-            }
-        }
-        if let Some(q) = garbage_q {
-            ancilla_garbage_batches += 1;
-            let v = sim.qubit(QubitId(q)) & cond_mask;
-            let msg = format!(
-                "ANCILLA GARBAGE: qubit {} = {:#018x} (live shots) at end of forward; \
-                 every non-register qubit must be |0⟩ on every live shot",
-                q, v
-            );
-            if fail_reason.is_none() {
-                fail_reason = Some(msg);
-            }
-            ok = false;
-        }
-    }
-
-    let _ = num_bits;
-    let denom = n.max(1) as f64;
-    SeedReport {
-        ok,
-        avg_cliff: sim.stats.clifford_gates as f64 / denom,
-        avg_tof: sim.stats.toffoli_gates as f64 / denom,
-        tot_tof: sim.stats.toffoli_gates,
-        tot_cliff: sim.stats.clifford_gates,
-        n_shots: n,
-        classical_failures,
-        phase_garbage_batches,
-        ancilla_garbage_batches,
-        fail_reason,
-    }
+    merge_reports(reports)
 }
 
 // ─── Output bookkeeping ────────────────────────────────────────────────────
@@ -511,8 +607,8 @@ fn main() {
     println!("  bits        : {}", num_bits);
 
     println!("\n-- correctness tests ({} shots) --", NUM_TESTS);
-    let xof = fiat_shamir_seed(&ops);
-    let r = run_tests(&ops, &regs, total_qubits, num_bits, xof, NUM_TESTS);
+    let commitment = fiat_shamir_commitment(&ops);
+    let r = run_tests(&ops, &regs, total_qubits, num_bits, commitment, NUM_TESTS);
     println!("  tested shots            : {}", r.n_shots);
     println!("  classical mismatches    : {}", r.classical_failures);
     println!("  phase-garbage batches   : {}", r.phase_garbage_batches);

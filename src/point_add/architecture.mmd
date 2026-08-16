@@ -28,12 +28,12 @@ flowchart TD
   Baseline --> Metrics["Trusted baseline: 2841 qubits, 5180786 average Toffoli, score 14718613026"]
   NonceFree --> FiatShamir["SHAKE256 test inputs derive only from the arithmetic stream"]
   Arithmetic --> Karatsuba["Karatsuba multiplication between inverse pairs; schoolbook multiply/apply inside pairs"]
-  Frontier --> Evidence["Only a complete trusted 9024-shot pass establishes a valid improvement"]
+  Frontier --> Evidence["Only a complete trusted 102400-shot pass establishes a valid improvement"]
 
   Result --> Validation["Trusted validation"]
   Metrics --> Validation
   FiatShamir --> Validation
   Karatsuba --> Validation
   Evidence --> Validation
-  Validation --> Checks["9024 shots: classical correctness, reversibility, phase cleanliness, and workspace cleanup"]
+  Validation --> Checks["102400 shots in 100 x 1024-shot waves: classical correctness, reversibility, phase cleanliness, and workspace cleanup"]
   Validation --> Commitments["Package commitments: ops.bin hash plus architecture.mmd hash"]

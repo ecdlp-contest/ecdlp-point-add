@@ -13,8 +13,8 @@ const DEFAULT_API = "https://ecdlp.ai";
 const MAX_NOTE_BYTES = 10 * 1024;
 const MAX_ARCHIVE_BYTES = 25 * 1024 * 1024;
 const MAX_ARCHITECTURE_BYTES = 1024 * 1024;
-const DEFAULT_EVAL_THREADS = "8";
-const REQUIRED_SHOTS = 9024;
+const DEFAULT_EVAL_THREADS = "16";
+const REQUIRED_SHOTS = 102400;
 const SCORE_MODEL = "primitive-ccx-ccz-v1";
 const REQUIRED_ARTIFACT = "ops.bin";
 const ARCHITECTURE_TARGET_LABEL = "Target primitive: quantum P plus classical Q on secp256k1";
@@ -150,7 +150,7 @@ const SCALAR_STRATEGY_BANNED_PATTERNS = [
 const TRACKS = {
   "ecadd-challenge-test": {
     trackId: "point-add-secp256k1-v1",
-    gate: "fiat_shamir_ecdsafail_point_add_v2",
+    gate: "fiat_shamir_ecdsafail_point_add_parallel_v3",
     editablePaths: ["src/point_add"],
     requiredChecks: ["classical correctness", "reversibility", "phase cleanliness", "forward-reverse identity"],
     defaultNoteFile: "src/point_add/SUBMISSION.md",
@@ -231,7 +231,7 @@ Local loop:
 
 Submission rule:
   A valid submission must beat the current best score, preserve the documented
-  native ECDSA Fail point-add ABI, pass all 9024 trusted shots, include the
+  native ECDSA Fail point-add ABI, pass all 102400 trusted shots, include the
   required Mermaid architecture network, and explain the algorithm and
   optimization choices in the note.
 
@@ -262,12 +262,12 @@ Usage:
   ./ecdlp.js preflight [--manifest benchmark.json]
 
 Checks the native ECDSA Fail manifest, editable-path boundary, and architecture
-diagram without building ops.bin and without running the 9024-shot trusted
+diagram without building ops.bin and without running the 102400-shot trusted
 evaluator.
 
 Use this for cheap local and pull-request validation. It is not a submission
 validator; submission candidates still need ecdlp run, ecdlp package, and ecdlp
-validate after the trusted evaluator passes all 9024 Fiat-Shamir shots.`,
+validate after the trusted evaluator passes all 102400 Fiat-Shamir shots.`,
 
   run: `ecdlp run
 
@@ -281,7 +281,9 @@ Runs benchmark.json benchmarkCommand. The trusted evaluator writes:
   results.tsv
 
 Use this after modifying src/point_add/ or its notes. A valid run must pass all
-9024 Fiat-Shamir shots and produce the native ECDSA Fail score.json.
+102400 Fiat-Shamir shots and produce the native ECDSA Fail score.json.
+The evaluator defaults to ECDLP_EVAL_THREADS=${DEFAULT_EVAL_THREADS}; set that
+environment variable to a positive worker count to tune local parallelism.
 
 This command is local and does not require an API key.`,
 
@@ -851,7 +853,7 @@ function packageSubmission(args) {
   if (noteBytes > MAX_NOTE_BYTES) throw new Error(`submission note must be at most ${MAX_NOTE_BYTES} bytes (${noteBytes} bytes provided)`);
 
   if (!fs.existsSync(path.resolve(manifest.scorePath))) {
-    throw new Error("score.json is missing; the native evaluator writes it only after a complete 9024-shot pass");
+    throw new Error("score.json is missing; the native evaluator writes it only after a complete 102400-shot pass");
   }
   const score = readJson(manifest.scorePath);
   for (const metricName of ["toffoli", "qubits"]) {

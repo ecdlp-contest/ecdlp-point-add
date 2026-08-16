@@ -46,7 +46,7 @@ Score model: $($metadata.scoreModel)
 Toffoli: $($score.metrics.toffoli)
 Qubits: $($score.metrics.qubits)
 Artifact: $($metadata.artifact)
-Validation: 9024 native ECDSA Fail Fiat-Shamir point-add shots
+Validation: 102400 deterministic parallel Fiat-Shamir point-add shots
 Model: $Model
 
 Co-authored-by: $SubmitterName <$SubmitterEmail>

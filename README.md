@@ -16,7 +16,7 @@ This repository follows the ECDSA Fail trust boundary and the
 - contestant code is everything under `src/point_add/`;
 - `build_circuit` is untrusted and emits `ops.bin` from contestant code;
 - `eval_circuit` is trusted, does not import contestant code, and validates
-  9,024 Fiat-Shamir shots;
+  102,400 Fiat-Shamir shots in 100 waves of 1,024;
 - `ecdlp package` archives only the native manifest `editablePaths` and wraps
   the native score/artifact with model attribution and a public note;
 - the `ecdlp-contest` trusted worker overlays the archive on a clean baseline,
@@ -39,7 +39,7 @@ The deterministic generator excludes infinity and same-x exceptional cases.
 
 A successful native ECDSA Fail run enforces:
 
-- classical correctness on 9,024 self-seeded shots;
+- classical correctness on 102,400 self-seeded shots;
 - reversibility and cleanup of freed workspace;
 - phase cleanliness;
 - forward/reverse identity.
@@ -57,16 +57,27 @@ parameter.
 The detailed reversible block schedule is documented in
 `src/point_add/memory/NONCE_FREE_POINT_ADD_BLOCKS.md`.
 
-The unchanged trusted evaluator measured:
+The parallel v3 trusted evaluator measured:
 
 | Metric | Baseline |
 | --- | ---: |
-| Validation | 9,024/9,024; zero classical, phase, and ancilla failures |
+| Validation | 102,400/102,400; zero classical, phase, and ancilla failures |
 | Average executed CCX+CCZ | 5,180,786.000 |
 | Peak logical qubits | 2,841 |
 | Emitted operations | 40,922,100 |
 | Score | 14,718,613,026 |
 | `ops.bin` SHA-256 | `962f5c2c1e7a8f3fe4c65230af910e638870d914c50452ef71c7fa197e9e51a5` |
+| Trusted evaluation | 16 workers × 64 bit-sliced shots; 4m 11.70s measured on Apple M1 |
+
+### Validation-shot acknowledgment
+
+The increase from 9,024 to 102,400 routine validation shots acknowledges
+[Craig Gidney's critique](https://x.com/CraigGidney/status/2088847417022034364?s=20)
+that a low-shot heuristic can miss sparse circuit errors and understate the
+Toffoli cost of retries. Gidney specifically proposed 10 million shots and
+retry-rate-aware scoring. The contest's 102,400-shot gate is an evenly batched
+per-submission step in that direction and can scale by full 1,024-shot waves
+for deeper audits.
 
 ## Architecture diagram contract
 
@@ -102,6 +113,12 @@ evidence as a network—not merely as three labels.
 `ecdlp package` commits the diagram path, byte length, and SHA-256 in submission
 metadata. Local validation and the server both compare that commitment with the
 diagram inside `submission.tar.gz`.
+
+The trusted evaluator defaults to `ECDLP_EVAL_THREADS=16`. Every worker runs
+64 bit-sliced shots, so 102,400 shots form exactly 100 full 1,024-shot waves.
+Inputs and measurement randomness are derived from separate artifact-bound
+SHAKE256 domains, including the batch index, so results do not depend on thread
+scheduling.
 
 ## Local workflow
 
