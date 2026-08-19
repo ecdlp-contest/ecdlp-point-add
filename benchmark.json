@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "name": "ecadd-challenge-test",
-  "description": "Optimize the qubit-toffoli product for a reversible circuit that adds a quantum elliptic curve point to a classical elliptic curve point.",
+  "description": "Optimize the balanced qubit-Toffoli-depth score for a reversible circuit that adds a quantum elliptic curve point to a classical elliptic curve point.",
   "category": "rust",
   "direction": "-",
   "editablePaths": ["src/point_add"],

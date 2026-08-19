@@ -599,9 +599,14 @@ fn append_results_row(
 fn write_score(avg_tof: f64, qubits: u64) {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/score.json");
     let toffoli = avg_tof.round() as u64;
+    // The emitted op stream is strictly sequential, so the executed Toffoli
+    // depth equals the executed Toffoli count, and the balanced score
+    // qubits * sqrt(toffoli * toffoli_depth) reduces to the exact integer
+    // product below.
+    let toffoli_depth = toffoli;
     let score = toffoli.saturating_mul(qubits);
     let body = format!(
-        "{{\n  \"score\": {score},\n  \"metrics\": {{\n    \"toffoli\": {toffoli},\n    \"qubits\": {qubits}\n  }}\n}}\n"
+        "{{\n  \"score\": {score},\n  \"metrics\": {{\n    \"toffoli\": {toffoli},\n    \"toffoli_depth\": {toffoli_depth},\n    \"qubits\": {qubits}\n  }}\n}}\n"
     );
     if let Err(e) = std::fs::write(path, body) {
         eprintln!("warning: failed to write score.json: {e}");

@@ -1,13 +1,16 @@
 # secp256k1 Point-Addition Circuit Contest
 
 Build the lowest-score reversible circuit for adding a quantum secp256k1 point
-to a classical secp256k1 point. The score is:
+to a classical secp256k1 point. The score model is
+`balanced-qubit-toffoli-depth-v1`, the same as the 5-bit Shor track:
 
 ```text
-round(average executed CCX + CCZ) * peak logical qubits
+peak logical qubits * sqrt(round(average executed CCX + CCZ) * round(average executed Toffoli depth))
 ```
 
-Lower is better. The native benchmark name remains `ecadd-challenge-test`; the
+Lower is better. The emitted op stream is strictly sequential, so the executed
+Toffoli depth currently equals the executed Toffoli count and the score reduces
+to `round(average executed CCX + CCZ) * peak logical qubits`. The native benchmark name remains `ecadd-challenge-test`; the
 `ecdlp-contest` server routes its package to track `point-add-secp256k1-v1`.
 
 This repository follows the ECDSA Fail trust boundary and the
@@ -63,6 +66,7 @@ The parallel v3 trusted evaluator measured:
 | --- | ---: |
 | Validation | 102,400/102,400; zero classical, phase, and ancilla failures |
 | Average executed CCX+CCZ | 5,180,786.000 |
+| Average executed Toffoli depth | 5,180,786 (sequential stream: equals CCX+CCZ count) |
 | Peak logical qubits | 2,841 |
 | Emitted operations | 40,922,100 |
 | Score | 14,718,613,026 |
