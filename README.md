@@ -79,6 +79,40 @@ retry-rate-aware scoring. The contest's 102,400-shot gate is an evenly batched
 per-submission step in that direction and can scale by full 1,024-shot waves
 for deeper audits.
 
+### Secret validation seed
+
+Shot count alone does not stop *grinding*. Because the trusted evaluator is
+deterministic and can be run offline, a contestant could otherwise search — using
+free nonce entropy — for a knowingly-incorrect but cheaper circuit that happens to
+pass the particular cases a predictable seed selects, then submit it with
+certainty.
+
+To close this, the trusted reproduction worker draws a **fresh secret seed for
+each submission, after the submitted `ops.bin` is locked**, and mixes it into the
+Fiat-Shamir derivation of both the validation inputs and the per-shot measurement
+randomness (via `ECDLP_VALIDATION_SEED`, folded into the SHAKE256 domains). The
+102,400 cases a submission is tested against are therefore unpredictable at
+submission time, so a sparse-error circuit cannot be pre-selected to pass them.
+
+The **mechanism is public; the seed value is not disclosed in advance** — only the
+scheme is (Kerckhoffs's principle), and a distinct seed is drawn per submission.
+Contestant runs supply no seed and stay fully deterministic, so the checked-in
+baseline reproduces its published score byte-for-byte and local development and
+self-verification are unaffected; contestants simply cannot know which cases the
+trusted rerun will draw. Ranking uses the trusted rerun's reproduced score and
+metrics, not self-reported values.
+
+After a submission is accepted, **its seed is published in the trusted-worker
+report** so that anyone can replay the exact 102,400-case validation — check out
+the accepted commit, rebuild, and rerun the evaluator with that
+`ECDLP_VALIDATION_SEED` — and independently reproduce the ranked score.
+Disclosing a locked submission's seed cannot aid grinding (the artifact is already
+fixed), and every submission draws an independent seed, so a past seed reveals
+nothing about a future one. Because the seed changes only which inputs are
+validated (never the emitted circuit), the `ops.bin` commitment — and, for a
+correct data-independent circuit, the score — remain exactly reproducible across
+seeds.
+
 ## Architecture diagram contract
 
 Every submission must update the Mermaid network at:
