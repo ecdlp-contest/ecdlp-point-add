@@ -168,6 +168,16 @@ fi
 install_cap_tools
 fix_bwrap_file_caps
 
+# When confinement is mandatory (trusted worker / CI), fail fast if best-effort
+# installation above did not leave a usable sandbox, rather than letting
+# benchmark.sh discover it later. macOS relies on the built-in sandbox-exec.
+if [[ "${ECDLP_REQUIRE_SANDBOX:-0}" == "1" || "${ECDLP_REQUIRE_SANDBOX:-}" == "true" ]]; then
+  if ! command -v bwrap >/dev/null 2>&1 && ! command -v sandbox-exec >/dev/null 2>&1; then
+    echo "setup.sh: ECDLP_REQUIRE_SANDBOX is set but neither bubblewrap nor sandbox-exec is available; the untrusted build cannot be confined" >&2
+    exit 1
+  fi
+fi
+
 # 2. Rust toolchain.
 if ! command -v cargo >/dev/null 2>&1; then
   if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
