@@ -42,6 +42,25 @@ const OP_BYTES: usize = OP_FIELDS * FIELD_BYTES;
 // Real circuits sit ~3k qubits and a few hundred million ops; caps are
 // generous compared to that.
 const MAX_OPS: u64 = 4_000_000_000;
+// Cap the eager op-vector reservation. A forged header may claim up to MAX_OPS;
+// reserving that many `Op` records up front (~56 bytes each) would abort with a
+// multi-hundred-GB request before the body is even read. Reserve at most this
+// many and let the Vec grow — a lie about the count still fails on short read.
+const OPS_RESERVE_CAP: usize = 64_000_000;
+// Sanity caps on operand identifiers. A single otherwise-valid op naming an
+// astronomically large qubit/bit/register index would size `Simulator::new`
+// (8 bytes/qubit) or the `analyze_ops` register vector without bound and OOM
+// the trusted process. Real circuits sit ~3k qubits and 4 registers; these caps
+// are generous but finite. Sentinel u64::MAX ("unused") is exempt.
+const MAX_QUBIT_ID: u64 = 1 << 22;
+const MAX_BIT_ID: u64 = 1 << 22;
+const MAX_REGISTER_ID: u64 = 1 << 16;
+// Optional server-chosen secret validation seed (hex, via ECDLP_VALIDATION_SEED).
+// The trusted worker sets a fresh random seed per reproduction; it is mixed into
+// the Fiat-Shamir input and measurement derivation so the validated inputs cannot
+// be predicted or ground offline by the contestant. Empty (local dev runs)
+// reproduces the deterministic, commitment-only derivation byte-for-byte.
+const MAX_VALIDATION_SEED_BYTES: usize = 128;
 const NUM_TESTS: usize = 100 * 1_024;
 const SHOTS_PER_BATCH: usize = 64;
 const DEFAULT_EVAL_WORKERS: usize = 16;
@@ -63,8 +82,11 @@ const DEFAULT_EVAL_WORKERS: usize = 16;
 // post-incident hardening). validate() panics on:
 //   - operand aliasing (CCX q q q etc. — would yield free non-reversible
 //     resets, the ToB "strictly better exploit primitive")
-//   - per-kind field-shape violations (e.g. R/Hmr with c_condition,
-//     which would suppress phase randomization on dirty frees)
+//   - per-kind field-shape violations (unexpected operands for a kind).
+// Note: conditioned R/Hmr ARE allowed by validate(); dirty-free soundness does
+// not rest on validate() but on the ancilla-zero and global-phase checks below —
+// a leftover set qubit cannot reach |0> without phase randomization or a genuine
+// reversible uncompute, and either way the per-shot checks catch it.
 // We catch_unwind so a forged ops.bin produces an error, not a crash.
 
 fn op_kind_from_u32(v: u32) -> Option<OperationType> {
@@ -120,7 +142,7 @@ fn load_ops(path: &str) -> Result<Vec<Op>, String> {
     dec.window_log_max(ZSTD_WINDOW_LOG_MAX)
         .map_err(|e| format!("{path}: zstd window cap: {e}"))?;
 
-    let mut ops = Vec::with_capacity(n);
+    let mut ops = Vec::with_capacity(n.min(OPS_RESERVE_CAP));
     let mut rec = [0u8; OP_BYTES];
     for i in 0..n {
         dec.read_exact(&mut rec)
@@ -223,18 +245,63 @@ fn fiat_shamir_commitment(ops: &[Op]) -> [u8; 32] {
     commitment
 }
 
-fn input_xof(commitment: &[u8; 32]) -> sha3::Shake256Reader {
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    if s.is_empty() || s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
+// Server-chosen secret validation seed. Absent/empty (contestant-local runs)
+// returns an empty vector, which is a no-op in the SHAKE update below and so
+// preserves the deterministic, commitment-only derivation exactly. When the
+// trusted worker sets ECDLP_VALIDATION_SEED, a malformed or oversized value
+// fails closed rather than silently downgrading to the grindable public seed.
+fn validation_seed() -> Vec<u8> {
+    match std::env::var("ECDLP_VALIDATION_SEED") {
+        Ok(raw) if !raw.trim().is_empty() => match decode_hex(raw.trim()) {
+            Some(bytes) if bytes.len() <= MAX_VALIDATION_SEED_BYTES => bytes,
+            Some(_) => {
+                eprintln!(
+                    "!! ECDLP_VALIDATION_SEED decodes to more than {MAX_VALIDATION_SEED_BYTES} bytes"
+                );
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("!! ECDLP_VALIDATION_SEED must be an even-length hex string");
+                std::process::exit(1);
+            }
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn input_xof(commitment: &[u8; 32], seed: &[u8]) -> sha3::Shake256Reader {
     let mut hasher = Shake256::default();
     hasher.update(b"quantum_ecc-fiat-shamir-parallel-inputs-v3");
     hasher.update(commitment);
+    // Fixed-width commitment (32 bytes) precedes the variable-length seed, so the
+    // concatenation is unambiguous; an empty seed leaves the digest unchanged.
+    hasher.update(seed);
     hasher.finalize_xof()
 }
 
-fn batch_xof(commitment: &[u8; 32], batch: usize) -> sha3::Shake256Reader {
+fn batch_xof(commitment: &[u8; 32], batch: usize, seed: &[u8]) -> sha3::Shake256Reader {
     let mut hasher = Shake256::default();
     hasher.update(b"quantum_ecc-fiat-shamir-parallel-batch-v3");
     hasher.update(commitment);
     hasher.update(&(batch as u64).to_le_bytes());
+    hasher.update(seed);
     hasher.finalize_xof()
 }
 
@@ -311,6 +378,7 @@ fn run_test_batch(
     expected: &[(U256, U256)],
     commitment: &[u8; 32],
     batch: usize,
+    seed: &[u8],
 ) -> SeedReport {
     let start = batch * SHOTS_PER_BATCH;
     let bs = SHOTS_PER_BATCH.min(targets.len() - start);
@@ -320,7 +388,7 @@ fn run_test_batch(
         (1u64 << bs) - 1
     };
 
-    let mut xof = batch_xof(commitment, batch);
+    let mut xof = batch_xof(commitment, batch, seed);
     let mut sim = Simulator::new(total_qubits as usize, num_bits as usize, &mut xof);
     let mut report = empty_report();
     report.n_shots = bs;
@@ -395,9 +463,10 @@ fn run_tests(
     num_bits: u64,
     commitment: [u8; 32],
     target_shots: usize,
+    seed: &[u8],
 ) -> SeedReport {
     let curve = secp256k1();
-    let mut xof = input_xof(&commitment);
+    let mut xof = input_xof(&commitment, seed);
 
     let mut targets = Vec::with_capacity(target_shots);
     let mut offsets = Vec::with_capacity(target_shots);
@@ -438,6 +507,7 @@ fn run_tests(
             let targets = &targets;
             let offsets = &offsets;
             let expected = &expected;
+            let seed = seed;
             handles.push(scope.spawn(move || {
                 let mut reports = Vec::new();
                 for batch in (worker..num_batches).step_by(workers) {
@@ -451,6 +521,7 @@ fn run_tests(
                         expected,
                         commitment,
                         batch,
+                        seed,
                     ));
                 }
                 reports
@@ -562,6 +633,40 @@ fn main() {
     };
     println!("  loaded ops  : {}", ops.len());
 
+    // Bound operand identifiers before analyze_ops / Simulator sizing so a single
+    // op naming an astronomically large index cannot OOM the trusted process.
+    // u64::MAX is the "unused" sentinel and is exempt.
+    for (i, op) in ops.iter().enumerate() {
+        for id in [op.q_control2.0, op.q_control1.0, op.q_target.0] {
+            if id != u64::MAX && id > MAX_QUBIT_ID {
+                fail_and_exit(
+                    &format!("op {i}: qubit id {id} exceeds cap {MAX_QUBIT_ID}"),
+                    &note,
+                    ops.len(),
+                    0,
+                );
+            }
+        }
+        for id in [op.c_target.0, op.c_condition.0] {
+            if id != u64::MAX && id > MAX_BIT_ID {
+                fail_and_exit(
+                    &format!("op {i}: bit id {id} exceeds cap {MAX_BIT_ID}"),
+                    &note,
+                    ops.len(),
+                    0,
+                );
+            }
+        }
+        if op.r_target.0 != u64::MAX && op.r_target.0 > MAX_REGISTER_ID {
+            fail_and_exit(
+                &format!("op {i}: register id {} exceeds cap {MAX_REGISTER_ID}", op.r_target.0),
+                &note,
+                ops.len(),
+                0,
+            );
+        }
+    }
+
     let (total_qubits, num_bits, _num_regs, regs) = analyze_ops(ops.iter());
 
     if regs.len() != 4 {
@@ -608,7 +713,22 @@ fn main() {
 
     println!("\n-- correctness tests ({} shots) --", NUM_TESTS);
     let commitment = fiat_shamir_commitment(&ops);
-    let r = run_tests(&ops, &regs, total_qubits, num_bits, commitment, NUM_TESTS);
+    let seed = validation_seed();
+    if seed.is_empty() {
+        println!("  validation seed         : deterministic (commitment-only)");
+    } else {
+        let mut fp_hasher = Shake256::default();
+        fp_hasher.update(b"quantum_ecc-validation-seed-fingerprint-v1");
+        fp_hasher.update(&seed);
+        let mut fp_xof = fp_hasher.finalize_xof();
+        let mut fp = [0u8; 4];
+        XofReader::read(&mut fp_xof, &mut fp);
+        println!(
+            "  validation seed         : server-supplied (fp {:02x}{:02x}{:02x}{:02x})",
+            fp[0], fp[1], fp[2], fp[3]
+        );
+    }
+    let r = run_tests(&ops, &regs, total_qubits, num_bits, commitment, NUM_TESTS, &seed);
     println!("  tested shots            : {}", r.n_shots);
     println!("  classical mismatches    : {}", r.classical_failures);
     println!("  phase-garbage batches   : {}", r.phase_garbage_batches);

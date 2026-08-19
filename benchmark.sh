@@ -172,6 +172,13 @@ elif [[ "$(uname -s)" == "Darwin" ]] && command -v sandbox-exec >/dev/null 2>&1;
     sandbox-exec -p "${macos_profile}"
       /bin/bash -c 'cd "$1" && export TMPDIR="$1" && exec "$2"' _ "${ops_scratch}" "${build_circuit_bin}"
   )
+elif [[ "${ECDLP_REQUIRE_SANDBOX:-0}" == "1" || "${ECDLP_REQUIRE_SANDBOX:-}" == "true" ]]; then
+  # Trusted/CI path: refuse to run untrusted contestant code without confinement.
+  # This job holds the trusted-worker token and repo write credentials, so an
+  # unconfined build_circuit would be a full trust-boundary compromise. Fail
+  # closed instead of silently downgrading to the dev fallback.
+  echo "!! ECDLP_REQUIRE_SANDBOX is set but no sandbox (bubblewrap/sandbox-exec) is available; refusing to run build_circuit unconfined" >&2
+  exit 1
 else
   echo "!! no sandbox available (bubblewrap/sandbox-exec); running build_circuit UNCONFINED (dev fallback)" >&2
   run_build=( bash -c 'cd "$1" && exec "$2"' _ "${ops_scratch}" "${build_circuit_bin}" )

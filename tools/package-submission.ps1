@@ -20,6 +20,7 @@ $RequiredGate = "fiat_shamir_ecdsafail_point_add_parallel_v3"
 $RequiredBenchmark = "ecadd-challenge-test"
 $RequiredScoreModel = "primitive-ccx-ccz-v1"
 $RequiredArtifact = "ops.bin"
+$RequiredEditablePaths = @("src/point_add")
 $RequiredArchitecturePath = "src/point_add/architecture.mmd"
 $RequiredArchitectureTarget = "Target primitive: quantum P plus classical Q on secp256k1"
 $RequiredValidationChecks = @(
@@ -222,6 +223,19 @@ try {
     if ($sorted[$i + 1].StartsWith($sorted[$i] + "/")) {
       throw "editablePaths must not overlap: $($sorted[$i]) and $($sorted[$i + 1])"
     }
+  }
+  # Pin to the track's editable surface (matching ecdlp.js). A manifest whose
+  # editablePaths was widened to "." or "src" would otherwise archive trusted
+  # files, .git, or the ignored .workspace/ autoresearch tree.
+  $sortedRequired = @($RequiredEditablePaths | Sort-Object)
+  $editablePathsMatch = $sorted.Count -eq $sortedRequired.Count
+  if ($editablePathsMatch) {
+    for ($i = 0; $i -lt $sorted.Count; $i++) {
+      if ($sorted[$i] -ne $sortedRequired[$i]) { $editablePathsMatch = $false; break }
+    }
+  }
+  if (-not $editablePathsMatch) {
+    throw "editablePaths must be exactly: $($RequiredEditablePaths -join ', ')"
   }
   Assert-ArchitectureDiagram $RepoRoot
   $architecturePath = Resolve-RepoPath $RepoRoot $RequiredArchitecturePath
