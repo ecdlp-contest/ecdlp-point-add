@@ -22,6 +22,16 @@ grinding.
 - `ops.bin` SHA-256
   `962f5c2c1e7a8f3fe4c65230af910e638870d914c50452ef71c7fa197e9e51a5`.
 
+## Resubmission record
+
+Resubmitted 2026-08-19 with an unchanged circuit after an independent local
+rerun (Windows, 16 workers x 64 bit-sliced shots) reproduced the identical
+artifact: 102,400/102,400 shots passed with zero classical, phase, and ancilla
+failures; the same 5,180,786.000 average executed Toffolis, 2,841 peak logical
+qubits, score 14,718,613,026, and byte-identical `ops.bin` SHA-256. The prior
+pending submission was withdrawn because its trusted-worker run failed on
+missing repository secrets before evaluation started.
+
 ## Optimization record
 
 This is the correctness-first baseline. Update this section for every candidate
