@@ -2,7 +2,9 @@
 
 Build the lowest-score reversible circuit for adding a quantum secp256k1 point
 to a classical secp256k1 point. Lower scores mean fewer live logical qubits and
-fewer executed non-Clifford resources in a core elliptic-curve operation.
+fewer executed non-Clifford resources in a core elliptic-curve operation. This
+contest verifies submissions with 102,400 shots and server-side seed to avoid
+GPU grinding/over-fitting. This contest is inspired by the [ecdsa.fail](https://ecdsa.fail) contest and its community.
 
 ## Goal
 
@@ -14,13 +16,6 @@ peak logical qubits * sqrt(
   round(average executed CCX + CCZ)
   * round(average executed Toffoli depth)
 )
-```
-
-The emitted op stream is strictly sequential, so executed Toffoli depth
-currently equals executed Toffoli count and the score reduces to:
-
-```text
-round(average executed CCX + CCZ) * peak logical qubits
 ```
 
 Lower is better.
@@ -45,7 +40,6 @@ on Windows.
 
 | Item | Contract |
 | --- | --- |
-| Native benchmark | `ecadd-challenge-test` |
 | Contest-server track | `point-add-secp256k1-v1` |
 | Score model | `balanced-qubit-toffoli-depth-v1` |
 | Direction | Lower is better |
@@ -141,7 +135,7 @@ Toffoli figures are the historical 9,024-shot results; the final column is a
 separate replay against this repository's current 102,400-shot,
 commitment-only evaluator with no external validation seed.
 
-| Submission/reference commit | Solver | Peak logical qubits | Rounded Toffoli count/depth | Score | 102,400-shot classical/phase/ancilla |
+| Commit | Solver | Qubits | Toffoli | Score | 102,400-shot classical/phase/ancilla |
 | --- | --- | ---: | ---: | ---: | ---: |
 | [`3493c837`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/31f9c58ce9c5a12df8d18245f3905cc3352cb6a9) | jackylee0424 | 1,150 | 1,284,776 | 1,477,492,400 | 264/173/0 |
 | [`6c0e30c6`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/3222da606dc1ccf9435cb6d382c11e58a34557f4) | Gajesh2007 | 1,151 | 1,301,798 | 1,498,369,498 | 142/119/0 |
@@ -164,8 +158,8 @@ commitment-only evaluator with no external validation seed.
 | [`a7ec174f`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/0fa5c6f5f79c1cb14f046534c9ba12ab1d81e9fa) | jieyilong | 1,192 | 1,412,425 | 1,683,610,600 | 153/76/0 |
 | [`ad4cf86d`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/bb579bba251e2ef0260d605d37600a5ea3770c24) | BitWonka | 1,193 | 1,412,391 | 1,684,982,463 | 197/109/0 |
 | [`833642fe`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/6953d1b28a67e931d63ba4c80ed573fca9afc3e5) | BitWonka | 1,203 | 1,410,971 | 1,697,398,113 | 209/116/0 |
-| [WarpSpeed proof `cd2b9c0`](https://github.com/double-ai/double-zkp-ecc/commit/cd2b9c087735602af52e4f9e6bcf575623fe6437) | doubleAI | 1,205 | 993,181 | 1,196,783,105 | not available (private circuit) |
-| [Current baseline `2386bab`](https://github.com/ecdlp-contest/ecdlp-point-add/commit/2386bab6db30561e42cd16708c2bd4eb8e211b64) | — | 2,841 | 5,180,786 | 14,718,613,026 | 0/0/0 |
+| [WarpSpeed `cd2b9c0`](https://github.com/double-ai/double-zkp-ecc/commit/cd2b9c087735602af52e4f9e6bcf575623fe6437) | doubleAI | **1,205** | **993,181** | **1,196,783,105** | not available (private circuit) |
+| [`2386bab`](https://github.com/ecdlp-contest/ecdlp-point-add/commit/2386bab6db30561e42cd16708c2bd4eb8e211b64) | repo baseline | _2,841_ | _5,180,786_ | _14,718,613,026_ | **0/0/0** |
 
 Every historical submission row is invalid under the current validation gate:
 each has nonzero classical and phase failures, despite zero ancilla failures.
