@@ -148,6 +148,67 @@ matching target directory as `CARGO_TARGET_DIR`. The benchmark writes fixed-name
 outputs such as `ops.bin`, `score.json`, and `results.tsv`; isolation prevents
 parallel candidates from overwriting or mixing those outputs.
 
+### Repository-local build rule
+
+All agent-initiated compilation, circuit emission, evaluation, build outputs,
+and per-run build caches **must stay inside this repository folder**. On
+Windows, executables built outside the checked-out repository may be denied by
+filesystem policy or Windows Application Control even when compilation
+succeeds. Read-only package-source caches managed by Cargo are not build-output
+locations and need not be relocated.
+
+- Start ordinary setup, preflight, build, and run commands from the repository
+  root. For an experiment, start them from its matching repository-local
+  worktree under `.workspace/autoresearch/worktrees/<run-id>/`.
+- Set `CARGO_TARGET_DIR` to the matching absolute path under
+  `.workspace/autoresearch/targets/<run-id>/`. Never point it at `%TEMP%`, the
+  system temporary directory, a home-directory cache, another checkout, or any
+  path outside this repository.
+- Keep `ops.bin`, `score.json`, `results.tsv`, process logs, extracted sources,
+  and temporary build products in the applicable worktree, target, run, or
+  scratch directory under `.workspace/autoresearch/`.
+- Before an expensive build, resolve and verify the repository root, worktree,
+  and target paths. Abort if the worktree or target does not remain beneath the
+  resolved repository root. Record the resolved working directory,
+  `CARGO_TARGET_DIR`, and build platform in `manifest.json`.
+- If a command is launched by a wrapper, task runner, PowerShell process, or
+  shell script, set its working directory explicitly; do not rely on the
+  caller's current directory.
+- A dependency cache may seed a new target only when the cache is also inside
+  this repository. The candidate crate must still be rebuilt in its matching
+  target, and each experiment must retain its own worktree and target.
+- If Windows blocks a newly built executable, do not copy the build outside the
+  repository or attempt to weaken security policy. Close or annotate the run,
+  then retry in a new run ID using repository-local paths. WSL is an acceptable
+  fallback only when its worktree, target, and outputs map back into this same
+  repository (for example under `/mnt/c/.../<repo>/.workspace/autoresearch/`).
+
+PowerShell agents should establish the paths explicitly before invoking Cargo:
+
+```powershell
+$repoRoot = (git rev-parse --show-toplevel).Trim()
+$runWorktree = Join-Path $repoRoot ".workspace\autoresearch\worktrees\<run-id>"
+$runTarget = Join-Path $repoRoot ".workspace\autoresearch\targets\<run-id>"
+$repoPrefix = [IO.Path]::GetFullPath($repoRoot).TrimEnd('\') + '\'
+foreach ($candidatePath in @($runWorktree, $runTarget)) {
+  $resolvedPath = [IO.Path]::GetFullPath($candidatePath)
+  if (-not $resolvedPath.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Build path escapes repository: $resolvedPath"
+  }
+}
+$env:CARGO_TARGET_DIR = $runTarget
+
+Push-Location $runWorktree
+try {
+  cargo build --release --locked --offline
+} finally {
+  Pop-Location
+}
+```
+
+For a non-experiment baseline run, the repository's own default `target/`
+directory is acceptable because it is still inside the checkout.
+
 Do not treat root `results.tsv` as the research ledger and never hand-edit a
 generated benchmark output. Copy the applicable score and newly produced result
 row into the run's `metrics/` directory.
