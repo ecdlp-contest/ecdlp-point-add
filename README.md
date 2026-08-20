@@ -126,14 +126,15 @@ The detailed reversible schedule is in
 The current candidate's public evidence and submission history are in
 [`src/point_add/SUBMISSION.md`](src/point_add/SUBMISSION.md).
 
-## Historical accepted-submission qubit ladder
+## secp256k1 point-addition qubit and score comparison
 
-The table selects the earliest accepted ECDSA Fail submission with official
-metrics at each distinct qubit count from 1,150 through 1,205. Missing counts
-have no accepted submission with official metrics. Submission scores and
-Toffoli figures are the historical 9,024-shot results; the final column is a
-separate replay against this repository's current 102,400-shot,
-commitment-only evaluator with no external validation seed.
+This table compares public ECDSA.fail submissions, published circuit estimates,
+and challenge baselines in ascending peak-logical-qubit order. The submission
+ladder uses the earliest accepted result at each distinct qubit count; external
+figures are cited in their rows. Scores are qubits multiplied by rounded
+Toffoli count when no separate depth measurement is available. The final column
+reports current 102,400-shot, commitment-only validation without an external
+seed, or states why that replay is unavailable.
 
 | Commit | Solver | Qubits | Toffoli | Score | 102,400-shot classical/phase/ancilla |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -154,23 +155,35 @@ commitment-only evaluator with no external validation seed.
 | [`af5abb17`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/bdb1d22261e6e5e86dba5f63a8339449430b167a) | tob-joe | 1,167 | 1,422,591 | 1,660,163,697 | 114/61/0 |
 | [`77eaef64`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/35ceb019efa0d48accca8176a9382a47219f1ba0) | BitWonka | 1,168 | 1,433,676 | 1,674,533,568 | 217/112/0 |
 | [`1278a074`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/674d0d81df048324d6b7f0c971aea12e51e3f0d8) | nasqret | 1,170 | 1,434,999 | 1,678,948,830 | 202/104/0 |
+| [Google private low-qubit Pareto point dataset](https://zenodo.org/records/19597130) | [Google Quantum AI](https://arxiv.org/pdf/2603.28846) | 1,175 | 2,700,000 | 3,172,500,000 | not available (private circuit) |
 | [`3182d2b3`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/cf310ecb9a0bb938bb961fcd18019e891c5b7d12) | nasqret | 1,185 | 1,418,587 | 1,681,025,595 | 196/102/0 |
 | [`a7ec174f`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/0fa5c6f5f79c1cb14f046534c9ba12ab1d81e9fa) | jieyilong | 1,192 | 1,412,425 | 1,683,610,600 | 153/76/0 |
 | [`ad4cf86d`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/bb579bba251e2ef0260d605d37600a5ea3770c24) | BitWonka | 1,193 | 1,412,391 | 1,684,982,463 | 197/109/0 |
+| [Public space-optimized circuit `9b23c917`](https://gitlab.inria.fr/capsule/qarton-projects/ec-point-addition/-/commit/9b23c9170a636a7097a02afb3a3d6cbb6425c9f4) | [André Schrottenloher](https://arxiv.org/pdf/2606.02235) | 1,195 | 2,304,135 | 2,753,441,325 | not run (public Qarton circuit) |
 | [`833642fe`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/6953d1b28a67e931d63ba4c80ed573fca9afc3e5) | BitWonka | 1,203 | 1,410,971 | 1,697,398,113 | 209/116/0 |
-| [WarpSpeed `cd2b9c0`](https://github.com/double-ai/double-zkp-ecc/commit/cd2b9c087735602af52e4f9e6bcf575623fe6437) | doubleAI | **1,205** | **993,181** | **1,196,783,105** | not available (private circuit) |
+| [WarpSpeed `cd2b9c0`](https://github.com/double-ai/double-zkp-ecc/commit/cd2b9c087735602af52e4f9e6bcf575623fe6437) | [doubleAI](https://www.doubleai.com/research/warpspeed-discovers-record-breaking-ecdsa-cracking-circuit) | **1,205** | **993,181** | **1,196,783,105** | not available (private circuit) |
+| [Google private low-gate Pareto point dataset](https://zenodo.org/records/19597130) | [Google Quantum AI](https://arxiv.org/pdf/2603.28846) | 1,425 | 2,100,000 | 2,992,500,000 | not available (private circuit) |
+| [Public gate-optimized circuit `9b23c917`](https://gitlab.inria.fr/capsule/qarton-projects/ec-point-addition/-/commit/9b23c9170a636a7097a02afb3a3d6cbb6425c9f4) | [André Schrottenloher](https://arxiv.org/pdf/2606.02235) | 1,443 | 1,799,437 | 2,596,587,591 | not run (public Qarton circuit) |
+| [ECDSA.fail challenge initial baseline `f43a73e8`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/f43a73e871e18238a36889409943d008c2a0c2e9) | ECDSA.fail challenge | 2,715 | 3,942,753 | 10,704,574,395 | 0/5/0 |
 | [`2386bab`](https://github.com/ecdlp-contest/ecdlp-point-add/commit/2386bab6db30561e42cd16708c2bd4eb8e211b64) | repo baseline | _2,841_ | _5,180,786_ | _14,718,613,026_ | **0/0/0** |
 
-Every historical submission row is invalid under the current validation gate:
-each has nonzero classical and phase failures, despite zero ancilla failures.
-Consequently, its displayed score is historical context rather than a current
-canonical score. The WarpSpeed row is an external reference, not an accepted
-ECDSA Fail submission; its public zero-knowledge proof certifies at most 993,181
-average executed CCX+CCZ gates and 1,205 logical qubits over its private
-circuit's historical 9,024-input test. The private operation stream is not
-available for a 102,400-shot replay. See the
-[DoubleAI article](https://www.doubleai.com/research/warpspeed-discovers-record-breaking-ecdsa-cracking-circuit)
-and [proof repository](https://github.com/double-ai/double-zkp-ecc).
+Every replayed public ECDSA.fail row is invalid under the current validation
+gate. The accepted-submission ladder from 1,150 through 1,203 has nonzero
+classical and phase failures despite zero ancilla failures; the 2,715-qubit
+initial baseline has 0 classical, 5 phase, and 0 ancilla failures. Consequently,
+the displayed scores are historical context rather than current canonical
+scores. The Google and WarpSpeed rows are external references whose private
+operation streams are unavailable for a 102,400-shot replay. WarpSpeed's public
+zero-knowledge proof certifies at most 993,181 average executed CCX+CCZ gates
+and 1,205 logical qubits over its private circuit's historical 9,024-input test.
+The Schrottenloher rows cite public Qarton circuits that have not yet been
+adapted to this evaluator. Their reported counts include Toffoli/AND gates, and
+their displayed scores are count-based proxies (`qubits × Toffoli`) because the
+source does not report average executed Toffoli depth. See
+[Schrottenloher](https://arxiv.org/pdf/2606.02235),
+[Google Quantum AI et al.](https://arxiv.org/abs/2603.28846v2), the
+[DoubleAI article](https://www.doubleai.com/research/warpspeed-discovers-record-breaking-ecdsa-cracking-circuit),
+and the [proof repository](https://github.com/double-ai/double-zkp-ecc).
 
 ## What you can edit
 
