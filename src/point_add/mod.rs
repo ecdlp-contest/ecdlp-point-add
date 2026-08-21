@@ -18,30 +18,22 @@
 //! offsets. The harness validates against `WeierstrassEllipticCurve::add`.
 //!
 //! # Algorithm
-//! Standard affine addition with Roetteler-style two-Kaliski uncomputation:
+//! The live schedule is generated from
+//! `profiles/clean-point-add-algorithm.json` in the companion formal toolset.
+//! It uses the internal convention `mu = -lambda`, because Kaliski's terminal
+//! `r` coefficient is a negative scaled inverse:
 //!
-//!   1. Px -= Qx,  Py -= Qy          (register now holds dx, dy)
-//!   2. kaliski_inv_inplace(Px)       (Px ← dx^{-1})
-//!   3. lam += Py * Px                (lam ← (dy)(dx^{-1}) = λ)
-//!   4. kaliski_inv_inplace(Px)       (Px ← dx)
-//!   5. Py -= lam * Px                (Py ← 0)
-//!   6. Px -= lam*lam                 (Px ← dx - λ²)
-//!   7. Px ← -Px                      (Px ← λ² - dx)
-//!   8. Px -= 2*Qx                    (Px ← λ² - Px_orig - Qx = Rx)
-//!   9. Py += lam * Qx                (Py ← λ·Qx)
-//!  10. Py -= lam * Px                (Py ← λ·Qx - λ·Rx)
-//!  11. Py -= Qy                      (Py ← Ry, via the identity
-//!                                      Ry = λ(Qx - Rx) - Qy)
-//!  12. Uncompute lam via the inverse path using the (Rx, Ry) state.
+//!   1. `tx = Px-Qx`, `ty = Py-Qy`.
+//!   2. Pair 1 scale-corrects the negative raw inverse, producing
+//!      `mu = -lambda`; adding `mu*(Px-Qx)` clears `ty`.
+//!   3. The x block produces `tx = Rx-Qx` and `ty = mu*(Rx-Qx)`.
+//!   4. Pair 2 uses the negative inverse of `Rx-Qx` to clear `mu`, subtracts
+//!      `Qy` to produce `Ry`, and finally adds `Qx` to restore `Rx`.
 //!
-//! Step 12 in detail (uses the identity λ = (Qy + Ry) / (Qx - Rx)):
-//!     a. Px -= Qx; Px ← -Px            (Px ← Qx - Rx)
-//!     b. kaliski_inv_inplace(Px)       (Px ← (Qx - Rx)^{-1})
-//!     c. lam -= Py * Px                (lam -= Ry / (Qx - Rx))
-//!     d. lam -= Qy * Px                (lam -= Qy / (Qx - Rx))
-//!                                        → lam = 0
-//!     e. kaliski_inv_inplace(Px)       (Px ← Qx - Rx)
-//!     f. Px ← -Px; Px += Qx            (Px ← Rx)
+//! Field-level Kaliski and affine-composition theorems live in
+//! `EccFormal.KaliskiAlmostInverse` and `EccFormal.PointAddAlgorithm`.
+//! Primitive refinement, lowering, allocation, and operation-stream equality
+//! are separate evidence gates.
 //!
 //! # Primitive layer
 //! All modular arithmetic is built on a single Cuccaro ripple-carry
@@ -61,6 +53,9 @@
 
 use alloy_primitives::U256;
 use crate::circuit::{BitId, Op, OperationType, QubitId, RegisterId};
+
+mod generated_point_add;
+mod generated_exact_rewrites;
 
 struct B {
     pub ops: Vec<Op>,
@@ -3571,7 +3566,8 @@ fn free_kaliski_state(b: &mut B, st: KaliskiState) {
 /// Forward-only Kaliski computation. Reads `v_in` (never writes), populates
 /// `st.*` with the algorithm's intermediate state. After this returns:
 ///   - `v_in` is unchanged
-///   - `st.r[..n]` holds the RAW Kaliski inverse `v^{-1} * 2^{2n} mod p`
+///   - `st.r[..n]` holds the negative raw Kaliski coefficient
+///     `-v^{-1} * 2^iters mod p`
 ///   - everything else in `st` is populated with deterministic iteration history
 ///
 /// The caller is responsible for applying the classical correction factor
@@ -4068,11 +4064,11 @@ fn with_kal_inv_raw<F: FnOnce(&mut B, &[QubitId])>(
     let n = v_in.len();
     let mut st = alloc_kaliski_state(b, n, iters);
 
-    // Forward kaliski. st.r[..n] holds raw = v_in^{-1} * 2^(2n) mod p.
+    // Forward Kaliski. st.r[..n] holds raw = -v_in^{-1} * 2^iters mod p.
     kaliski_forward(b, v_in, &st, p, iters);
 
     // Kaliski invariant at end of forward (for nonzero v_in):
-    //   u = 1, v_w = 0, f = 0, s = some, r = raw inverse.
+    //   u = 1, v_w = 0, f = 0, s = some, r = negative scaled inverse.
     // Free registers whose post-forward state is classically known:
     //   v_w = 0 (free directly)
     //   f_flag = 0 (free directly)
@@ -4195,69 +4191,10 @@ pub fn build() -> Vec<Op> {
     let oy = b.alloc_bits(N);
     b.declare_bit_register(&oy);
 
-    // === Point add ===
-    //
-    let p = SECP256K1_P;
-    // 2N-1 guarantees Kaliski convergence for all inputs. The fast-path
-    // 399-iter truncation was empirically correct on the official seed but
-    // leaves rare residuals on ~0.01% of points, which show up as alternate-
-    // seed phase failures. Switch to the safe bound while we re-establish
-    // robustness, then claw back Toffoli separately.
-    let pair1_iters = 2 * N - 1;
-    let pair2_iters = 2 * N - 1;
-
-    // Block 1: coordinate differences, dx = Px - Qx and dy = Py - Qy.
-    b.set_phase("coordinate_differences");
-    mod_sub_qb(b, &tx, &ox, p);
-    mod_sub_qb(b, &ty, &oy, p);
-
-    let lam = b.alloc_qubits(N);
-
-    // Blocks 2-5: first Kaliski forward/apply/backward pair. Kaliski's raw
-    // inverse carries a 2^(2N-1) factor. Fold that
-    // scale onto lam itself, then halve lam down once. This avoids the
-    // inverse-register restore pass entirely.
-    b.set_phase("pair1_kaliski_forward");
-    with_kal_inv_raw(b, &tx, p, pair1_iters, |b, inv_raw| {
-        b.set_phase("pair1_mul1");
-        mod_mul_write_into_zero_acc_schoolbook(b, &lam, &ty, inv_raw, p);
-        b.set_phase("pair1_halve");
-        for _ in 0..pair1_iters { mod_halve_inplace_fast(b, &lam, p); }
-        b.set_phase("pair1_mul2");
-        mod_mul_add_into_acc_schoolbook(b, &ty, &lam, &tx, p);
-        b.set_phase("pair1_kaliski_backward");
-    });
-
-    // Block 6: form the output x coordinate and the Qx - Rx denominator used
-    // by the second Kaliski/apply pair.
-    b.set_phase("x_coordinate_and_pair2_denominator");
-    // Px := λ² - Px_orig - Qx. Rearranged: tx = dx - λ². Add 2Qx, then
-    // negate: -(dx - λ² + 2Qx) = λ² - dx - 2Qx = Rx. mod_add_qb is
-    // cheaper than mod_sub_qb (1024 vs 1280 per call, saves 512 total).
-    mod_mul_sub_qq(b, &tx, &lam, &lam, p);
-    mod_add_double_qb(b, &tx, &ox, p);
-    // Fold mod_neg + mod_sub_qb into mod_add_qb + mod_neg: mod_add_qb is
-    // cheaper than mod_sub_qb by n CCX. Result equivalent: tx = Rx - Qx.
-    mod_add_qb(b, &tx, &ox, p);                          // tx = dx - λ² + 3Qx
-    mod_neg_inplace_fast(b, &tx, p);                     // tx = -(...)= Rx - Qx
-    // ty starts at 0 here (mul2 cleared it), use zero-acc fast path.
-    b.set_phase("mul3_between_pair");
-    mod_mul_write_into_zero_acc_karatsuba2(b, &ty, &lam, &tx, p);
-    b.set_phase("pair2_kaliski_forward");
-    with_kal_inv_raw(b, &tx, p, pair2_iters, |b, inv_raw| {
-        b.set_phase("pair2_double");
-        for _ in 0..pair2_iters { mod_double_inplace_fast(b, &lam, p); }
-        b.set_phase("pair2_mul");
-        mod_mul_add_into_acc_schoolbook(b, &lam, inv_raw, &ty, p);
-        b.set_phase("pair2_cleanup");
-        mod_sub_qb(b, &ty, &oy, p);
-        b.set_phase("pair2_kaliski_backward");
-    });
-    // Block 12: restore the final affine x coordinate and release lambda.
-    b.set_phase("final_coordinate_restore");
-    mod_add_qb(b, &tx, &ox, p);                           // tx = Rx
-
-    b.free_vec(&lam);
+    // Generated from the reviewed clean-point-add field/register derivation.
+    // The generated module records the canonical specification hash; operation
+    // stream equivalence remains an explicit build gate.
+    generated_point_add::emit_point_add(b, &tx, &ty, &ox, &oy);
 
     if std::env::var("TRACE_PEAK").is_ok() {
         eprintln!("DEBUG peak_qubits={} at phase='{}' ops_idx={} total_ops={}", b.peak_qubits, b.peak_phase, b.peak_ops_idx, b.ops.len());
@@ -4328,5 +4265,5 @@ pub fn build() -> Vec<Op> {
         }
     }
 
-    b.ops.clone()
+    generated_exact_rewrites::apply_exact_rewrites(b.ops.clone())
 }

@@ -23,14 +23,19 @@ flowchart TD
   Optimization --> Baseline["Correctness-first baseline: full 2N - 1 = 511 Kaliski schedules"]
   Optimization --> NonceFree["Nonce-free operation stream: no identity tail, tail rewrite, or seed grinding"]
   Optimization --> Arithmetic["Cuccaro modular arithmetic with secp256k1 pseudo-Mersenne reductions"]
-  Optimization --> Frontier["Optimization frontier: reduce Kaliski/apply cost without truncation failures"]
+  Optimization --> Fanout["Generated exact target-fanout rewrite at five source-bound windows"]
+  Optimization --> Frontier["Next frontier: derive exact local donor mechanisms without truncation failures"]
 
-  Baseline --> Metrics["Baseline: 2841 qubits, 5180786 average Toffoli, score 14718613026"]
+  Baseline --> ParentMetrics["Parent: 2841 qubits, 5180786 average Toffoli, score 14718613026"]
   NonceFree --> FiatShamir["SHAKE256 test inputs derive only from the arithmetic stream"]
   Arithmetic --> Karatsuba["Karatsuba multiplication between inverse pairs; schoolbook multiply/apply inside pairs"]
+  Fanout --> Identity["CCX(a,b,t); CX(t,u); CCX(a,b,t) becomes CX(t,u); CCX(a,b,u)"]
+  Identity --> Guard["Fail closed on index, lane, condition, or condition-depth drift"]
+  Guard --> Metrics["Candidate: 2841 qubits, 5180781 average Toffoli, score 14718598821"]
   Frontier --> Evidence["Only a complete trusted 102400-shot pass establishes a valid improvement"]
 
   Result --> Validation["Trusted validation"]
+  ParentMetrics --> Validation
   Metrics --> Validation
   FiatShamir --> Validation
   Karatsuba --> Validation
