@@ -280,10 +280,11 @@ trusted rerun:
 
 ```bash
 ./ecdlp.js login <api-key>
-./ecdlp.js submit \
-  --source-url https://github.com/<org>/<repo>/pull/<id> \
-  --watch
+./ecdlp.js submit --watch
 ```
+
+Pass `--source-url https://github.com/<org>/<repo>/pull/<id>` only when public
+source or pull-request context is available for reviewers.
 
 The CLI rejects an equal-or-worse candidate against the current accepted
 leaderboard. Server receipt is not promotion: the trusted worker must reproduce
