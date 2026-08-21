@@ -25,7 +25,7 @@ flowchart TD
   Optimization --> Arithmetic["Cuccaro modular arithmetic with secp256k1 pseudo-Mersenne reductions"]
   Optimization --> Frontier["Optimization frontier: reduce Kaliski/apply cost without truncation failures"]
 
-  Baseline --> Metrics["Trusted baseline: 2841 qubits, 5180786 average Toffoli, score 14718613026"]
+  Baseline --> Metrics["Baseline: 2841 qubits, 5180786 average Toffoli, score 14718613026"]
   NonceFree --> FiatShamir["SHAKE256 test inputs derive only from the arithmetic stream"]
   Arithmetic --> Karatsuba["Karatsuba multiplication between inverse pairs; schoolbook multiply/apply inside pairs"]
   Frontier --> Evidence["Only a complete trusted 102400-shot pass establishes a valid improvement"]
