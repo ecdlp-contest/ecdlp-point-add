@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "name": "ecadd-challenge-test",
+  "name": "ecdlp-point-add",
   "description": "Optimize the balanced qubit-Toffoli-depth score for a reversible circuit that adds a quantum elliptic curve point to a classical elliptic curve point.",
   "category": "rust",
   "direction": "-",

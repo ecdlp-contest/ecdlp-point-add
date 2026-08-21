@@ -147,15 +147,18 @@ const SCALAR_STRATEGY_BANNED_PATTERNS = [
   }
 ];
 
+const POINT_ADD_TRACK = {
+  trackId: "point-add-secp256k1-v1",
+  gate: "fiat_shamir_ecdsafail_point_add_parallel_v3",
+  editablePaths: ["src/point_add"],
+  requiredChecks: ["classical correctness", "reversibility", "phase cleanliness", "forward-reverse identity"],
+  defaultNoteFile: "src/point_add/SUBMISSION.md",
+  architectureDiagram: REQUIRED_ARCHITECTURE_PATH
+};
 const TRACKS = {
-  "ecadd-challenge-test": {
-    trackId: "point-add-secp256k1-v1",
-    gate: "fiat_shamir_ecdsafail_point_add_parallel_v3",
-    editablePaths: ["src/point_add"],
-    requiredChecks: ["classical correctness", "reversibility", "phase cleanliness", "forward-reverse identity"],
-    defaultNoteFile: "src/point_add/SUBMISSION.md",
-    architectureDiagram: REQUIRED_ARCHITECTURE_PATH
-  }
+  "ecdlp-point-add": POINT_ADD_TRACK,
+  // Accept already-packaged private-beta submissions during the public-name migration.
+  "ecadd-challenge-test": POINT_ADD_TRACK
 };
 
 const VALUE_FLAGS = new Set([
@@ -810,6 +813,7 @@ function scoresMatch(left, right) {
 
 function assertEditableManifestContract(manifest) {
   const spec = TRACKS[manifest.name];
+  if (!spec) throw new Error(`unsupported benchmark '${manifest.name || ""}'`);
   if (manifest.scorePath !== "score.json") throw new Error("benchmark.json scorePath must be score.json");
 
   const editablePaths = Array.isArray(manifest.editablePaths) ? manifest.editablePaths.map((item) => assertRepoRelativePath(item, "editablePaths")) : [];

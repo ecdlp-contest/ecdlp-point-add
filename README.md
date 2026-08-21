@@ -28,6 +28,9 @@ Lower is better.
 ./ecdlp.js run --note "describe the candidate"
 ```
 
+To install a contest-specific launcher without replacing another ECDLP contest's
+CLI, run `./install.sh`; it installs `ecdlp-point-add` by default.
+
 AI coding agents and autoresearch sessions must also read
 [`AGENTS.md`](AGENTS.md) before changing contestant code. Resume any existing
 local research state under `.workspace/autoresearch/` rather than recreating it.
@@ -95,16 +98,17 @@ be reflected in resource estimates; Gidney proposed 10 million shots with
 retry-rate-aware scoring. We use 102,400 shots—100 evenly batched waves of
 1,024—as a substantially stricter but still routine per-submission gate. Shot
 count alone would remain grindable with a public deterministic seed, so the
-trusted worker draws a fresh private seed only after the submitted `ops.bin` is
-locked, uses it for validation inputs and measurement randomness, and publishes
+trusted worker first reproduces and checks the submitted `ops.bin` commitment,
+then draws a fresh private seed, uses it only in the trusted evaluator for
+validation inputs and measurement randomness, and publishes
 it after acceptance for exact replay. This makes the checked cases
 unpredictable while preserving deterministic local development and reproducible
 accepted results. See [`docs/VALIDATION.md`](docs/VALIDATION.md) for the full
 threat model and replay protocol.
 
-## Checked-in baseline
+## Reference baseline
 
-The correctness-first baseline is an affine point-add circuit adapted from
+The correctness-first parent baseline is an affine point-add circuit adapted from
 public ECDSA Fail commit
 `da90a484510cf223b525ea84b3f2da9bccd6f8b3`. It uses two conservative
 Kaliski inverse/apply pairs with the full `2 * 256 - 1 = 511` schedule and
@@ -165,7 +169,8 @@ seed, or states why that replay is unavailable.
 | [Google private low-gate Pareto point dataset](https://zenodo.org/records/19597130) | [Google Quantum AI](https://arxiv.org/pdf/2603.28846) | 1,425 | 2,100,000 | 2,992,500,000 | not available (private circuit) |
 | [Public gate-optimized circuit `9b23c917`](https://gitlab.inria.fr/capsule/qarton-projects/ec-point-addition/-/commit/9b23c9170a636a7097a02afb3a3d6cbb6425c9f4) | [André Schrottenloher](https://arxiv.org/pdf/2606.02235) | 1,443 | 1,799,437 | 2,596,587,591 | not run (public Qarton circuit) |
 | [ECDSA.fail challenge initial baseline `f43a73e8`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/f43a73e871e18238a36889409943d008c2a0c2e9) | ECDSA.fail challenge | 2,715 | 3,942,753 | 10,704,574,395 | 0/5/0 |
-| [`2386bab`](https://github.com/ecdlp-contest/ecdlp-point-add/commit/2386bab6db30561e42cd16708c2bd4eb8e211b64) | repo baseline | _2,841_ | _5,180,786_ | _14,718,613,026_ | **0/0/0** |
+| [`2386bab`](https://github.com/ecdlp-contest/ecdlp-point-add/commit/2386bab6db30561e42cd16708c2bd4eb8e211b64) | reference baseline | _2,841_ | _5,180,786_ | _14,718,613,026_ | **0/0/0** |
+| [`513bfec`](https://github.com/ecdlp-contest/ecdlp-point-add/commit/513bfec) | current accepted candidate | _2,841_ | _5,180,781_ | _14,718,598,821_ | **0/0/0** |
 
 Every replayed public ECDSA.fail row is invalid under the current validation
 gate. The accepted-submission ladder from 1,150 through 1,203 has nonzero

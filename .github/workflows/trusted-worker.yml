@@ -25,26 +25,24 @@ jobs:
   trusted-worker:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    env:
-      ECDLP_API_URL: ${{ secrets.ECDLP_API_URL }}
-      ECDLP_TRUSTED_WORKER_TOKEN: ${{ secrets.ECDLP_TRUSTED_WORKER_TOKEN }}
-      ECDLP_WORKER_LIMIT: ${{ github.event.inputs.limit }}
-      ECDLP_WORKER_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
-      # This job holds the trusted-worker token and repo write access; never run
-      # the untrusted build_circuit unconfined. benchmark.sh fails closed on this.
-      ECDLP_REQUIRE_SANDBOX: "1"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
-          persist-credentials: true
-      # TODO(supply-chain): pin the two actions below to full commit SHAs (as
-      # checkout above and every action in benchmark.yml are). This privileged
-      # job must not resolve actions from mutable @v4 / @master refs.
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, pinned 2026-08-21
         with:
           toolchain: 1.93.0
       - name: Reproduce pending point-add submission
+        env:
+          ECDLP_API_URL: ${{ secrets.ECDLP_API_URL }}
+          ECDLP_TRUSTED_WORKER_TOKEN: ${{ secrets.ECDLP_TRUSTED_WORKER_TOKEN }}
+          ECDLP_WORKER_LIMIT: ${{ github.event.inputs.limit }}
+          ECDLP_WORKER_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          # The worker passes this token only to the final authenticated git push;
+          # child build and evaluation environments are allowlisted in the worker.
+          GITHUB_TOKEN: ${{ github.token }}
+          ECDLP_REQUIRE_SANDBOX: "1"
         run: node tools/trusted-worker.mjs
