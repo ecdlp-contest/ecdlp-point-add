@@ -156,9 +156,11 @@ if command -v bwrap >/dev/null 2>&1; then
   fi
   run_build=(
     "${bw[@]}"
-      --ro-bind / / --dev /dev --ro-bind /proc /proc
+      --ro-bind / / --dev /dev --proc /proc
       --bind "${ops_scratch}" "${ops_scratch}" --chdir "${ops_scratch}"
+      --clearenv
       --setenv TMPDIR "${ops_scratch}"
+      --setenv PATH "/usr/local/bin:/usr/bin:/bin"
       --unshare-user --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup
       --cap-drop ALL --new-session --die-with-parent
       --uid 65534 --gid 65534
@@ -170,7 +172,7 @@ elif [[ "$(uname -s)" == "Darwin" ]] && command -v sandbox-exec >/dev/null 2>&1;
   macos_profile="(version 1)(allow default)(deny file-write*)(allow file-write* (subpath \"${ops_scratch}\"))(allow file-write* (subpath \"/dev\"))(deny network*)"
   run_build=(
     sandbox-exec -p "${macos_profile}"
-      /bin/bash -c 'cd "$1" && export TMPDIR="$1" && exec "$2"' _ "${ops_scratch}" "${build_circuit_bin}"
+      /bin/bash -c 'cd "$1" && exec /usr/bin/env -i TMPDIR="$1" PATH="/usr/local/bin:/usr/bin:/bin" "$2"' _ "${ops_scratch}" "${build_circuit_bin}"
   )
 elif [[ "${ECDLP_REQUIRE_SANDBOX:-0}" == "1" || "${ECDLP_REQUIRE_SANDBOX:-}" == "true" ]]; then
   # Trusted/CI path: refuse to run untrusted contestant code without confinement.
@@ -245,6 +247,12 @@ rm -rf "${ops_scratch}"; ops_scratch=""
 if [[ ! -s ops.bin ]]; then
   echo "!! build_circuit did not produce ops.bin" >&2
   exit 1
+fi
+
+# The trusted worker uses this mode to reproduce and verify the submitted
+# artifact commitment before a private validation seed is generated.
+if [[ "${ECDLP_BUILD_ONLY:-0}" == "1" ]]; then
+  exit 0
 fi
 
 # 4. Trusted scoring stage (never imports contestant code).

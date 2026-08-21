@@ -33,10 +33,12 @@ that happens to pass the predictable cases and submit it with certainty.
 
 For each submission, the trusted reproduction worker therefore:
 
-1. locks the submitted `ops.bin`;
-2. draws a fresh private seed;
-3. folds that seed into the artifact-bound SHAKE256 domains for validation
-   inputs and per-shot measurement randomness;
+1. rebuilds `ops.bin` without credentials or a validation seed and verifies its
+   size and SHA-256 against the submitted commitment;
+2. only after that commitment check, draws a fresh private seed;
+3. passes that seed only to the trusted evaluator and folds it into the
+   artifact-bound SHAKE256 domains for validation inputs and per-shot measurement
+   randomness;
 4. runs the 102,400-shot trusted evaluation;
 5. publishes the seed in the trusted-worker report after acceptance.
 

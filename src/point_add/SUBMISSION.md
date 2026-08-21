@@ -43,14 +43,15 @@ average executed Toffolis, keeps the 2,841-qubit peak, and lowers the score by
 trusted run; the 102,400 shots were used only as a final verifier. There is no
 seed tuning, width truncation, approximate tail, or identity nonce.
 
-## Resubmission record
+## Historical parent resubmission
 
-Resubmitted 2026-08-19 with an unchanged circuit after an independent local
+The parent baseline was resubmitted on 2026-08-19 with an unchanged circuit
+after an independent local
 rerun (Windows, 16 workers x 64 bit-sliced shots) reproduced the identical
 artifact: 102,400/102,400 shots passed with zero classical, phase, and ancilla
 failures; the same 5,180,786.000 average executed Toffolis, 2,841 peak logical
 qubits, score 14,718,613,026, and byte-identical `ops.bin` SHA-256. The prior
-pending submission was withdrawn because its trusted-worker run failed on
+pending parent submission was withdrawn because its trusted-worker run failed on
 missing repository secrets before evaluation started.
 
 ## Prior baseline record

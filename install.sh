@@ -5,7 +5,7 @@ REPO_URL="${ECDLP_REPO_URL:-https://github.com/ecdlp-contest/ecdlp-point-add.git
 REPO_REF="${ECDLP_REPO_REF:-main}"
 INSTALL_DIR="${ECDLP_HOME:-$HOME/.local/share/ecdlp/ecdlp-point-add}"
 BIN_DIR="${ECDLP_BIN_DIR:-$HOME/.local/bin}"
-BIN_PATH="$BIN_DIR/ecdlp"
+BIN_PATH="${ECDLP_BIN_PATH:-$BIN_DIR/ecdlp-point-add}"
 
 say() { printf '%s\n' "$1"; }
 fail() { printf 'error: %s\n' "$1" >&2; exit 1; }
@@ -46,10 +46,10 @@ chmod +x "$BIN_PATH"
 
 say "Installed ecdlp to $BIN_PATH"
 say "Contest repo: $INSTALL_DIR"
-if ! command -v ecdlp >/dev/null 2>&1; then
-  say "Add $BIN_DIR to your PATH to run ecdlp from any shell."
+if ! command -v ecdlp-point-add >/dev/null 2>&1; then
+  say "Add $BIN_DIR to your PATH to run ecdlp-point-add from any shell."
 fi
 say "Try:"
 say "  cd $(shell_quote "$INSTALL_DIR")"
-say "  ecdlp --help"
-say "  ecdlp package --help"
+say "  ecdlp-point-add --help"
+say "  ecdlp-point-add package --help"

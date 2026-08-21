@@ -14,11 +14,23 @@ const DRY_RUN = process.env.ECDLP_WORKER_DRY_RUN === "1" || process.argv.include
 const NOTE_TEXT = "trusted worker reproduction";
 const TRACK_ID = "point-add-secp256k1-v1";
 const WORKER_ENV = { CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR || "target" };
+const CHILD_ENV_ALLOWLIST = [
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL",
+  "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CC", "CI",
+  "GITHUB_ACTIONS", "RUNNER_OS", "RUNNER_ARCH", "RUNNER_TEMP",
+];
 
 function readJson(filePath) { return JSON.parse(fs.readFileSync(path.resolve(filePath), "utf8")); }
+function sanitizedChildEnv(source = process.env, overrides = {}) {
+  const env = {};
+  for (const key of CHILD_ENV_ALLOWLIST) {
+    if (source[key] !== undefined) env[key] = source[key];
+  }
+  return { ...env, ...WORKER_ENV, FORCE_COLOR: "0", NO_COLOR: "1", ...overrides };
+}
 function run(command, args, options = {}) {
   console.log("> " + [command, ...args].join(" "));
-  const result = spawnSync(command, args, { cwd: options.cwd || ROOT_DIR, env: { ...process.env, ...WORKER_ENV, ...(options.env || {}) }, stdio: options.capture ? ["ignore", "pipe", "pipe"] : "inherit", encoding: "utf8", shell: false });
+  const result = spawnSync(command, args, { cwd: options.cwd || ROOT_DIR, env: sanitizedChildEnv(process.env, options.env || {}), stdio: options.capture ? ["ignore", "pipe", "pipe"] : "inherit", encoding: "utf8", shell: false });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(command + " failed with exit code " + result.status + (result.stderr ? "\n" + result.stderr : ""));
   return result.stdout || "";
@@ -122,7 +134,7 @@ function compareMetadata(metadata, submission) {
   assertPresent("submission.artifact_binary_sha256", submission.artifact_binary_sha256);
   assertPresent("submission.metrics.logical_qubits", submission.metrics?.logical_qubits);
   assertEqual("track_id", TRACK_ID, submission.track_id);
-  assertEqual("benchmark", metadata.benchmark, "ecadd-challenge-test");
+  assertEqual("benchmark", metadata.benchmark, "ecdlp-point-add");
   assertEqual("score_model", metadata.scoreModel, submission.score_model);
   assertEqual("artifact_binary_sha256", metadata.artifactSha256, submission.artifact_binary_sha256);
   assertEqual("architecture_diagram_path", metadata.architectureDiagram?.path, submission.architecture_diagram_path);
@@ -134,6 +146,14 @@ function compareMetadata(metadata, submission) {
   // reproduced values posted in the trusted-pass report.
   assertClose("score", metadata.localScore, submission.metrics?.score);
   assertClose("metrics.toffoli_count", metadata.metrics?.toffoli, submission.metrics?.toffoli_count);
+}
+function assertArtifactCommitment(submission, artifactPath = path.join(ROOT_DIR, "ops.bin")) {
+  assertPresent("submission.artifact_binary_sha256", submission.artifact_binary_sha256);
+  assertPresent("submission.metrics.logical_qubits", submission.metrics?.logical_qubits);
+  if (!fs.existsSync(artifactPath)) throw new Error("reproduced ops.bin is missing");
+  const artifact = fs.readFileSync(artifactPath);
+  assertEqual("artifact_binary_size_bytes", artifact.length, submission.metrics.artifact_binary_size_bytes);
+  assertEqual("artifact_binary_sha256", sha256(artifact), submission.artifact_binary_sha256);
 }
 function noteFileFor() { const notePath = ".trusted-worker-note.md"; fs.writeFileSync(path.join(ROOT_DIR, notePath), NOTE_TEXT + "\n"); return notePath; }
 function hasStagedChanges() { const result = spawnSync("git", ["diff", "--cached", "--quiet"], { cwd: ROOT_DIR, stdio: "ignore", shell: false }); if (result.error) throw result.error; return result.status === 1; }
@@ -157,10 +177,49 @@ function scrubSubmissionMetadata(manifest) {
   }
   for (const editablePath of manifest.editablePaths || []) removeSystemMetadataUnder(path.join(ROOT_DIR, editablePath));
 }
-function commitAndPush(submission, manifest, metadata) { for (const editablePath of manifest.editablePaths || []) run("git", ["add", editablePath]); if (!hasStagedChanges()) { console.log("No editable-path changes to commit; using current HEAD."); return currentCommit(); } run("git", ["config", "user.name", "ecdlp-trusted-worker"]); run("git", ["config", "user.email", "ecdlp-trusted-worker@users.noreply.github.com"]); run("git", ["commit", "-m", acceptCommitMessage(submission, metadata)]); run("git", ["push", "origin", "HEAD:main"]); return currentCommit(); }
+function githubPushEnv() {
+  const token = process.env.GITHUB_TOKEN || "";
+  if (!token) throw new Error("GITHUB_TOKEN is required to publish an accepted submission");
+  const authorization = Buffer.from(`x-access-token:${token}`).toString("base64");
+  return {
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+    GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${authorization}`,
+  };
+}
+function commitAndPush(submission, manifest, metadata) { for (const editablePath of manifest.editablePaths || []) run("git", ["add", editablePath]); if (!hasStagedChanges()) { console.log("No editable-path changes to commit; using current HEAD."); return currentCommit(); } run("git", ["config", "user.name", "ecdlp-trusted-worker"]); run("git", ["config", "user.email", "ecdlp-trusted-worker@users.noreply.github.com"]); run("git", ["commit", "-m", acceptCommitMessage(submission, metadata)]); run("git", ["push", "origin", "HEAD:main"], { env: githubPushEnv() }); return currentCommit(); }
 async function processSubmission(submission, manifest) {
   console.log("\nProcessing " + submission.submission_id + " (" + submission.track_id + ")");
-  const archivePath = path.join(ROOT_DIR, ".trusted-submission.tar.gz"); await downloadArchive(submission, archivePath); validateArchiveEntries(manifest, archivePath); resetGeneratedOutputs(); for (const editablePath of manifest.editablePaths || []) fs.rmSync(path.join(ROOT_DIR, editablePath), { recursive: true, force: true }); run("tar", ["-xzf", archivePath, "-C", ROOT_DIR]); scrubSubmissionMetadata(manifest); prepareScripts(); const validationSeed = crypto.randomBytes(32).toString("hex"); const sandboxEnv = { ECDLP_REQUIRE_SANDBOX: "1" }; run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "preflight"]); run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "setup"], { env: sandboxEnv }); run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "run", "--note", NOTE_TEXT], { env: { ...sandboxEnv, ECDLP_VALIDATION_SEED: validationSeed } }); run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "package", "--note-file", noteFileFor(manifest), "--model", submission.submitted_model || "trusted-worker"]); run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "validate", path.join(ROOT_DIR, "dist", "submission-metadata.json")]); const metadata = readJson(path.join(ROOT_DIR, "dist", "submission-metadata.json")); compareMetadata(metadata, submission); if (DRY_RUN) { console.log("dry-run: not committing source or posting trusted-pass"); return; } const acceptedCommit = commitAndPush(submission, manifest, metadata); const response = await requestJson(API_URL + "/api/submissions/" + encodeURIComponent(submission.submission_id) + "/trusted-pass", { method: "POST", body: JSON.stringify({ status: "passed", report: { worker: process.env.GITHUB_WORKFLOW || "contest-repo-trusted-worker", run_id: process.env.GITHUB_RUN_ID || null, accepted_repository: process.env.GITHUB_REPOSITORY || null, accepted_commit_sha: acceptedCommit, score: metadata.localScore, metrics: { score: metadata.localScore, logical_qubits: Math.round(Number(metadata.metrics?.qubits)), toffoli_count: Math.round(Number(metadata.metrics?.toffoli)) }, validation_seed: validationSeed, validation_seed_sha256: sha256(Buffer.from(validationSeed, "hex")), artifact_binary_sha256: metadata.artifactSha256, archive_sha256: submission.archive_sha256 || null } }) }); console.log("accepted " + response.submission_id + ": " + response.status + "/" + response.rank_status);
+  const archivePath = path.join(ROOT_DIR, ".trusted-submission.tar.gz");
+  await downloadArchive(submission, archivePath);
+  validateArchiveEntries(manifest, archivePath);
+  resetGeneratedOutputs();
+  for (const editablePath of manifest.editablePaths || []) fs.rmSync(path.join(ROOT_DIR, editablePath), { recursive: true, force: true });
+  run("tar", ["-xzf", archivePath, "-C", ROOT_DIR]);
+  scrubSubmissionMetadata(manifest);
+  prepareScripts();
+
+  const sandboxEnv = { ECDLP_REQUIRE_SANDBOX: "1" };
+  run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "preflight"]);
+  run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "setup"], { env: sandboxEnv });
+  run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "run", "--note", NOTE_TEXT], {
+    env: { ...sandboxEnv, ECDLP_BUILD_ONLY: "1" },
+  });
+  assertArtifactCommitment(submission);
+
+  // The committed artifact is reproduced and checked before this seed exists.
+  const validationSeed = crypto.randomBytes(32).toString("hex");
+  run(path.join(ROOT_DIR, "target", "release", "eval_circuit"), ["--note", NOTE_TEXT], {
+    env: { ECDLP_VALIDATION_SEED: validationSeed },
+  });
+  run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "package", "--note-file", noteFileFor(manifest), "--model", submission.submitted_model || "trusted-worker"]);
+  run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "validate", path.join(ROOT_DIR, "dist", "submission-metadata.json")]);
+  const metadata = readJson(path.join(ROOT_DIR, "dist", "submission-metadata.json"));
+  compareMetadata(metadata, submission);
+  if (DRY_RUN) { console.log("dry-run: not committing source or posting trusted-pass"); return; }
+  const acceptedCommit = commitAndPush(submission, manifest, metadata);
+  const response = await requestJson(API_URL + "/api/submissions/" + encodeURIComponent(submission.submission_id) + "/trusted-pass", { method: "POST", body: JSON.stringify({ status: "passed", report: { worker: process.env.GITHUB_WORKFLOW || "contest-repo-trusted-worker", run_id: process.env.GITHUB_RUN_ID || null, accepted_repository: process.env.GITHUB_REPOSITORY || null, accepted_commit_sha: acceptedCommit, score: metadata.localScore, metrics: { score: metadata.localScore, logical_qubits: Math.round(Number(metadata.metrics?.qubits)), toffoli_count: Math.round(Number(metadata.metrics?.toffoli)) }, validation_seed: validationSeed, validation_seed_sha256: sha256(Buffer.from(validationSeed, "hex")), artifact_binary_sha256: metadata.artifactSha256, archive_sha256: submission.archive_sha256 || null } }) });
+  console.log("accepted " + response.submission_id + ": " + response.status + "/" + response.rank_status);
 }
 async function reportTrustedFailure(submission, error) {
   if (DRY_RUN) return;
@@ -183,7 +242,15 @@ async function reportTrustedFailure(submission, error) {
   }
 }
 async function main() { if (process.argv.includes("--help") || process.argv.includes("-h")) return; if (!API_URL) throw new Error("ECDLP_API_URL is required"); if (!WORKER_TOKEN) throw new Error("ECDLP_TRUSTED_WORKER_TOKEN is required"); const manifest = readJson(path.join(ROOT_DIR, "benchmark.json")); const pending = await requestJson(API_URL + "/api/trusted-worker/submissions/pending?track_id=" + encodeURIComponent(TRACK_ID) + "&limit=" + encodeURIComponent(String(LIMIT))); if (!pending.rows.length) { console.log("No pending trusted-worker submissions for " + TRACK_ID + "."); return; } const failures = []; for (const submission of pending.rows) { try { await processSubmission(submission, manifest); } catch (error) { await reportTrustedFailure(submission, error); failures.push({ submission_id: submission.submission_id, error: error.message }); console.error("failed " + submission.submission_id + ": " + error.message); } } if (failures.length > 0) { console.error(JSON.stringify({ failures }, null, 2)); process.exit(1); } }
-export { acceptCommitMessage, coAuthorTrailer, isSystemMetadataPath, scrubSubmissionMetadata, validateArchiveEntries };
+export {
+  acceptCommitMessage,
+  assertArtifactCommitment,
+  coAuthorTrailer,
+  isSystemMetadataPath,
+  sanitizedChildEnv,
+  scrubSubmissionMetadata,
+  validateArchiveEntries,
+};
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   main().catch((error) => { console.error("trusted worker error: " + error.message); process.exit(1); });
