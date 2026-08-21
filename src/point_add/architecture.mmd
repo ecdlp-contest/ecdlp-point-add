@@ -2,43 +2,35 @@ flowchart TD
   Target["Target primitive: quantum P plus classical Q on secp256k1"]
   Algorithm["Algorithm"]
   Optimization["Optimization"]
-
   Target --> Algorithm
   Target --> Optimization
+  Algorithm --> Contract["ABI: quantum target x and y; preserved classical offset x and y"]
+  Algorithm --> Affine["Affine shell: coordinate differences, slope, output coordinates"]
+  Optimization --> Exact["Exact generated optimization blocks"]
 
-  Algorithm --> Contract["Four-register ABI: quantum target_x and target_y; preserved classical offset_x and offset_y"]
-  Algorithm --> Affine["Affine addition: lambda = (Py - Qy) / (Px - Qx)"]
-  Algorithm --> Reversible["Reversible compute, apply, and uncompute schedule"]
+  Affine --> Pair1["Kaliski pair 1: full 511-round inverse, apply, and uncompute"]
+  Pair1 --> Lambda["Remove inverse scale and form slope lambda"]
+  Lambda --> XCoord["Form output x and second denominator"]
+  XCoord --> Pair2["Kaliski pair 2: form output y while uncomputing lambda"]
+  Pair2 --> Result["Overwrite target with P plus Q and clean all ancillas"]
+  Contract --> Result
 
-  Contract --> Result["Overwrite target registers with R = P + Q"]
-  Affine --> Differences["Coordinate differences dx = Px - Qx and dy = Py - Qy"]
-  Differences --> Pair1["Kaliski pair 1: invert dx, apply dy times inverse, then uncompute"]
-  Pair1 --> Lambda["Remove the raw 2^511 inverse scale to obtain lambda"]
-  Lambda --> XCoordinate["Form Rx and the second denominator Qx - Rx"]
-  XCoordinate --> Pair2["Kaliski pair 2: uncompute lambda while forming Ry"]
-  Pair2 --> Result
-  Reversible --> Cleanup["Backward replays restore every inverse workspace and free lambda"]
-  Cleanup --> Result
+  Exact --> Square["Half-product exact square"]
+  Square --> Identity["x equals a plus 2^128 b; use a^2, b^2, and (a+b)^2 sequentially"]
+  Identity --> Fold["Apply five signed secp256k1 fold terms with full modular primitives"]
+  Fold --> Bennett["Uncompute every 256 or 258-bit product and the 129-bit sum"]
 
-  Optimization --> Baseline["Correctness-first baseline: full 2N - 1 = 511 Kaliski schedules"]
-  Optimization --> NonceFree["Nonce-free operation stream: no identity tail, tail rewrite, or seed grinding"]
-  Optimization --> Arithmetic["Cuccaro modular arithmetic with secp256k1 pseudo-Mersenne reductions"]
-  Optimization --> Fanout["Generated exact target-fanout rewrite at five source-bound windows"]
-  Optimization --> Frontier["Next frontier: derive exact local donor mechanisms without truncation failures"]
+  Exact --> Solinas["Exact Solinas power walk"]
+  Solinas --> Walk["22 modular doubles; center add or subtract; 22 modular halves"]
+  Walk --> Peak["Remove shift spill lifetime; peak moves to Kaliski step 4"]
 
-  Baseline --> ParentMetrics["Parent: 2841 qubits, 5180786 average Toffoli, score 14718613026"]
-  NonceFree --> FiatShamir["SHAKE256 test inputs derive only from the arithmetic stream"]
-  Arithmetic --> Karatsuba["Karatsuba multiplication between inverse pairs; schoolbook multiply/apply inside pairs"]
-  Fanout --> Identity["CCX(a,b,t); CX(t,u); CCX(a,b,t) becomes CX(t,u); CCX(a,b,u)"]
-  Identity --> Guard["Fail closed on index, lane, condition, or condition-depth drift"]
-  Guard --> Metrics["Candidate: 2841 qubits, 5180781 average Toffoli, score 14718598821"]
-  Frontier --> Evidence["Only a complete trusted 102400-shot pass establishes a valid improvement"]
+  Exact --> Fanout["Source-bound epoch target-fanout pass"]
+  Fanout --> Rule["CCX into temporary; commuting context; CX to output; inverse CCX becomes CX then CCX into output"]
+  Rule --> Guard["36 disjoint witnesses checked by indices, lanes, conditions, depths, and stream sizes"]
 
-  Result --> Validation["Trusted validation"]
-  ParentMetrics --> Validation
-  Metrics --> Validation
-  FiatShamir --> Validation
-  Karatsuba --> Validation
-  Evidence --> Validation
-  Validation --> Checks["102400 shots in 100 x 1024-shot waves: classical correctness, reversibility, phase cleanliness, and workspace cleanup"]
-  Validation --> Commitments["Package commitments: ops.bin hash plus architecture.mmd hash"]
+  Result --> Validation["Hardened trusted validation"]
+  Bennett --> Validation
+  Peak --> Validation
+  Guard --> Validation
+  Validation --> Checks["102400 shots: classical correctness, reversibility, phase cleanliness, ancilla cleanup"]
+  Validation --> Metrics["2820 qubits; 5211740 average Toffoli; score 14697106800"]

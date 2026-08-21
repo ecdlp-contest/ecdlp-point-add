@@ -2,61 +2,50 @@
 
 ## Algorithm
 
-This submission implements reversible mixed secp256k1 point addition: the
+This submission implements reversible mixed secp256k1 point addition. The
 quantum target point `P` is overwritten with `P + Q`, while the classical
-offset point `Q` is preserved. It uses affine addition with two conservative
-Kaliski inverse/apply pairs and explicit uncomputation of every workspace.
+offset point `Q` is preserved. The affine shell computes coordinate
+differences, uses two full 511-round Kaliski inverse/apply pairs, forms the
+slope and output coordinates, and reverses all workspaces.
 
-The operation stream is nonce-free. Both inverse pairs use the full
-`2 * 256 - 1 = 511` schedule; there is no identity tail, tail rewrite, or seed
-grinding.
+The operation stream is nonce-free. There is no identity tail, truncated
+inverse schedule, seed grinding, probabilistic guard, or approximate cleanup.
 
-The affine schedule is generated from a reviewed algorithm profile. A second
-generated module applies five fail-closed exact target-fanout rewrites to the
-emitted parent stream:
+## Exact generated optimizations
 
-```text
-CCX(a, b, t); CX(t, u); CCX(a, b, t)
-    =>
-CX(t, u); CCX(a, b, u)
-```
+The Rust source applies three fail-closed, exact transformations to the clean
+parent:
 
-Each rewrite restores `t`, preserves the XOR applied to `u`, and removes one
-CCX. The generated matcher binds all controls, targets, inline conditions,
-condition-stack depths, and absolute parent-stream indices before rewriting.
-Any source drift aborts circuit construction.
+1. The squaring branch splits `x = a + 2^128 b` and uses
+   `x^2 = a^2 + 2^128((a+b)^2-a^2-b^2) + 2^256 b^2`. It computes the three
+   half products sequentially in 256/258-bit registers and uncomputes each.
+2. Each secp256k1 Solinas `2^10` to `2^32` gap is implemented as 22 modular
+   doubles, the original center add/subtract, and 22 inverse modular halves.
+   This removes the former shift spill live range and moves the qubit peak.
+3. A generated source-bound epoch pass applies 36 exact target-fanout
+   identities across commuting contexts. It checks the expected input/output
+   stream sizes, absolute indices, qubits, conditions, and condition depths;
+   any parent drift aborts construction.
+
+The square and Solinas transformations use full modular primitives. They do
+not import reduced-width donor guards or partial overflow comparators.
 
 ## Trusted candidate evidence
 
-- 102,400/102,400 deterministic parallel Fiat-Shamir shots passed;
+The candidate was transplanted as only `src/point_add` onto contest main
+`ca69c0326ee1548afb68c7fb6780fc70ecc8a595`, then rebuilt and evaluated by the
+hardened native harness:
+
+- 102,400/102,400 deterministic Fiat-Shamir shots passed;
 - zero classical, phase, and ancilla failures;
-- 2,841 peak logical qubits;
-- 5,180,781.000 average executed Toffolis;
-- 40,922,095 emitted operations;
-- score 14,718,598,821;
+- 2,820 peak logical qubits;
+- 5,211,740.000 average executed Toffolis;
+- 41,431,550 emitted operations;
+- score 14,697,106,800;
 - `ops.bin` SHA-256
-  `f778dad9a0065a52c3ed1bbaf92de0578c74579476a4a545ed807e1da0bbc74c`.
+  `9619157cd04d1fc4427f4b0268a3b9ecd5308c38bb2ecec505fa7de919073b8f`.
 
-Relative to the clean baseline, this removes exactly five emitted and five
-average executed Toffolis, keeps the 2,841-qubit peak, and lowers the score by
-14,205. The transformation was selected from circuit structure before the
-trusted run; the 102,400 shots were used only as a final verifier. There is no
-seed tuning, width truncation, approximate tail, or identity nonce.
-
-## Historical parent resubmission
-
-The parent baseline was resubmitted on 2026-08-19 with an unchanged circuit
-after an independent local
-rerun (Windows, 16 workers x 64 bit-sliced shots) reproduced the identical
-artifact: 102,400/102,400 shots passed with zero classical, phase, and ancilla
-failures; the same 5,180,786.000 average executed Toffolis, 2,841 peak logical
-qubits, score 14,718,613,026, and byte-identical `ops.bin` SHA-256. The prior
-pending parent submission was withdrawn because its trusted-worker run failed on
-missing repository secrets before evaluation started.
-
-## Prior baseline record
-
-The accepted parent emitted 40,922,100 operations at 5,180,786 average executed
-Toffolis, 2,841 peak qubits, and score 14,718,613,026. The generated affine
-schedule reproduced that operation stream byte-for-byte before the exact
-fanout postpass was activated.
+The accepted parent scored 14,718,598,821 at 2,841 qubits. This candidate
+reduces the balanced score by 21,492,021. Structural alternatives were chosen
+using deterministic operation/allocation accounting; the 102,400 shots were
+used only as the final verifier, not as an optimization target.

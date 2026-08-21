@@ -54,8 +54,10 @@
 use alloy_primitives::U256;
 use crate::circuit::{BitId, Op, OperationType, QubitId, RegisterId};
 
+mod generated_epoch_fanout;
+mod generated_exact_solinas;
+mod generated_exact_square;
 mod generated_point_add;
-mod generated_exact_rewrites;
 
 struct B {
     pub ops: Vec<Op>,
@@ -1269,9 +1271,7 @@ fn mod_mul_write_into_zero_acc_schoolbook(
     mod_sub_qq_fast(b, acc, &hi, p);
     for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
     mod_add_qq_fast(b, acc, &hi, p);
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    mod_add_qq(b, acc, &hi, p);
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
+    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);
     b.set_phase("sol_halve_tail");
     for _ in 0..10 {
         mod_halve_inplace_fast(b, &hi, p);
@@ -1997,9 +1997,7 @@ fn mod_mul_add_into_acc_karatsuba_with_tmp_ext(
     mod_sub_qq_fast(b, acc, &hi, p);
     for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
     mod_add_qq_fast(b, acc, &hi, p);
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    mod_add_qq(b, acc, &hi, p);
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
+    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);
     for _ in 0..10 { mod_halve_inplace_fast(b, &hi, p); }
 
     karatsuba_inverse(b, x, y, tmp_ext, &z1_reg);
@@ -2051,13 +2049,11 @@ fn mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(
     b.set_phase("sol_add10");
     mod_add_qq_fast(b, acc, &hi, p);
     b.set_phase("kara_solinas_shift22L");
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
     b.set_phase("kara_solinas_post32_add");
-    // Use non-fast mod_add at peak site (after shift_left, with extra locals alive)
-    // to save 256 carry qubits at the expense of ~n Toffoli.
-    mod_add_qq(b, acc, &hi, p);
+    // The generated walk retains non-fast mod_add at this peak-sensitive site,
+    // saving its 256 carry qubits at the expense of about n Toffolis.
+    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);
     b.set_phase("kara_solinas_shift22R");
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
     b.set_phase("kara_solinas_post_halve");
     for _ in 0..10 { mod_halve_inplace_fast(b, &hi, p); }
 
@@ -2227,9 +2223,7 @@ fn mod_mul_add_into_acc_karatsuba2(
     mod_sub_qq_fast(b, acc, &hi, p);
     for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
     mod_add_qq_fast(b, acc, &hi, p);
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    mod_add_qq(b, acc, &hi, p);
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
+    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);
     b.set_phase("kara2_add_halve_tail");
     for _ in 0..10 { mod_halve_inplace_fast(b, &hi, p); }
 
@@ -2268,9 +2262,7 @@ fn mod_mul_write_into_zero_acc_karatsuba2(
     mod_sub_qq_fast(b, acc, &hi, p);
     for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
     mod_add_qq_fast(b, acc, &hi, p);
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    mod_add_qq(b, acc, &hi, p);
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
+    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);
     for _ in 0..10 { mod_halve_inplace_fast(b, &hi, p); }
 
     karatsuba_inverse_2level(b, x, y, &tmp_ext, &z1_reg, &z1_inner_a, &z1_inner_b);
@@ -2309,9 +2301,7 @@ fn mod_mul_add_into_acc_schoolbook(
     mod_sub_qq_fast(b, acc, &hi, p);  // position 6 (SUB because of 977 consolidation)
     for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
     mod_add_qq_fast(b, acc, &hi, p);  // position 10
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    mod_add_qq(b, acc, &hi, p);  // position 32
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
+    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);  // position 32
     b.set_phase("sol_halve_tail");
     for _ in 0..10 {
         mod_halve_inplace_fast(b, &hi, p);
@@ -2415,9 +2405,7 @@ fn squaring_add_to_acc_schoolbook(
     mod_sub_qq_fast(b, acc, &hi, p);
     for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
     mod_add_qq_fast(b, acc, &hi, p);
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    mod_add_qq(b, acc, &hi, p);
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
+    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);
     for _ in 0..10 {
         mod_halve_inplace_fast(b, &hi, p);
     }
@@ -2478,9 +2466,7 @@ fn squaring_sub_from_acc_schoolbook(
     mod_add_qq_fast(b, acc, &hi, p);  // sign flipped
     for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
     mod_sub_qq_fast(b, acc, &hi, p);
-    let (spill, flag_inv, ovf) = mod_shift_left_by_k(b, &hi, p, 22);
-    mod_sub_qq(b, acc, &hi, p);
-    mod_shift_right_by_k(b, &hi, p, 22, spill, flag_inv, ovf);
+    generated_exact_solinas::sub_power32_from_power10(b, acc, &hi, p);
     for _ in 0..10 {
         mod_halve_inplace_fast(b, &hi, p);
     }
@@ -2560,8 +2546,7 @@ fn mod_mul_sub_qq(
     let n = acc.len();
     let is_squaring = x[0] == y[0]; // same register → squaring
     if is_squaring {
-        // Use the schoolbook squarer for the squaring case (~170k savings).
-        squaring_sub_from_acc_schoolbook(b, acc, x, p);
+        generated_exact_square::squaring_sub_from_acc_half_products_exact(b, acc, x, p);
         return;
     }
     if false {
@@ -4265,5 +4250,5 @@ pub fn build() -> Vec<Op> {
         }
     }
 
-    generated_exact_rewrites::apply_exact_rewrites(b.ops.clone())
+    generated_epoch_fanout::apply_epoch_fanout(b.ops.clone())
 }
