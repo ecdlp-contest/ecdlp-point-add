@@ -230,8 +230,10 @@ flowchart TD
 
 The target must be the only root and have no incoming edge. Both explanation
 branches need at least one child. Add nodes and cross-links for the submitted
-algorithm, arithmetic blocks, cleanup, optimizations, metrics, and validation
-evidence.
+algorithm, arithmetic blocks, cleanup, optimizations, metrics, Toffoli depth,
+and validation evidence. The note and diagram must report the reviewed score,
+qubits, executed Toffolis, Toffoli depth, and 102,400-shot validation evidence;
+the note must also report the reviewed `ops.bin` SHA-256.
 
 Do not change these trusted contract files when comparing or submitting
 candidates:
@@ -270,6 +272,22 @@ Prepare and validate a submission package:
 ./ecdlp.js validate
 ```
 
+The final public note, including its `Model:` prefix, must be between 5 KiB and
+10 KiB of UTF-8 text. It must contain these non-empty Markdown sections; the
+CLI matches their headings case-insensitively by the listed keywords:
+
+1. `AI Model/Harness` (`model` and `harness`): identify the LLM, effort level,
+   and harness such as Codex app, Claude app, Claude Code, OpenClaw, or Hermes.
+2. `Summary` (`summary`): explain why and how the candidate can beat the prior
+   baseline.
+3. `Method` (`method`): explain how the submitted implementation works.
+4. `Result` (`result` or `results`): report measured results and validation.
+`Caveat and what is left`, `Credit`, `References`, and `Comments` sections are
+optional. Caveats may document risks, limitations, remaining work, next steps,
+or future opportunities. Credit may name a GitHub username and commit link;
+references may cite related work; comments may include any additional submitter
+context.
+
 The evaluator writes `ops.bin`, `score.json`, and the append-only benchmark
 history `results.tsv`; packaging writes under `dist/`. These are generated
 artifacts and must not be hand-edited.
@@ -288,11 +306,16 @@ trusted rerun:
 
 ```bash
 ./ecdlp.js login <api-key>
-./ecdlp.js submit --watch
+./ecdlp.js submit --confirm-docs-truthful --watch
 ```
 
 Pass `--source-url https://github.com/<org>/<repo>/pull/<id>` only when public
-source or pull-request context is available for reviewers.
+source or pull-request context is available for reviewers. The packaged note
+and model cannot be overridden at submit time; edit the canonical note, rebuild
+the package, and then submit it. Immediately
+before upload, `submit` asks the contender agent to inspect the packaged note and
+diagram, verbally give the user its truthfulness/relevant-detail verdict, and
+rerun with `--confirm-docs-truthful` only when that verdict is yes.
 
 The CLI rejects an equal-or-worse candidate against the current accepted
 leaderboard. Server receipt is not promotion: the trusted worker must reproduce
