@@ -155,7 +155,6 @@ function assertArtifactCommitment(submission, artifactPath = path.join(ROOT_DIR,
   assertEqual("artifact_binary_size_bytes", artifact.length, submission.metrics.artifact_binary_size_bytes);
   assertEqual("artifact_binary_sha256", sha256(artifact), submission.artifact_binary_sha256);
 }
-function noteFileFor() { const notePath = ".trusted-worker-note.md"; fs.writeFileSync(path.join(ROOT_DIR, notePath), NOTE_TEXT + "\n"); return notePath; }
 function hasStagedChanges() { const result = spawnSync("git", ["diff", "--cached", "--quiet"], { cwd: ROOT_DIR, stdio: "ignore", shell: false }); if (result.error) throw result.error; return result.status === 1; }
 function currentCommit() { return run("git", ["rev-parse", "HEAD"], { capture: true }).trim(); }
 function coAuthorTrailer(submission) {
@@ -212,7 +211,10 @@ async function processSubmission(submission, manifest) {
   run(path.join(ROOT_DIR, "target", "release", "eval_circuit"), ["--note", NOTE_TEXT], {
     env: { ECDLP_VALIDATION_SEED: validationSeed },
   });
-  run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "package", "--note-file", noteFileFor(manifest), "--model", submission.submitted_model || "trusted-worker"]);
+  // Repackage the canonical note from the submitted editable tree. A
+  // placeholder note would allow the uploaded prose to diverge from
+  // SUBMISSION.md.
+  run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "package", "--model", submission.submitted_model || "trusted-worker"]);
   run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "validate", path.join(ROOT_DIR, "dist", "submission-metadata.json")]);
   const metadata = readJson(path.join(ROOT_DIR, "dist", "submission-metadata.json"));
   compareMetadata(metadata, submission);

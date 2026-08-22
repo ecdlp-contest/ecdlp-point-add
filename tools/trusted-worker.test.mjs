@@ -75,7 +75,7 @@ test("artifact commitment must match before trusted evaluation", () => {
   );
 });
 
-test("archive validation accepts only regular editable-path entries", () => {
+test("archive validation accepts only regular editable-path entries", (t) => {
   const manifest = { editablePaths: ["src/point_add"] };
   const valid = makeArchive("valid", [
     { path: "src/point_add/mod.rs", contents: "pub fn build() {}\n" },
@@ -88,11 +88,16 @@ test("archive validation accepts only regular editable-path entries", () => {
   ]);
   assert.throws(() => validateArchiveEntries(manifest, outside), /outside editable paths/);
 
-  const symlink = makeArchive("symlink", [
-    { path: "src/point_add/mod.rs" },
-    { path: "src/point_add/escape", symlink: "../../benchmark.json" },
-  ]);
-  assert.throws(() => validateArchiveEntries(manifest, symlink), /not a regular file or directory/);
+  try {
+    const symlink = makeArchive("symlink", [
+      { path: "src/point_add/mod.rs" },
+      { path: "src/point_add/escape", symlink: "../../benchmark.json" },
+    ]);
+    assert.throws(() => validateArchiveEntries(manifest, symlink), /not a regular file or directory/);
+  } catch (error) {
+    if (error?.code !== "EPERM") throw error;
+    t.diagnostic("Windows symlink privilege unavailable; symlink archive case skipped");
+  }
 });
 
 test("worker orders artifact verification before private seed generation", () => {

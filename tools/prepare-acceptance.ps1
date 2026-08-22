@@ -33,7 +33,9 @@ Push-Location (Split-Path -Parent $PSScriptRoot)
 try {
   Invoke-NativeChecked powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
   Invoke-NativeChecked powershell -NoProfile -ExecutionPolicy Bypass -File .\benchmark.ps1 -Note $Note
-  Invoke-NativeChecked powershell -ExecutionPolicy Bypass -File tools\package-submission.ps1 -NoteFile src\point_add\memory\README.md -Model $Model
+  # Use the canonical packager so this helper applies the note contract.
+  Invoke-NativeChecked node .\ecdlp.js package --note-file src\point_add\SUBMISSION.md --model $Model
+  Invoke-NativeChecked node .\ecdlp.js validate
 
   $score = Get-Content score.json | ConvertFrom-Json
   $metadata = Get-Content dist\submission-metadata.json | ConvertFrom-Json

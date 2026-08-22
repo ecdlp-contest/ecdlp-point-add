@@ -12,6 +12,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$MinSubmissionNoteBytes = 5 * 1024
 $MaxSubmissionNoteBytes = 10 * 1024
 $MaxSubmissionArchiveBytes = 25 * 1024 * 1024
 $MaxArchitectureBytes = 1024 * 1024
@@ -252,10 +253,54 @@ try {
   if ($Model.Trim().Length -eq 0) {
     throw "submission model is required"
   }
+  $headingMatches = [regex]::Matches(
+    $rawNote,
+    "(?m)^\s{0,3}(?<marks>#{1,6})\s+(?<title>.+?)\s*#*\s*$"
+  )
+  $sections = @()
+  for ($headingIndex = 0; $headingIndex -lt $headingMatches.Count; $headingIndex++) {
+    $heading = $headingMatches[$headingIndex]
+    $level = $heading.Groups["marks"].Value.Length
+    $bodyEnd = $rawNote.Length
+    for ($nextIndex = $headingIndex + 1; $nextIndex -lt $headingMatches.Count; $nextIndex++) {
+      if ($headingMatches[$nextIndex].Groups["marks"].Value.Length -le $level) {
+        $bodyEnd = $headingMatches[$nextIndex].Index
+        break
+      }
+    }
+    $bodyStart = $heading.Index + $heading.Length
+    $normalizedHeading = (
+      [regex]::Replace(
+        $heading.Groups["title"].Value.ToLowerInvariant(),
+        "[^a-z0-9]+",
+        " "
+      )
+    ).Trim()
+    $sections += [pscustomobject]@{
+      Heading = $normalizedHeading
+      Body = $rawNote.Substring($bodyStart, $bodyEnd - $bodyStart).Trim()
+    }
+  }
+  $requiredSectionChecks = @(
+    @{ Name = "AI Model/Harness"; Match = { param($heading) $heading -match "\bmodel\b" -and $heading -match "\bharness\b" } },
+    @{ Name = "Summary"; Match = { param($heading) $heading -match "\bsummary\b" } },
+    @{ Name = "Method"; Match = { param($heading) $heading -match "\bmethod\b" } },
+    @{ Name = "Result"; Match = { param($heading) $heading -match "\bresults?\b" } }
+  )
+  foreach ($check in $requiredSectionChecks) {
+    $matchScript = $check.Match
+    $matchingSections = @($sections | Where-Object { & $matchScript $_.Heading })
+    if ($matchingSections.Count -eq 0) {
+      throw "submission note is missing required Markdown section '$($check.Name)'"
+    }
+    if (-not ($matchingSections | Where-Object { $_.Body.Length -gt 0 } | Select-Object -First 1)) {
+      throw "submission note required Markdown section '$($check.Name)' must not be empty"
+    }
+  }
   $submissionNote = "Model: $($Model.Trim())`n`n$rawNote"
   $noteBytes = $Utf8NoBom.GetByteCount($submissionNote)
-  if ($noteBytes -gt $MaxSubmissionNoteBytes) {
-    throw "submission note must be at most $MaxSubmissionNoteBytes bytes ($noteBytes bytes provided)"
+  if ($noteBytes -lt $MinSubmissionNoteBytes -or $noteBytes -gt $MaxSubmissionNoteBytes) {
+    throw "submission note must be between $MinSubmissionNoteBytes and $MaxSubmissionNoteBytes UTF-8 bytes ($noteBytes bytes provided)"
   }
 
   $scorePath = Resolve-RepoPath $RepoRoot $manifest.scorePath

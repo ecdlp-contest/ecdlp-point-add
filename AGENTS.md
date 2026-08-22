@@ -269,6 +269,17 @@ terminal runs, including rejected and invalid runs.
 
 ### Submission boundary
 
+The final packaged public note, including the `Model:` prefix, must be between
+5 KiB and 10 KiB of UTF-8 text. It must have non-empty Markdown sections whose
+headings match `AI Model/Harness`, `Summary`, `Method`, and `Result`. `Caveat and
+what is left`, `Credit`, `References`, and `Comments` are optional. See
+`README.md` for the accepted heading-keyword variants and required content.
+At upload time, the contender AI agent must inspect the packaged implementation,
+note, diagram, and evidence; correct and repackage false, stale, unsupported,
+misleading, or irrelevant content; explicitly tell the user the yes/no
+truthfulness and relevant-detail verdict; and pass
+`--confirm-docs-truthful` to `ecdlp submit` only when the verdict is yes.
+
 Before packaging or submitting, verify that the payload contains no autoresearch
 documents, helper tools, logs, worktrees, target directories, caches, generated
 artifacts, credentials, or machine-specific information. Only files allowed by
