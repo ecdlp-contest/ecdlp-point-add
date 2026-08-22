@@ -174,7 +174,6 @@ seed, or states why that replay is unavailable.
 | [Public gate-optimized circuit `9b23c917`](https://gitlab.inria.fr/capsule/qarton-projects/ec-point-addition/-/commit/9b23c9170a636a7097a02afb3a3d6cbb6425c9f4) | [André Schrottenloher](https://arxiv.org/pdf/2606.02235) | 1,443 | 1,799,437 | 2,596,587,591 | not run (public Qarton circuit) |
 | [ECDSA.fail challenge initial baseline `f43a73e8`](https://github.com/Layr-Labs/ecdsafail-challenge/commit/f43a73e871e18238a36889409943d008c2a0c2e9) | ECDSA.fail challenge | 2,715 | 3,942,753 | 10,704,574,395 | 0/5/0 |
 | [`2386bab`](https://github.com/ecdlp-contest/ecdlp-point-add/commit/2386bab6db30561e42cd16708c2bd4eb8e211b64) | reference baseline | _2,841_ | _5,180,786_ | _14,718,613,026_ | **0/0/0** |
-| [`513bfec`](https://github.com/ecdlp-contest/ecdlp-point-add/commit/513bfec) | current accepted candidate | _2,841_ | _5,180,781_ | _14,718,598,821_ | **0/0/0** |
 
 Every replayed public ECDSA.fail row is invalid under the current validation
 gate. The accepted-submission ladder from 1,150 through 1,203 has nonzero
