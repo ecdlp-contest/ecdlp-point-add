@@ -39,6 +39,11 @@ test("package enforces the 5-10 KiB section contract and submit requires the con
     shell: false,
   });
 
+  const canonicalNote = fs.readFileSync(path.join(root, "src", "point_add", "SUBMISSION.md"), "utf8");
+  fs.writeFileSync(path.join(pointAdd, "SUBMISSION.md"), canonicalNote);
+  const canonicalPackage = run("package", "--model", "Historical model fixture");
+  assert.equal(canonicalPackage.status, 0, `${canonicalPackage.stdout}\n${canonicalPackage.stderr}`);
+
   fs.writeFileSync(path.join(pointAdd, "SUBMISSION.md"), "# Too short\n");
   const tooShort = run("package", "--model", "Test Agent");
   assert.notEqual(tooShort.status, 0);

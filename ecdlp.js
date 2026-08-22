@@ -197,6 +197,10 @@ Commands:
   logs         Print server-side validation logs
   leaderboard  Show accepted submissions for a track
 
+Execution model:
+  Prepare the contest repository and run its pinned ./ecdlp.js from the repo
+  root. A global ecdlp shim may delegate here but carries no separate contract.
+
 Help:
   ecdlp setup --help
   ecdlp preflight --help
