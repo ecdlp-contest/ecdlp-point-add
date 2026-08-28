@@ -1,183 +1,189 @@
-# Qarton classical-Q point addition
+# Generated 1,283-qubit Qarton hybrid point addition
 
 ## AI Model / Harness
 
-This candidate was implemented by OpenAI Codex based on GPT-5 in the Codex
-desktop application. The work used the repository's autoresearch isolation
-contract, a per-run Git worktree, a per-run Cargo target, Python/Qarton 1.0.0 for
-source extraction, WSL2 Ubuntu 24.04 for Rust builds, and the unchanged trusted
-`build_circuit` and `eval_circuit` binaries. The application did not expose a
-separate user-facing reasoning-effort label, so none is invented here.
+This candidate was prepared with OpenAI GPT-5.6 Sol in the Codex desktop
+application. The reasoning-effort setting was not exposed to this task, so it
+is not guessed. The work used the contest repository's isolated development
+workflow, Python/Qarton 1.0.0 for circuit construction, and the repository-pinned
+ECDLP CLI with the unchanged trusted Rust builder and evaluator.
+
+The active Rust replay wrapper is generated output. It and its compressed QPRT
+payload were produced deterministically from the pinned Qarton construction.
+Neither contains a validation nonce, sampled-input table, target-side correction,
+or evaluator-derived patch.
 
 ## Summary
 
-The candidate is a direct operation-stream Rust port of André Schrottenloher's
-Qarton secp256k1 point-addition circuit, adapted from its fixed-point one-bit
-window interface to the contest's arbitrary classical-Q ABI. The source anchor
-is `ec-point-addition` commit
-`9b23c9170a636a7097a02afb3a3d6cbb6425c9f4` with Qarton 1.0.0.
+This submission replaces the accepted 1,536-qubit Qarton replay with a hybrid
+4.0-margin circuit. It retains the same four-register contest ABI and the same
+reversible classical-Q adaptation of André Schrottenloher's point-addition
+circuit. The inversion uses a gate-efficient shrinking binary-GCD value walk
+and a space-efficient full-width coefficient replay.
 
-The circuit exposes the required four registers: quantum `P.x[256]`, quantum
-`P.y[256]`, classical `Q.x[256]`, and classical `Q.y[256]`. It overwrites P with
-P+Q and preserves Q. Fixed lookups become reversible classical loads. The
-precomputed `3*Q.x` lookup becomes three modular additions from one recyclable
-loaded Q.x word. Q.x is not retained across the inverse, avoiding roughly 256
-additional peak qubits.
+The frozen operation stream passed 102,400 deterministic local shots with zero
+classical mismatches, zero phase-garbage batches, and zero ancilla-garbage
+batches. It measured 1,283 peak logical qubits, 2,502,170.191 average executed
+Toffolis, 8,022,141.868 average executed Clifford operations, and 12,377,821
+emitted operations. After contest rounding, the balanced score is
+3,210,284,110.
 
-The first 2.4-sigma adapter reproduced the low resource envelope at 1,441 qubits
-and 1,804,545 Qarton-weighted CCX, but it was invalid: the trusted 102,400-shot
-run found three classical failures, one phase-garbage batch, and three
-ancilla-garbage batches. Qarton's source describes the 2.4-sigma inversion
-profile as allowing approximately one failure per 10,000--20,000 inversions.
-That result is retained as negative evidence and is not presented as valid.
-
-The active candidate raises both inversion safety margins to 6.0. The unchanged
-trusted evaluator passed all 102,400 deterministic local shots with zero
-classical, phase, or ancilla failures. It uses 1,536 qubits, averages
-2,241,864.716 executed Toffolis, and has rounded score 3,443,504,640. The
-95-qubit increase is not Rust overhead: it is already present in Qarton's
-allocation and comes from the longer, more heavily padded 6-sigma inverse.
+The currently accepted 1,536-qubit route scores 3,443,495,424. The submitted
+candidate reduces that by 233,211,314, about 6.77%. It exchanges roughly
+260,305 additional average Toffolis for 253 fewer peak qubits, which improves
+the balanced product.
 
 ## Method
 
-### Classical-Q source adaptation
+### Source construction and contest ABI
 
-The Python reference circuit has two quantum `ModIntType(p)` registers followed
-by two classical 256-bit registers. A Q coordinate is loaded into a clean quantum
-word by applying an X conditioned on each corresponding classical bit. Applying
-the same gates again clears that word. This preserves Q and adds no Toffoli cost
-to the lookup itself.
+The source anchor is André Schrottenloher, *Optimized Point Addition Circuits
+for Shor's Algorithm*, arXiv:2606.02235, and its public
+`ec-point-addition` Python/Qarton implementation at commit
+`9b23c9170a636a7097a02afb3a3d6cbb6425c9f4`.
 
-The first stage loads Q.x and Q.y, performs the original coordinate subtractions,
-and unloads both words before the in-place modular division. This preserves the
-paper circuit's important workspace lifetime: no 256-bit Q word is live across
-the inverse.
+The original Qarton primitive selects a fixed point with a quantum selector.
+The contest instead requests unconditional addition of an arbitrary
+runtime-classical point. The adapter exposes exactly four registers, in the
+required order:
 
-The second fixed lookup originally loaded the compile-time constant `3*Q.x`.
-Runtime Q prevents that precomputation. The adapter loads Q.x once, performs
-three complete modular additions into the original accumulator, and unloads
-Q.x. This costs two additional modular additions but reuses the same lifetime.
+1. quantum `P.x[256]`;
+2. quantum `P.y[256]`;
+3. classical preserved `Q.x[256]`;
+4. classical preserved `Q.y[256]`.
 
-The controlled square-add stage was originally enabled when the selector was
-nonzero. The adapter binds its control to a temporary `|1>` qubit and clears it.
-The following controlled negation becomes unconditional. Finally, Q.x and Q.y
-are loaded again for the output-coordinate stage and uncomputed immediately.
+A classical Q coordinate is loaded into a clean quantum word with X operations
+conditioned on the corresponding classical bits. Applying the same operations
+after the arithmetic unloads the word and preserves Q. The first stage loads
+Q.x and Q.y, performs the coordinate differences, and unloads both words before
+the inverse. No 256-qubit Q register therefore remains live through the inverse
+workspace peak.
 
-### Reliability hardening
+The fixed source circuit precomputes `3*Q.x`. Runtime Q prevents that lookup, so
+the adapter loads Q.x once, performs three modular additions into the original
+accumulator, and unloads Q.x. The source selector is specialized to true, and
+finite-point flags are specialized under the benchmark domain, which excludes
+infinity and equal-x exceptional inputs. Q.x and Q.y are loaded again only for
+the final coordinate stage and are uncomputed immediately.
 
-The paper repository sets `ITERATIONS_VAR = 2.4` and `U_PAD_VAR = 2.3` for the
-binary-GCD schedule. Its source explicitly calls this an approximate choice with
-expected failures. A contest candidate cannot accept that failure model because
-every one of 102,400 fresh-seeded shots must pass.
+### Hybrid inverse profile
 
-The active generation profile sets both margins to 6.0 before constructing the
-memoized inverse circuits. This increases the Qarton allocation from 1,441 to
-1,536 qubits and the weighted CCX estimate from 1,804,545 to 2,242,731. The
-active stream is a reliability-hardened derivative; it does not claim to
-reproduce the paper's exact resource row.
+The candidate splits the modular inverse into two independently selected
+backends. The shrinking binary-GCD value walk uses the gate-efficient backend;
+the full-width coefficient replay uses the space-efficient backend. Both the
+fixed-iteration safety margin and signed-coefficient padding margin are 4.0.
+The generated schedule has 426 fixed rounds and a 710-bit packed dialog.
 
-The delta occurs before the language boundary: Python/Qarton allocates 1,441
-wires at 2.4 sigma and 1,536 at 6 sigma. `ITERATIONS_VAR` lengthens the fixed
-inverse schedule and `U_PAD_VAR` widens its signed coefficient workspace. Rust
-preserves those assigned wire indices; decoding and compression add no qubits.
+This resource reduction occurs before the Rust language boundary. Qarton assigns
+the 1,283-wire peak while constructing the circuit; decoding and compression do
+not compress wire identifiers or change lifetimes. Compared with the accepted
+6.0-margin route, the shorter inverse schedule and smaller signed coefficient
+workspace reduce peak qubits but raise the probability of an approximation
+boundary being reached.
 
-### Operation-preserving Rust replay
+### Deterministic operation lowering
 
 The fully decomposed, classical-last Qarton circuit is streamed into a canonical
-IR. The 6-sigma source stream SHA-256 is
-`2edf1a06c4c285b20fce52eef6c28783ccb9563a0f4bd4dd241d9bc144031f2e`.
-Every operation is lowered to the contest vocabulary and encoded as a compact
-versioned replay. The lowered-record SHA-256 is
-`97c0329cdb77b80458972682a56dadd83565037cdd1dc04648b49e13c1cb8dda`.
+operation representation. A clean forward reconstruction emitted 12,904,572
+source operations and reproduced the source-stream SHA-256:
 
-All 1,097,858 adjacent Qarton `H; MSR` pairs become HMR. Remaining Hadamards
-belong to measurement-uncompute phase workspaces: an ancilla is prepared as
-`|->`, receives a CCX on its target, and is unprepared. The lowering replaces
-that exact phase-kickback gadget with CZ. One classical control uses
-`c_condition`; two controls additionally use the trusted condition stack.
+`18a114949e77ad5f586f58523d8ba261616e0892568b29cfe2d80b69a05a4917`.
 
-The replay is zstd-compressed and decoded by Rust into validated `Op` values.
-The decoder checks magic, qubit count, classical-bit count, gate count, record
-boundaries, operand aliases through `Op::validate`, and trailing bytes. Tests
-traverse the complete fixed-point and classical-Q replays and check gate totals.
+The classical-Q adapter performs five 256-bit coordinate loads and the five
+matching unloads. Adjacent Q.x/Q.y copies appear as 512-operation runs, for
+2,560 classically controlled X operations in total. Qarton AND gates are
+lowered consistently to CCX at source generation time; this is not a later
+change to the Rust target.
+
+The source operations are lowered to the contest vocabulary and encoded in a
+versioned QPRT replay:
+
+- adjacent Qarton `H; MSR` becomes the contest HMR operation;
+- a phase CCX targeting `|->` becomes the equivalent CZ correction;
+- one classical control becomes `c_condition`;
+- two classical controls additionally use the trusted condition stack; and
+- register declarations and ordered operands are preserved.
+
+The lowered-record SHA-256 is
+`a35c38d09fe8777333b15cf93c05964a564544990f42f79a8b1feb21472bb888`.
+The QPRT SHA-256 is
+`a4f6f22453d26643df63e977e79292068cc5b143f9705d585ae93bb3677354f7`,
+and the compressed payload SHA-256 is
+`42c86d6903b66b7a6c3d16a8d01dad9f1b8962f18241666e872555358a2b1b7d`.
+
+The public Rust wrapper contains the immutable census constants, payload
+inclusion, decoder invocation, and complete-stream tests. The accepted
+`qarton_fixed_port` decoder is unchanged. It checks replay magic, qubit and
+classical-bit counts, record boundaries, operand aliases through
+`Op::validate`, and trailing bytes before returning the operation vector.
+
+### Reproducibility controls
+
+The generator fixes the Qarton repository commit, Qarton version, source
+parameters, operation ordering, and payload hashes. Rust is an output of that
+pipeline. The evaluator operates only on `ops.bin`; it does not import the
+Python construction or use submission-side testing data.
+
+The local operation commitment is
+`b9ab2819553e845a7aab7cf27c02fe4e280f71b11edcd40d26896414ddddac08`.
+That commitment identifies the circuit evaluated for the metrics below. Any
+source, parameter, lowering, or payload change must produce a new commitment
+and undergo a complete evaluation again.
 
 ## Result
 
-The default build emits the reliability-hardened adapter without an environment
-switch. Rebuilding after activation produced the same evaluated `ops.bin`, with
-SHA-256
-`713dfb1c5c0ff91381afc4b4d765a9b54a85e82278c89ba56e64228bf534de03`.
+The frozen local evaluation reported:
 
-The unchanged trusted evaluator reported:
+| Metric | Result |
+| --- | ---: |
+| Shots | 102,400 |
+| Classical mismatches | 0 |
+| Phase-garbage batches | 0 |
+| Ancilla-garbage batches | 0 |
+| Peak logical qubits | 1,283 |
+| Average executed Toffoli | 2,502,170.191 |
+| Average executed Toffoli depth | 2,502,170.191 |
+| Average executed Clifford | 8,022,141.868 |
+| Emitted operations | 12,377,821 |
+| Rounded balanced score | 3,210,284,110 |
 
-- 102,400 of 102,400 deterministic commitment-only shots passed;
-- zero classical mismatches;
-- zero phase-garbage batches;
-- zero ancilla-garbage batches;
-- 1,536 peak logical qubits;
-- 2,241,864.716 average executed Toffolis;
-- 9,526,511.625 average executed Clifford operations;
-- 13,764,960 emitted operations; and
-- rounded balanced score 3,443,504,640.
+The decoded stream contains 2,572,427 CCX operations, 704,099 HMR operations,
+577,162 CZ operations, and 91,428 paired two-control condition scopes. The
+trusted builder declares 1,028 register operations and preserves the four ABI
+registers in their required order.
 
-The full locked offline release test suite also passed. It includes complete
-decoder tests for the paper-signature replay and the active classical-Q replay.
-
-## Reduction opportunities
-
-The following are prospective optimizations, not claims about the validated
-artifact. Each would require regenerating the source and lowered hashes and
-rerunning the complete trusted gate.
-
-1. **Tune the margins independently.** Both parameters moved directly to 6.0.
-   Sweeping `ITERATIONS_VAR` and `U_PAD_VAR` separately may recover inverse
-   rounds, coefficient width, and part of the 95-qubit delta. Any smaller choice
-   needs a justified tail bound plus independent-seed testing; a local pass alone
-   does not prove the failure probability is acceptable.
-2. **Use a reversible overflow path.** A narrower common coefficient register
-   plus an overflow flag and exact uncomputed fallback could avoid sizing every
-   input for the 6-sigma tail. Simple truncation is invalid and would recreate
-   the rejected 2.4-sigma failures.
-3. **Optimize runtime `3*Q.x`.** A secp256k1-specialized modular doubling plus
-   one addition, or a fused shift/add with pseudo-Mersenne correction, may beat
-   three generic modular additions. Schedule its scratch outside the inverse
-   peak so a gate saving does not increase qubits.
-4. **Improve source-level lifetimes.** Reuse coefficient/comparison scratch
-   across mutually exclusive binary-GCD phases, shrink active widths over the
-   schedule, and cancel compute/uncompute pairs before allocation. Serialization
-   alone cannot reduce the declared peak.
-5. **Extend verified lowering peepholes.** Beyond the existing HMR and CZ
-   rewrites, look for cancellable classical loads, condition scopes, and inverse
-   gate pairs across block boundaries. Require local equivalence checks and full
-   trusted validation for every rewrite.
-
-## Credit and references
-
-The point-addition architecture, optimized modular arithmetic, bounded binary-GCD
-schedule, and original Qarton implementation are the work of André
-Schrottenloher. This submission is a Rust operation-stream port and contest-ABI
-adaptation of that work; it does not claim authorship of the underlying paper
-construction or Python algorithms.
-
-- André Schrottenloher, *Optimized Point Addition Circuits for Shor's Algorithm*,
-  [arXiv:2606.02235](https://arxiv.org/abs/2606.02235).
-- André Schrottenloher's Python/Qarton implementation,
-  [`ec-point-addition`](https://gitlab.inria.fr/capsule/qarton-projects/ec-point-addition),
-  source commit `9b23c9170a636a7097a02afb3a3d6cbb6425c9f4`.
-- Qarton 1.0.0, used to construct, decompose, allocate, and resource-count the
-  source circuit before deterministic lowering to the Rust replay.
+The submission is rebuilt and packaged by the current repository-pinned CLI.
+Server receipt alone is not a ranked result: the trusted worker must reproduce
+the submitted operation commitment and pass all 102,400 shots using a fresh
+private seed.
 
 ## Caveat and what is left
 
-The successful campaign used the deterministic local commitment-only seed. It
-is strong stream-qualified evidence but not a server-seeded receipt and not an
-all-input proof. The 6-sigma parameters make the bounded-GCD failure mechanism
-substantially less likely; they do not prove the bound can never be exceeded.
+The inverse schedule and several special-prime arithmetic paths use bounded
+approximations. The clean local 102,400-shot cohort is strong evidence about
+these exact bytes, but it does not prove every exceptional event unreachable
+or predict the private validation seed. A server-seeded mismatch, phase event,
+or dirty ancilla would invalidate this candidate despite its lower score.
 
-The benchmark excludes infinity and equal-x inputs. The specialization depends
-on that domain and is not a complete elliptic-curve addition formula outside it.
+If validation fails, the repair must occur in the source construction and
+produce a new immutable operation stream. Patching Rust after observing the
+evaluator or adding a nonce would not be an admissible correction.
 
-Any Python, Qarton, parameter, lowering, or allocator change requires a new
-source hash, lowered hash, Rust asset, and complete trusted evaluation. The
-1,441-qubit approximate stream must not replace the active asset merely to claim
-a smaller score.
+The benchmark's finite, unequal-x input domain is part of the construction.
+This is a mixed affine point-add primitive, not a complete exceptional-case
+elliptic-curve group law or a complete implementation of Shor's algorithm.
+
+## Credit and references
+
+The point-addition architecture, modular arithmetic, bounded binary-GCD method,
+and original Qarton implementation are André Schrottenloher's work. This
+submission is a generated Rust replay and contest-ABI adaptation; it does not
+claim authorship of the underlying algorithms.
+
+- André Schrottenloher, *Optimized Point Addition Circuits for Shor's
+  Algorithm*, [arXiv:2606.02235](https://arxiv.org/abs/2606.02235).
+- André Schrottenloher's Python/Qarton implementation,
+  [`ec-point-addition`](https://gitlab.inria.fr/capsule/qarton-projects/ec-point-addition),
+  commit `9b23c9170a636a7097a02afb3a3d6cbb6425c9f4`.
+- Qarton 1.0.0, used for circuit construction, decomposition, allocation, and
+  resource counting before deterministic Rust replay generation.

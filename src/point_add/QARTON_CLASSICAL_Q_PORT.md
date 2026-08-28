@@ -2,82 +2,44 @@
 
 ## Scope
 
-This is an operation-preserving Rust replay derived from André Schrottenloher's
-Qarton point-addition implementation at `ec-point-addition` commit
-`9b23c9170a636a7097a02afb3a3d6cbb6425c9f4`. The paper/repository primitive adds
-either zero or one fixed point selected by a quantum bit. The contest instead
-requires an unconditional addition of an arbitrary runtime-classical point `Q`.
+The active module is a generated operation replay derived from André
+Schrottenloher's Qarton point-add implementation at commit
+`9b23c9170a636a7097a02afb3a3d6cbb6425c9f4`. It adapts the source's fixed-point
+selector interface to the contest's unconditional arbitrary classical-Q ABI.
 
-Primary sources: [arXiv:2606.02235](https://arxiv.org/abs/2606.02235) and the
-[`ec-point-addition` Python/Qarton repository](https://gitlab.inria.fr/capsule/qarton-projects/ec-point-addition).
-The Rust port and contest adaptation do not claim authorship of the underlying
-paper construction or Python algorithms.
+It declares quantum P.x and P.y followed by preserved classical Q.x and Q.y.
+Q coordinates are copied into clean quantum words with classically conditioned
+X operations and unloaded by applying the same operations again. Runtime
+`3*Q.x` is implemented by three modular additions from one temporary Q.x word.
 
-The source-level adapter exposes exactly four registers, in contest order:
+## Active profile
 
-1. quantum `P.x[256]`;
-2. quantum `P.y[256]`;
-3. classical preserved `Q.x[256]`;
-4. classical preserved `Q.y[256]`.
+The active replay combines a gate-efficient binary-GCD value walk with a
+space-efficient coefficient replay. Both inverse safety margins are 4.0, the
+schedule has 426 fixed rounds, and the packed dialog uses 710 bits.
 
-## Adaptation
+The source stream contains 12,904,572 decomposed operations and has SHA-256
+`18a114949e77ad5f586f58523d8ba261616e0892568b29cfe2d80b69a05a4917`.
+The generated wrapper and compressed QPRT payload are immutable outputs.
 
-The selector is specialized to true and finite-point flags are removed because
-the trusted generator excludes infinity and equal-x exceptional inputs.
+## Lowering
 
-Each fixed full-point lookup is replaced by allocating `Q.x/Q.y` quantum words,
-loading them with classically conditioned X gates, using the original modular
-arithmetic, and applying the same conditioned X gates to clear the words. These
-loads are Clifford operations and preserve the classical registers.
+The target-neutral lowering maps adjacent Qarton `H; MSR` to HMR, replaces a
+phase CCX into `|->` with CZ, preserves one classical control directly, and
+represents two controls with the trusted condition stack. The accepted decoder
+validates record boundaries and operands before producing contest `Op` values.
 
-The fixed `3*Q.x` lookup cannot be precomputed for runtime Q. Instead, `Q.x` is
-loaded once, added to the accumulator three times modulo secp256k1's field prime,
-and unloaded. It is deliberately not retained across the modular inverse, which
-would increase the peak by approximately 256 qubits.
+The QPRT SHA-256 is
+`a4f6f22453d26643df63e977e79292068cc5b143f9705d585ae93bb3677354f7`.
+The decoded operation stream SHA-256 is
+`b9ab2819553e845a7aab7cf27c02fe4e280f71b11edcd40d26896414ddddac08`.
 
-The decomposed Qarton stream is lowered as follows:
+## Validation boundary
 
-- adjacent `H; MSR` becomes the contest's HMR operation;
-- Qarton's measurement-uncompute phase workspace is eliminated exactly by
-  replacing a CCX into `|->` with its equivalent CZ phase correction;
-- one or two Qarton classical controls become `c_condition` and, for two
-  controls, the trusted condition stack.
+The exact frozen stream passed 102,400 deterministic local shots at `0/0/0`.
+It measured 1,283 qubits, 2,502,170.191 average executed Toffolis and depth,
+8,022,141.868 average Clifford operations, and score 3,210,284,110.
 
-The canonical 6-sigma source stream SHA-256 is
-`2edf1a06c4c285b20fce52eef6c28783ccb9563a0f4bd4dd241d9bc144031f2e`.
-The lowered-record SHA-256 is
-`97c0329cdb77b80458972682a56dadd83565037cdd1dc04648b49e13c1cb8dda`.
-
-## Reliability profiles
-
-Qarton's paper parameters use `ITERATIONS_VAR = U_PAD_VAR = 2.4`. The source
-describes this as an approximate profile with roughly one failure per
-10,000--20,000 inversions. The classical-Q adapter at those settings uses 1,441
-qubits and reports 1,804,545 probability-weighted CCX. Trusted evaluation found
-three classical failures, one phase-garbage batch, and three ancilla-garbage
-batches in 102,400 deterministic local shots. It is not a valid contest result.
-
-The active replay sets both safety margins to 6.0. It uses 1,536 qubits and its
-Qarton reporter gives 2,242,731 probability-weighted CCX. This profile has a
-separate stream and must not be described as reproducing the paper's exact
-resource row.
-
-## Trusted validation
-
-The unchanged build stage emitted 13,764,960 operations. The unchanged trusted
-evaluator loaded the artifact with four ABI registers and reported:
-
-| Metric | Result |
-| --- | ---: |
-| Shots | 102,400 |
-| Classical mismatches | 0 |
-| Phase-garbage batches | 0 |
-| Ancilla-garbage batches | 0 |
-| Qubits | 1,536 |
-| Average executed Toffoli | 2,241,864.716 |
-| Average executed Clifford | 9,526,511.625 |
-| Rounded contest score | 3,443,504,640 |
-
-This is deterministic commitment-only local evidence. It is not a fresh
-server-seeded receipt or an all-input correctness proof. No package, upload, or
-submission was performed.
+This is cohort evidence, not an all-input proof or server-private receipt. The
+4.0-margin inverse and special-prime approximations remain subject to the
+trusted server's fresh private-seed evaluation.

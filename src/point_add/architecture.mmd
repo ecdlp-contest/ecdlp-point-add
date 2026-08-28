@@ -1,44 +1,34 @@
 flowchart TD
-    Anchor["Target primitive: quantum P plus classical Q on secp256k1"]
+    Target["Target primitive: quantum P plus classical Q on secp256k1"]
     Algorithm["Algorithm"]
     Optimization["Optimization"]
-    ABI["Contest ABI<br/>quantum P.x, P.y<br/>classical Q.x, Q.y"]
-    Load1["Load Q.x/Q.y with classically-conditioned X"]
-    Diff["Coordinate differences"]
-    Inv1["6σ in-place modular inverse/apply"]
-    LoadX["Reload Q.x"]
-    ThreeAdd["Three modular additions<br/>replaces fixed 3Q.x lookup"]
-    Square["Always-enabled special-prime square-add"]
-    Inv2["6σ in-place modular multiply/apply"]
-    Load3["Reload Q.x/Q.y"]
-    Finish["Finish output coordinates and unload Q"]
-    Extract["Canonical decomposed Qarton stream<br/>SHA-256 2edf1a06…31f2e"]
-    Lower["H+MSR → HMR<br/>phase CCX into |−⟩ → CZ<br/>classical controls preserved"]
-    Replay["Rust zstd replay<br/>13,476,916 lowered gates"]
-    Trusted["Trusted eval<br/>102,400 shots, 0/0/0"]
-    Metrics["1,536 qubits<br/>2,241,864.716 avg Toffoli<br/>score 3,443,504,640"]
+    ABI["Four-register ABI: quantum P.x/P.y and preserved classical Q.x/Q.y"]
+    Load["Reversible classical-coordinate X load and unload"]
+    Affine["Schrottenloher mixed affine point-add schedule"]
+    Walk["Gate-efficient fixed 426-round binary-GCD value walk"]
+    Replay["Space-efficient coefficient replay with 710-bit dialog"]
+    Arithmetic["Special-prime modular add, double, square, multiply, and divide"]
+    Source["Pinned Qarton generation: 12,904,572 source operations"]
+    Lower["Deterministic QPRT lowering: HMR, CZ phase correction, classical conditions"]
+    Rust["Generated Rust wrapper plus compressed immutable payload"]
+    Census["1,283 qubits; 2,502,170.191 average Toffoli and depth"]
+    Shots["Frozen-byte local evaluation: 102,400 shots, 0/0/0"]
+    Score["Balanced score: 3,210,284,110"]
+    Risk["Bounded approximation; server-private validation remains authoritative"]
 
-    Anchor --> Algorithm
-    Anchor --> Optimization
-    Reliability["6σ inversion iteration and padding margins"]
+    Target --> Algorithm
+    Target --> Optimization
     Algorithm --> ABI
-    ABI --> Load1
-    Load1 --> Diff
-    Diff --> Inv1
-    Inv1 --> LoadX
-    LoadX --> ThreeAdd
-    ThreeAdd --> Square
-    Square --> Inv2
-    Inv2 --> Load3
-    Load3 --> Finish
-    Optimization --> Reliability
-    Reliability --> Extract
-    Optimization --> Approx
-    Finish --> Extract
-    Extract --> Lower
-    Lower --> Replay
-    Replay --> Trusted
-    Trusted --> Metrics
-
-    Approx["Rejected 2.4σ profile<br/>1,441 qubits<br/>3 classical failures"]
-    Approx --> Trusted
+    ABI --> Load
+    Load --> Affine
+    Affine --> Walk
+    Walk --> Replay
+    Replay --> Arithmetic
+    Optimization --> Source
+    Source --> Lower
+    Lower --> Rust
+    Rust --> Census
+    Census --> Shots
+    Shots --> Score
+    Optimization --> Risk
+    Risk --> Shots
