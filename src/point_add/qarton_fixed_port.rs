@@ -1,4 +1,12 @@
-//! Generated compact decoder for the frozen QPRT operation stream.
+//! Shared QPRT replay decoder.
+//!
+//! QPRT is the frozen operation-stream format the generated Qarton ports are
+//! shipped in. This module owns the decoder; each port module supplies its own
+//! compressed payload and register layout.
+//!
+//! Format: `b"QPRT1\0" | u16 qubits | u16 cbits | u64 gate_count`, then per
+//! gate a header byte `(n_controls << 6) | opcode`, `n_targets` u16 target
+//! ids, and `n_controls` u16 control bit ids.
 
 use super::B;
 use crate::circuit::{BitId, Op, OperationType, QubitId};
@@ -14,7 +22,7 @@ fn read_u16(data: &[u8], cursor: &mut usize) -> u16 {
     let end = *cursor + 2;
     let bytes: [u8; 2] = data
         .get(*cursor..end)
-        .expect("truncated replay record")
+        .expect("truncated Qarton replay record")
         .try_into()
         .unwrap();
     *cursor = end;
@@ -30,18 +38,15 @@ fn decode_header(byte: u8) -> Header {
         4 => (OperationType::CZ, 2),
         5 => (OperationType::CCX, 3),
         6 => (OperationType::Swap, 2),
+        // HMR stores one qubit and one classical result in its two target slots.
         7 => (OperationType::Hmr, 2),
-        opcode => panic!("unknown replay opcode {opcode}"),
+        opcode => panic!("unknown Qarton replay opcode {opcode}"),
     };
-    assert!(controls <= 2, "unsupported condition arity");
-    Header {
-        kind,
-        quantum_arity,
-        controls,
-    }
+    assert!(controls <= 2, "unsupported Qarton condition arity");
+    Header { kind, quantum_arity, controls }
 }
 
-fn append_gate(builder: &mut B, kind: OperationType, targets: &[u16], controls: &[u16]) {
+fn append_gate(b: &mut B, kind: OperationType, targets: &[u16], controls: &[u16]) {
     let mut op = Op::empty();
     op.kind = kind;
     match kind {
@@ -65,12 +70,12 @@ fn append_gate(builder: &mut B, kind: OperationType, targets: &[u16], controls: 
         op.c_condition = BitId(u64::from(condition));
     }
     if controls.len() == 2 {
-        builder.push_condition(BitId(u64::from(controls[0])));
+        b.push_condition(BitId(u64::from(controls[0])));
     }
     op.validate();
-    builder.ops.push(op);
+    b.ops.push(op);
     if controls.len() == 2 {
-        builder.pop_condition();
+        b.pop_condition();
     }
 }
 
@@ -82,7 +87,8 @@ pub(super) fn build_replay(
     quantum_registers: &[(usize, usize)],
     classical_registers: &[(usize, usize)],
 ) -> Vec<Op> {
-    let stream = zstd::stream::decode_all(compressed_stream).expect("embedded replay must be valid");
+    let stream = zstd::stream::decode_all(compressed_stream)
+        .expect("embedded Qarton replay must be valid zstd");
     let stream = stream.as_slice();
     assert_eq!(&stream[..6], b"QPRT1\0");
     let mut cursor = 6;
@@ -90,23 +96,20 @@ pub(super) fn build_replay(
     let cbits = usize::from(read_u16(stream, &mut cursor));
     let count = u64::from_le_bytes(stream[cursor..cursor + 8].try_into().unwrap()) as usize;
     cursor += 8;
-    assert_eq!(
-        (qubits, cbits, count),
-        (expected_qubits, expected_cbits, expected_gates)
-    );
+    assert_eq!((qubits, cbits, count), (expected_qubits, expected_cbits, expected_gates));
 
-    let mut builder = B::new();
-    let quantum = builder.alloc_qubits(qubits);
-    let classical = builder.alloc_bits(cbits);
+    let mut b = B::new();
+    let q = b.alloc_qubits(qubits);
+    let c = b.alloc_bits(cbits);
     for &(start, end) in quantum_registers {
-        builder.declare_qubit_register(&quantum[start..end]);
+        b.declare_qubit_register(&q[start..end]);
     }
     for &(start, end) in classical_registers {
-        builder.declare_bit_register(&classical[start..end]);
+        b.declare_bit_register(&c[start..end]);
     }
 
     for _ in 0..count {
-        let header = decode_header(*stream.get(cursor).expect("truncated replay"));
+        let header = decode_header(*stream.get(cursor).expect("truncated Qarton replay"));
         cursor += 1;
         let mut targets = [0_u16; 3];
         for target in targets.iter_mut().take(header.quantum_arity) {
@@ -117,13 +120,13 @@ pub(super) fn build_replay(
             *control = read_u16(stream, &mut cursor);
         }
         append_gate(
-            &mut builder,
+            &mut b,
             header.kind,
             &targets[..header.quantum_arity],
             &controls[..header.controls],
         );
     }
-    assert_eq!(cursor, stream.len(), "trailing replay bytes");
-    assert_eq!(builder.peak_qubits as usize, expected_qubits);
-    builder.ops
+    assert_eq!(cursor, stream.len(), "trailing bytes in Qarton replay");
+    assert_eq!(b.peak_qubits as usize, expected_qubits);
+    b.ops
 }

@@ -1,195 +1,205 @@
-# Contextual zero-control reduction for the 1,283-qubit point-add circuit
+# Gate-efficient 1,482-qubit Qarton contest-ABI point addition
 
-## AI Model/Harness
+## AI Model / Harness
 
-This candidate was developed with AI-assisted circuit analysis, transformation
-review, deterministic generation, and evidence review. Model attribution is
-supplied by the submission metadata. The submitted circuit is a deterministic
-replay and has no runtime dependency on the development process.
+This candidate was prepared with Anthropic Claude Opus 5 (1M context) running in
+Claude Code, the terminal coding agent, driven interactively from the contest
+repository root. No separate reasoning-effort setting was exposed to the task,
+so none is claimed.
+
+The work used the repository's own trusted pipeline unchanged: the pinned Rust
+toolchain, the untrusted `build_circuit` stage, and the trusted `eval_circuit`
+evaluator invoked through `./ecdlp.js run`. Circuit generation used Python
+3.13 with Qarton 1.0.0 in an isolated, repository-local virtual environment.
+
+The submitted Rust module is generated output. Neither it nor its compressed
+QPRT payload contains a validation nonce, a sampled-input table, a target-side
+correction, or any evaluator-derived patch. The operation stream is a frozen
+byte artifact committed together with its SHA-256.
 
 ## Summary
 
-This submission is a narrow cleanup of the ranked 1,283-qubit point-add
-construction. It keeps the same four-register affine point-add interface, the
-same 1,283-qubit allocation, the same arithmetic schedule, and the same
-measurement and phase-cleanup structure. The only semantic change is the
-deletion of 152 Toffoli operations whose control state is provably zero at the
-exact operation boundary.
+The accepted 1,283-qubit frontier scores 3,210,284,110. It is a *hybrid*
+inversion: a gate-efficient binary-GCD value walk paired with a
+space-efficient coefficient replay. That mix minimises qubit count, but the
+contest score is a product, `peak qubits x average executed Toffoli`, and the
+product does not reward qubits alone.
 
-For a Toffoli with controls `a` and `b` and target `t`, the computational action
-is `t <- t XOR (a AND b)`. If either control is zero on every reachable branch
-at that boundary, `a AND b` is zero and the target is unchanged. The operation
-is therefore the identity and can be removed. This is a contextual identity,
-not a decomposition of an unrestricted Toffoli into Clifford gates.
+This submission runs the **gate-efficient** implementation on *both* halves of
+the inversion. It spends 199 more qubits (1,482 against 1,283) to remove
+541,075 average executed Toffolis (1,961,095 against 2,502,170). The product
+falls to **2,906,342,790**, an improvement of **9.47%**.
 
-The cleanup reduces the emitted operation count from 12,377,821 to 12,377,669
-and reduces the emitted CCX count by exactly 152. It does not change the CZ
-count, register layout, number of classical bits, or peak logical qubits. Since
-the removed operations are unconditional, the executed Toffoli reduction is
-exactly 152 for every identical set of evaluation inputs and measurement
-outcomes.
+The frozen operation stream passed 102,400 deterministic local shots with zero
+classical mismatches, zero phase-garbage batches, and zero ancilla-garbage
+batches.
 
-The current trusted local evaluator completed 102,400 shots with zero classical
-mismatches, zero phase-garbage batches, and zero ancilla-garbage batches. The
-measured score is 3,210,081,396, below the live ranked score of 3,210,285,393.
+Three other routes were measured and closed before settling on this one, and
+they are worth recording because they look attractive and are not:
+
+- **Toffoli depth is not an independent lever.** `write_score` defines
+  `toffoli_depth = toffoli` because the emitted stream is strictly sequential,
+  so the score reduces exactly to `qubits x toffoli`. Parallelising cannot help.
+- **Qubit re-indexing yields nothing.** The evaluator scores peak qubits as
+  `max(qubit_index) + 1`, an index-space measure, so any slack between that and
+  the true simultaneous-live count would be free score. Measured on the frontier
+  stream with plain interval liveness and again with reset-aware liveness that
+  splits each qubit's usage at `Hmr`/`R` events (705,165 segments over 1,283
+  qubits): the workspace interval-graph optimum is 771, plus 512 pinned output
+  qubits, exactly 1,283. Slack zero. The circuit sits at its full width for
+  95.9% of the stream.
+- **Peephole cancellation yields nothing.** Zero adjacent identical Toffoli
+  pairs, and zero cancellable pairs within a 64-operation commutation window
+  over a 400,000-Toffoli sample.
 
 ## Method
 
-### Start from an immutable accurate operation stream
+### Source and contest ABI
 
-The optimization begins with the accepted 1,283-qubit operation stream. The
-parent is treated as immutable. A separate child stream is derived so that the
-parent result, the child transformation, and the child evaluation cannot be
-silently mixed. The child retains the complete operation order except at the
-152 explicitly classified identity sites.
+The construction is Andre Schrottenloher's windowed affine point addition,
+arXiv:2606.02235, from the public `ec-point-addition` implementation at commit
+`9b23c9170a636a7097a02afb3a3d6cbb6425c9f4`, built with Qarton 1.0.0.
 
-The source-level stream contains quantum inputs, classical inputs, clean
-workspace allocation, reversible gates, classically conditioned regions,
-measure-and-reset operations, and register declarations. The analysis covers
-the complete stream rather than a prefix, a sampled trace, or a search over
-rendered source text.
+The upstream primitive adds a point selected from a compile-time window by a
+quantum selector; its signature is `(selector[1], AffPoint[513])`. The contest
+instead requires an unconditional addition of a runtime-classical point with
+exactly four registers. Two changes achieve that, and nothing else in the
+schedule moves:
 
-### Track only facts strong enough to justify a deletion
+1. The selector becomes an internal ancilla pinned to `|1>`. Every
+   selector-derived control (`creg_is_not_0`) then evaluates true, so the
+   arithmetic runs unconditionally while the surrounding upstream schedule is
+   preserved verbatim.
 
-Each quantum wire is assigned one of three abstract values at every operation
-boundary:
+2. The four window lookups load from the classical Q registers instead of a
+   baked-in constant: one X per coordinate wire, conditioned on the matching
+   classical bit. The load is involutory, so applying the same conditioned X
+   gates again unloads the word, returns the ancilla to `|0>`, and leaves Q
+   untouched. Runtime `3*Q.x` is built from one temporary Q.x word and two
+   modular additions.
 
-- `zero`, when the wire is known to be in computational value zero;
-- `one`, when the wire is known to be in computational value one;
-- `unknown`, when neither constant fact is established.
+Register layout in the emitted stream, verified by scanning the artifact:
+qubits `[0,256)` are P.x and `[256,512)` are P.y; classical bits `[0,256)` are
+Q.x and `[256,512)` are Q.y. Every `Hmr` writes into `[512,768)`, so the
+preserved Q registers are never touched by a measurement.
 
-The two quantum input coordinates begin unknown. Fresh workspace begins zero.
-Reversible operations update this abstract state conservatively. A NOT gate
-swaps zero and one. A controlled NOT updates a known target only when the
-control fact is sufficient; otherwise the target becomes unknown. Swap moves
-the two abstract values. A Toffoli receives the same conservative treatment.
-Measurement boundaries and phase workspaces are handled according to their
-declared lifecycle rather than guessed from sampled behavior.
+### Choice of inversion mix
 
-When an operation is classically conditioned, the analysis joins the state in
-which the operation executes with the state in which it does not execute. A
-wire remains constant after that join only if both branches agree. This avoids
-using a fact that holds on one classical branch as if it held globally.
+`IPModMul` threads a single `gate_efficient` flag into both halves of the
+inversion, `ToBitVector` (the value walk) and `ApplyBitVector` (the coefficient
+replay). Splitting that flag and measuring all four mixes at the same safety
+margins gives, in the paper signature:
 
-### Bind the identity to exact operation sites
+| value walk | coefficient replay | qubits | CCX | product |
+| --- | --- | ---: | ---: | ---: |
+| gate | gate | 1,483 | 1,994,490 | 2.958e9 |
+| space | gate | 1,483 | 2,084,218 | 3.091e9 |
+| space | space | 1,235 | 2,587,660 | 3.196e9 |
+| gate | space | 1,285 | 2,497,932 | 3.210e9 |
 
-A candidate is accepted only when all of the following agree:
+The last row reproduces the accepted frontier. This submission takes the first.
 
-1. the operation is CCX;
-2. its absolute position in the frozen source stream matches;
-3. its ordered pair of controls and its target match;
-4. at least one control is `zero` immediately before the operation;
-5. the operation is unconditional at the source boundary;
-6. deleting it leaves all quantum and classical state unchanged.
+### Safety margins
 
-The transformation fails closed if any position, operation kind, operand, or
-stream commitment changes. It does not perform a textual replacement over the
-submitted Rust. It consumes the bound operation declarations and regenerates a
-new compressed operation stream and a small deterministic replay entry point.
+The GCD walk is heuristic: it runs a fixed round count and fixed register
+padding, and fails if either is exceeded. `ITERATIONS_VAR` sets the round
+margin and `U_PAD_VAR` the padding margin; `gcd.py` couples them through
+`n - iterations*0.5*1.415 + u_padding >= 0`.
 
-### Restricted gate-replacement policy
+Upstream defaults (2.4 and 2.3) are tuned for the paper's own success target,
+not for a 102,400-shot gate. An independent Monte-Carlo of 60,000 GCD runs
+re-derived the distributions rather than trusting the published constants:
+iterations have mean 361.82 against the heuristic `1.413n = 361.728` and
+standard deviation 9.524 against `0.6*sqrt(n) = 9.600`; padding has mean 8.09,
+standard deviation 4.25, and a clean exponential tail with log-survival slope
+-0.4441 per bit. Extrapolating that fitted tail, the upstream default
+`U_PAD_VAR = 2.3` carries roughly a 34% chance of at least one failure across
+102,400 shots.
 
-The broader cleanup policy recognizes only replacements justified by the wire
-state at a particular operation boundary:
+This submission uses `ITERATIONS_VAR = 4.0` (426 rounds, 710-bit dialog, the
+same round margin as the accepted frontier) and `U_PAD_VAR = 3.5`, whose fitted
+padding-overflow probability is about 8.6e-10 per shot, or roughly 1e-4 across
+the full gate.
 
-- `CCX(0,b;t)` or `CCX(a,0;t)` is deleted because its target cannot flip.
-- `CCX(1,b;t)` reduces to `CX(b,t)`, with the symmetric rule for the other
-  control.
-- `CCZ(0,b,t)` is deleted, while `CCZ(1,b,t)` reduces to `CZ(b,t)`.
-- A CCX whose target is maintained in the minus phase eigenstate can reduce to
-  a CZ between its controls because the target flip becomes phase kickback.
-- A final-use AND workspace may use measurement-based uncomputation only when
-  both measurement outcomes, the correction phase, the unchanged controls,
-  and the workspace release are all covered by the same lifetime condition.
+### Lowering
 
-These rules are contextual. They do not imply that a generic CCX or CCZ can be
-expressed using only CX and CZ. In the submitted child, the only newly applied
-rule is zero-control CCX deletion. The other rule families either were already
-present in the parent or had no newly eligible site under the strict boundary
-conditions.
+The contest operation set has no H gate. Qarton emits H in exactly two shapes,
+and both are absorbed by the QPRT lowering:
 
-### Keep other gate reductions separate
+- X-basis measurement, `h(q); msr(q,c)`, folds into a single `Hmr(q,c)`;
+- a borrowed `|->` phase ancilla from `MCXWithBorrowedBits`, where `x(q); h(q)`
+  prepares the state, a `ccx(a,b,q)` kicks a phase back, and `h(q); x(q)`
+  releases it. The bracket gates are dropped and the Toffoli becomes `cz(a,b)`,
+  carrying its classical controls.
 
-The parent already contains 1,734 sites where a Toffoli target is held in the
-minus phase eigenstate and the operation has been lowered to the corresponding
-CZ phase action. Those sites are counted as already realized parent behavior;
-they are not counted again as wins in this submission.
+Any other shape raises rather than being silently mistranslated. The emitter
+was validated by regenerating the upstream paper-signature circuit and
+reproducing the census this repository documented for it exactly: 1,443 qubits,
+256 classical bits, 10,515,375 gates, 1,842,771 CCX, 857,383 Hmr, 854,058 CZ.
 
-The analysis also considered final-use AND workspaces that might admit
-measurement-based uncomputation. No site satisfied the strict complete-lifetime
-matcher, so none was changed. Constant-one controls and unrestricted CCZ gates
-were likewise left unchanged. This conservative policy is important: an
-unrestricted CCX or CCZ is not equivalent to a composition of only CX and CZ.
+This package also drops three QPRT payloads the active build never reads, and
+their wrapper modules, keeping the shared replay decoder. That is packaging
+hygiene only: the emitted stream, and so `ops.bin` and its SHA-256, are
+identical with or without them.
 
-### Regenerate and freeze the child
+## Result
 
-The 152 accepted declarations are applied to the source operation stream. The
-result is lowered and serialized deterministically. The submitted Rust only
-decodes that frozen child stream and exposes the required four-register point
-addition entry point. It does not choose transformations at runtime.
+Measured by the repository's trusted evaluator through `./ecdlp.js run`, with
+the contestant stage sandboxed as usual:
 
-The emitted circuit declares two 256-qubit target coordinates followed by two
-256-bit classical offset coordinates. The target coordinates are overwritten
-with the affine sum. The offset coordinates are preserved. All other allocated
-qubits must return to zero, and the final global phase must be clean.
-
-The child was frozen before evaluation. The same frozen operation commitment
-was used for resource accounting and the complete trusted local validation.
-
-## Results
-
-### Whole-stream resource census
-
-| Metric | Ranked parent | This child | Delta |
-| --- | ---: | ---: | ---: |
-| Peak logical qubits | 1,283 | 1,283 | 0 |
-| Emitted CCX | 2,572,427 | 2,572,275 | -152 |
-| Emitted CZ | 577,162 | 577,162 | 0 |
-| Emitted operations | 12,377,821 | 12,377,669 | -152 |
-
-The operation stream also contains 768 classical bits. The reduction does not
-increase the measurement count or alter the condition-stack structure.
-
-### Trusted local evaluation
-
-| Measurement | Result |
+| Metric | Value |
 | --- | ---: |
-| Validation shots | 102,400 |
+| Score | **2,906,342,790** |
+| Peak logical qubits | 1,482 |
+| Average executed Toffoli | 1,961,095.319 |
+| Average executed Toffoli depth | 1,961,095 |
+| Average executed Clifford | 8,277,783.561 |
+| Emitted operations | 11,771,529 |
+| Validation | 102,400 / 102,400 |
 | Classical mismatches | 0 |
 | Phase-garbage batches | 0 |
 | Ancilla-garbage batches | 0 |
-| Average executed CCX+CCZ | 2,502,012.001 |
-| Rounded executed Toffoli | 2,502,012 |
-| Rounded Toffoli depth | 2,502,012 |
-| Average executed Clifford | 8,022,076.793 |
-| Peak logical qubits | 1,283 |
-| Emitted operations | 12,377,669 |
-| Balanced score | 3,210,081,396 |
+| `ops.bin` SHA-256 | `c308973b390574348da2048180853ab07fd13b026b8fa6e81878c66b92458443` |
 
-The frozen operation artifact has SHA-256 commitment
-`8afad3ff46beb059ba86fd7024be94fc0305638a92d584AC517CC8DCE510CE1E`.
-The score follows the contest definition: peak qubits multiplied by the square
-root of rounded executed Toffoli count times rounded Toffoli depth. In this
-operation model the charged depth equals the executed Toffoli count, so the
-score reduces to `1,283 * 2,502,012`.
+Against the prior accepted frontier at 3,210,284,110, this is a reduction of
+303,941,320, or 9.47%.
 
-The live ranked parent is displayed at score 3,210,285,393. This candidate's
-local score is lower by 203,997. Shot-dependent averages vary slightly between
-independent validation seeds, while the structural reduction of 152
-unconditional CCX operations is seed-independent for identical cases.
+Before lowering, Qarton's own `auto_test` checked the adapted circuit against a
+direct evaluation of the affine chord map on 10 random inputs, confirming both
+output coordinates and the preservation of Q.
 
 ## Caveat and what is left
 
-The 102,400-shot result is strong evidence about the frozen submitted circuit,
-but it is not a proof over every possible curve input. The server's private-seed
-validation remains the promotion authority.
+The GCD margins are heuristic, not proofs. The reported failure probabilities
+come from a fitted exponential tail on 60,000 samples extrapolated well beyond
+the sampled range; they are evidence, not guarantees. The trusted server draws
+a fresh private seed, and that evaluation remains authoritative.
 
-This optimization is intentionally small and conservative. It removes no
-qubits and does not attempt a general replacement of nonlinear three-qubit
-gates. Larger improvements would require new arithmetic structure, additional
-state invariants, or safe final-use workspace transformations. Any such change
-should be derived and evaluated as a new immutable child rather than modifying
-this submitted stream after validation.
+`TRUNCATE`, `ITER_CAN_BE_Q`, `PADDING`, and `PADDING2` are left at their
+upstream values. They are separate approximation sources with their own failure
+probabilities, and they were not independently characterised here; the frontier
+appears to use the same defaults.
 
-The public payload contains only the minimal generated replay implementation,
-its embedded operation data, and the documentation required by the contest.
+The remaining headroom is visible but unclaimed. Lowering `U_PAD_VAR` to 3.0
+would score near 2.83e9 at roughly a 0.3% rejection risk, which was judged a
+bad trade. More interestingly, the circuit runs a fixed 426 rounds on every
+input while the walk converges after 362 on average, and only 5.5% of emitted
+Toffolis are classically conditioned; making the trailing rounds skippable
+against a converged flag would cut the *average executed* count substantially
+without touching worst-case correctness or qubit count.
+
+## Credit
+
+Circuit construction is derived from Andre Schrottenloher's
+`ec-point-addition` at commit `9b23c9170a636a7097a02afb3a3d6cbb6425c9f4`
+(AGPL-3.0), built with Qarton 1.0.0. The contest-ABI adaptation, the QPRT
+lowering and emitter, the margin analysis, and the inversion-mix selection are
+this submission's own work.
+
+## References
+
+- Andre Schrottenloher, *Optimized Point Addition Circuits for Elliptic Curve
+  Discrete Logarithms*, arXiv:2606.02235, https://eprint.iacr.org/2026/1128.pdf
+- `ec-point-addition`, https://gitlab.inria.fr/capsule/qarton-projects/ec-point-addition
+- Khattar, Shutty, Gidney et al., *Verifiable quantum advantage via optimized
+  DQI circuits*, arXiv:2510.10967 (the "dialog" GCD representation used here).
