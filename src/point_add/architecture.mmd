@@ -1,34 +1,32 @@
 flowchart TD
-    Target["Target primitive: quantum P plus classical Q on secp256k1"]
-    Algorithm["Algorithm"]
-    Optimization["Optimization"]
-    ABI["Four-register ABI: quantum P.x/P.y and preserved classical Q.x/Q.y"]
-    Load["Reversible classical-coordinate X load and unload"]
-    Affine["Schrottenloher mixed affine point-add schedule"]
-    Walk["Gate-efficient fixed 426-round binary-GCD value walk"]
-    Replay["Space-efficient coefficient replay with 710-bit dialog"]
-    Arithmetic["Special-prime modular add, double, square, multiply, and divide"]
-    Source["Pinned Qarton generation: 12,904,572 source operations"]
-    Lower["Deterministic QPRT lowering: HMR, CZ phase correction, classical conditions"]
-    Rust["Generated Rust wrapper plus compressed immutable payload"]
-    Census["1,283 qubits; 2,502,170.191 average Toffoli and depth"]
-    Shots["Frozen-byte local evaluation: 102,400 shots, 0/0/0"]
-    Score["Balanced score: 3,210,284,110"]
-    Risk["Bounded approximation; server-private validation remains authoritative"]
+  Target["Target primitive: quantum P plus classical Q on secp256k1"]
+  Algorithm["Algorithm"]
+  Optimization["Optimization"]
+  Replay["Frozen reversible point-add operation stream"]
+  Registers["Two 256-qubit target coordinates and two preserved 256-bit classical coordinates"]
+  Arithmetic["Affine point-add arithmetic with reversible cleanup and phase cleanliness"]
+  Context["Complete-stream zero one unknown control-state analysis"]
+  Branches["Conditioned regions join executed and unexecuted abstract states"]
+  Identity["CCX with a proved zero control is the identity"]
+  Delete["Delete exactly 152 source-bound unconditional CCX operations"]
+  Preserve["Keep every unclassified CCX and CCZ unchanged"]
+  Resources["1283 qubits 2502012 rounded Toffoli 2502012 depth 12377669 operations"]
+  Score["Balanced score 3210081396"]
+  Validation["102400 trusted local shots passed with 0 classical 0 phase 0 ancilla failures"]
+  Commitment["Frozen artifact SHA256 8afad3ff46beb059ba86fd7024be94fc0305638a92d584ac517cc8dce510ce1e"]
 
-    Target --> Algorithm
-    Target --> Optimization
-    Algorithm --> ABI
-    ABI --> Load
-    Load --> Affine
-    Affine --> Walk
-    Walk --> Replay
-    Replay --> Arithmetic
-    Optimization --> Source
-    Source --> Lower
-    Lower --> Rust
-    Rust --> Census
-    Census --> Shots
-    Shots --> Score
-    Optimization --> Risk
-    Risk --> Shots
+  Target --> Algorithm
+  Target --> Optimization
+  Algorithm --> Replay
+  Replay --> Registers
+  Replay --> Arithmetic
+  Optimization --> Context
+  Context --> Branches
+  Context --> Identity
+  Identity --> Delete
+  Context --> Preserve
+  Delete --> Resources
+  Preserve --> Resources
+  Resources --> Score
+  Score --> Validation
+  Validation --> Commitment

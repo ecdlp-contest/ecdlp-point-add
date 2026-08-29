@@ -1,189 +1,195 @@
-# Generated 1,283-qubit Qarton hybrid point addition
+# Contextual zero-control reduction for the 1,283-qubit point-add circuit
 
-## AI Model / Harness
+## AI Model/Harness
 
-This candidate was prepared with OpenAI GPT-5.6 Sol in the Codex desktop
-application. The reasoning-effort setting was not exposed to this task, so it
-is not guessed. The work used the contest repository's isolated development
-workflow, Python/Qarton 1.0.0 for circuit construction, and the repository-pinned
-ECDLP CLI with the unchanged trusted Rust builder and evaluator.
-
-The active Rust replay wrapper is generated output. It and its compressed QPRT
-payload were produced deterministically from the pinned Qarton construction.
-Neither contains a validation nonce, sampled-input table, target-side correction,
-or evaluator-derived patch.
+This candidate was developed with AI-assisted circuit analysis, transformation
+review, deterministic generation, and evidence review. Model attribution is
+supplied by the submission metadata. The submitted circuit is a deterministic
+replay and has no runtime dependency on the development process.
 
 ## Summary
 
-This submission replaces the accepted 1,536-qubit Qarton replay with a hybrid
-4.0-margin circuit. It retains the same four-register contest ABI and the same
-reversible classical-Q adaptation of André Schrottenloher's point-addition
-circuit. The inversion uses a gate-efficient shrinking binary-GCD value walk
-and a space-efficient full-width coefficient replay.
+This submission is a narrow cleanup of the ranked 1,283-qubit point-add
+construction. It keeps the same four-register affine point-add interface, the
+same 1,283-qubit allocation, the same arithmetic schedule, and the same
+measurement and phase-cleanup structure. The only semantic change is the
+deletion of 152 Toffoli operations whose control state is provably zero at the
+exact operation boundary.
 
-The frozen operation stream passed 102,400 deterministic local shots with zero
-classical mismatches, zero phase-garbage batches, and zero ancilla-garbage
-batches. It measured 1,283 peak logical qubits, 2,502,170.191 average executed
-Toffolis, 8,022,141.868 average executed Clifford operations, and 12,377,821
-emitted operations. After contest rounding, the balanced score is
-3,210,284,110.
+For a Toffoli with controls `a` and `b` and target `t`, the computational action
+is `t <- t XOR (a AND b)`. If either control is zero on every reachable branch
+at that boundary, `a AND b` is zero and the target is unchanged. The operation
+is therefore the identity and can be removed. This is a contextual identity,
+not a decomposition of an unrestricted Toffoli into Clifford gates.
 
-The currently accepted 1,536-qubit route scores 3,443,495,424. The submitted
-candidate reduces that by 233,211,314, about 6.77%. It exchanges roughly
-260,305 additional average Toffolis for 253 fewer peak qubits, which improves
-the balanced product.
+The cleanup reduces the emitted operation count from 12,377,821 to 12,377,669
+and reduces the emitted CCX count by exactly 152. It does not change the CZ
+count, register layout, number of classical bits, or peak logical qubits. Since
+the removed operations are unconditional, the executed Toffoli reduction is
+exactly 152 for every identical set of evaluation inputs and measurement
+outcomes.
+
+The current trusted local evaluator completed 102,400 shots with zero classical
+mismatches, zero phase-garbage batches, and zero ancilla-garbage batches. The
+measured score is 3,210,081,396, below the live ranked score of 3,210,285,393.
 
 ## Method
 
-### Source construction and contest ABI
+### Start from an immutable accurate operation stream
 
-The source anchor is André Schrottenloher, *Optimized Point Addition Circuits
-for Shor's Algorithm*, arXiv:2606.02235, and its public
-`ec-point-addition` Python/Qarton implementation at commit
-`9b23c9170a636a7097a02afb3a3d6cbb6425c9f4`.
+The optimization begins with the accepted 1,283-qubit operation stream. The
+parent is treated as immutable. A separate child stream is derived so that the
+parent result, the child transformation, and the child evaluation cannot be
+silently mixed. The child retains the complete operation order except at the
+152 explicitly classified identity sites.
 
-The original Qarton primitive selects a fixed point with a quantum selector.
-The contest instead requests unconditional addition of an arbitrary
-runtime-classical point. The adapter exposes exactly four registers, in the
-required order:
+The source-level stream contains quantum inputs, classical inputs, clean
+workspace allocation, reversible gates, classically conditioned regions,
+measure-and-reset operations, and register declarations. The analysis covers
+the complete stream rather than a prefix, a sampled trace, or a search over
+rendered source text.
 
-1. quantum `P.x[256]`;
-2. quantum `P.y[256]`;
-3. classical preserved `Q.x[256]`;
-4. classical preserved `Q.y[256]`.
+### Track only facts strong enough to justify a deletion
 
-A classical Q coordinate is loaded into a clean quantum word with X operations
-conditioned on the corresponding classical bits. Applying the same operations
-after the arithmetic unloads the word and preserves Q. The first stage loads
-Q.x and Q.y, performs the coordinate differences, and unloads both words before
-the inverse. No 256-qubit Q register therefore remains live through the inverse
-workspace peak.
+Each quantum wire is assigned one of three abstract values at every operation
+boundary:
 
-The fixed source circuit precomputes `3*Q.x`. Runtime Q prevents that lookup, so
-the adapter loads Q.x once, performs three modular additions into the original
-accumulator, and unloads Q.x. The source selector is specialized to true, and
-finite-point flags are specialized under the benchmark domain, which excludes
-infinity and equal-x exceptional inputs. Q.x and Q.y are loaded again only for
-the final coordinate stage and are uncomputed immediately.
+- `zero`, when the wire is known to be in computational value zero;
+- `one`, when the wire is known to be in computational value one;
+- `unknown`, when neither constant fact is established.
 
-### Hybrid inverse profile
+The two quantum input coordinates begin unknown. Fresh workspace begins zero.
+Reversible operations update this abstract state conservatively. A NOT gate
+swaps zero and one. A controlled NOT updates a known target only when the
+control fact is sufficient; otherwise the target becomes unknown. Swap moves
+the two abstract values. A Toffoli receives the same conservative treatment.
+Measurement boundaries and phase workspaces are handled according to their
+declared lifecycle rather than guessed from sampled behavior.
 
-The candidate splits the modular inverse into two independently selected
-backends. The shrinking binary-GCD value walk uses the gate-efficient backend;
-the full-width coefficient replay uses the space-efficient backend. Both the
-fixed-iteration safety margin and signed-coefficient padding margin are 4.0.
-The generated schedule has 426 fixed rounds and a 710-bit packed dialog.
+When an operation is classically conditioned, the analysis joins the state in
+which the operation executes with the state in which it does not execute. A
+wire remains constant after that join only if both branches agree. This avoids
+using a fact that holds on one classical branch as if it held globally.
 
-This resource reduction occurs before the Rust language boundary. Qarton assigns
-the 1,283-wire peak while constructing the circuit; decoding and compression do
-not compress wire identifiers or change lifetimes. Compared with the accepted
-6.0-margin route, the shorter inverse schedule and smaller signed coefficient
-workspace reduce peak qubits but raise the probability of an approximation
-boundary being reached.
+### Bind the identity to exact operation sites
 
-### Deterministic operation lowering
+A candidate is accepted only when all of the following agree:
 
-The fully decomposed, classical-last Qarton circuit is streamed into a canonical
-operation representation. A clean forward reconstruction emitted 12,904,572
-source operations and reproduced the source-stream SHA-256:
+1. the operation is CCX;
+2. its absolute position in the frozen source stream matches;
+3. its ordered pair of controls and its target match;
+4. at least one control is `zero` immediately before the operation;
+5. the operation is unconditional at the source boundary;
+6. deleting it leaves all quantum and classical state unchanged.
 
-`18a114949e77ad5f586f58523d8ba261616e0892568b29cfe2d80b69a05a4917`.
+The transformation fails closed if any position, operation kind, operand, or
+stream commitment changes. It does not perform a textual replacement over the
+submitted Rust. It consumes the bound operation declarations and regenerates a
+new compressed operation stream and a small deterministic replay entry point.
 
-The classical-Q adapter performs five 256-bit coordinate loads and the five
-matching unloads. Adjacent Q.x/Q.y copies appear as 512-operation runs, for
-2,560 classically controlled X operations in total. Qarton AND gates are
-lowered consistently to CCX at source generation time; this is not a later
-change to the Rust target.
+### Restricted gate-replacement policy
 
-The source operations are lowered to the contest vocabulary and encoded in a
-versioned QPRT replay:
+The broader cleanup policy recognizes only replacements justified by the wire
+state at a particular operation boundary:
 
-- adjacent Qarton `H; MSR` becomes the contest HMR operation;
-- a phase CCX targeting `|->` becomes the equivalent CZ correction;
-- one classical control becomes `c_condition`;
-- two classical controls additionally use the trusted condition stack; and
-- register declarations and ordered operands are preserved.
+- `CCX(0,b;t)` or `CCX(a,0;t)` is deleted because its target cannot flip.
+- `CCX(1,b;t)` reduces to `CX(b,t)`, with the symmetric rule for the other
+  control.
+- `CCZ(0,b,t)` is deleted, while `CCZ(1,b,t)` reduces to `CZ(b,t)`.
+- A CCX whose target is maintained in the minus phase eigenstate can reduce to
+  a CZ between its controls because the target flip becomes phase kickback.
+- A final-use AND workspace may use measurement-based uncomputation only when
+  both measurement outcomes, the correction phase, the unchanged controls,
+  and the workspace release are all covered by the same lifetime condition.
 
-The lowered-record SHA-256 is
-`a35c38d09fe8777333b15cf93c05964a564544990f42f79a8b1feb21472bb888`.
-The QPRT SHA-256 is
-`a4f6f22453d26643df63e977e79292068cc5b143f9705d585ae93bb3677354f7`,
-and the compressed payload SHA-256 is
-`42c86d6903b66b7a6c3d16a8d01dad9f1b8962f18241666e872555358a2b1b7d`.
+These rules are contextual. They do not imply that a generic CCX or CCZ can be
+expressed using only CX and CZ. In the submitted child, the only newly applied
+rule is zero-control CCX deletion. The other rule families either were already
+present in the parent or had no newly eligible site under the strict boundary
+conditions.
 
-The public Rust wrapper contains the immutable census constants, payload
-inclusion, decoder invocation, and complete-stream tests. The accepted
-`qarton_fixed_port` decoder is unchanged. It checks replay magic, qubit and
-classical-bit counts, record boundaries, operand aliases through
-`Op::validate`, and trailing bytes before returning the operation vector.
+### Keep other gate reductions separate
 
-### Reproducibility controls
+The parent already contains 1,734 sites where a Toffoli target is held in the
+minus phase eigenstate and the operation has been lowered to the corresponding
+CZ phase action. Those sites are counted as already realized parent behavior;
+they are not counted again as wins in this submission.
 
-The generator fixes the Qarton repository commit, Qarton version, source
-parameters, operation ordering, and payload hashes. Rust is an output of that
-pipeline. The evaluator operates only on `ops.bin`; it does not import the
-Python construction or use submission-side testing data.
+The analysis also considered final-use AND workspaces that might admit
+measurement-based uncomputation. No site satisfied the strict complete-lifetime
+matcher, so none was changed. Constant-one controls and unrestricted CCZ gates
+were likewise left unchanged. This conservative policy is important: an
+unrestricted CCX or CCZ is not equivalent to a composition of only CX and CZ.
 
-The local operation commitment is
-`b9ab2819553e845a7aab7cf27c02fe4e280f71b11edcd40d26896414ddddac08`.
-That commitment identifies the circuit evaluated for the metrics below. Any
-source, parameter, lowering, or payload change must produce a new commitment
-and undergo a complete evaluation again.
+### Regenerate and freeze the child
 
-## Result
+The 152 accepted declarations are applied to the source operation stream. The
+result is lowered and serialized deterministically. The submitted Rust only
+decodes that frozen child stream and exposes the required four-register point
+addition entry point. It does not choose transformations at runtime.
 
-The frozen local evaluation reported:
+The emitted circuit declares two 256-qubit target coordinates followed by two
+256-bit classical offset coordinates. The target coordinates are overwritten
+with the affine sum. The offset coordinates are preserved. All other allocated
+qubits must return to zero, and the final global phase must be clean.
 
-| Metric | Result |
+The child was frozen before evaluation. The same frozen operation commitment
+was used for resource accounting and the complete trusted local validation.
+
+## Results
+
+### Whole-stream resource census
+
+| Metric | Ranked parent | This child | Delta |
+| --- | ---: | ---: | ---: |
+| Peak logical qubits | 1,283 | 1,283 | 0 |
+| Emitted CCX | 2,572,427 | 2,572,275 | -152 |
+| Emitted CZ | 577,162 | 577,162 | 0 |
+| Emitted operations | 12,377,821 | 12,377,669 | -152 |
+
+The operation stream also contains 768 classical bits. The reduction does not
+increase the measurement count or alter the condition-stack structure.
+
+### Trusted local evaluation
+
+| Measurement | Result |
 | --- | ---: |
-| Shots | 102,400 |
+| Validation shots | 102,400 |
 | Classical mismatches | 0 |
 | Phase-garbage batches | 0 |
 | Ancilla-garbage batches | 0 |
+| Average executed CCX+CCZ | 2,502,012.001 |
+| Rounded executed Toffoli | 2,502,012 |
+| Rounded Toffoli depth | 2,502,012 |
+| Average executed Clifford | 8,022,076.793 |
 | Peak logical qubits | 1,283 |
-| Average executed Toffoli | 2,502,170.191 |
-| Average executed Toffoli depth | 2,502,170.191 |
-| Average executed Clifford | 8,022,141.868 |
-| Emitted operations | 12,377,821 |
-| Rounded balanced score | 3,210,284,110 |
+| Emitted operations | 12,377,669 |
+| Balanced score | 3,210,081,396 |
 
-The decoded stream contains 2,572,427 CCX operations, 704,099 HMR operations,
-577,162 CZ operations, and 91,428 paired two-control condition scopes. The
-trusted builder declares 1,028 register operations and preserves the four ABI
-registers in their required order.
+The frozen operation artifact has SHA-256 commitment
+`8afad3ff46beb059ba86fd7024be94fc0305638a92d584AC517CC8DCE510CE1E`.
+The score follows the contest definition: peak qubits multiplied by the square
+root of rounded executed Toffoli count times rounded Toffoli depth. In this
+operation model the charged depth equals the executed Toffoli count, so the
+score reduces to `1,283 * 2,502,012`.
 
-The submission is rebuilt and packaged by the current repository-pinned CLI.
-Server receipt alone is not a ranked result: the trusted worker must reproduce
-the submitted operation commitment and pass all 102,400 shots using a fresh
-private seed.
+The live ranked parent is displayed at score 3,210,285,393. This candidate's
+local score is lower by 203,997. Shot-dependent averages vary slightly between
+independent validation seeds, while the structural reduction of 152
+unconditional CCX operations is seed-independent for identical cases.
 
 ## Caveat and what is left
 
-The inverse schedule and several special-prime arithmetic paths use bounded
-approximations. The clean local 102,400-shot cohort is strong evidence about
-these exact bytes, but it does not prove every exceptional event unreachable
-or predict the private validation seed. A server-seeded mismatch, phase event,
-or dirty ancilla would invalidate this candidate despite its lower score.
+The 102,400-shot result is strong evidence about the frozen submitted circuit,
+but it is not a proof over every possible curve input. The server's private-seed
+validation remains the promotion authority.
 
-If validation fails, the repair must occur in the source construction and
-produce a new immutable operation stream. Patching Rust after observing the
-evaluator or adding a nonce would not be an admissible correction.
+This optimization is intentionally small and conservative. It removes no
+qubits and does not attempt a general replacement of nonlinear three-qubit
+gates. Larger improvements would require new arithmetic structure, additional
+state invariants, or safe final-use workspace transformations. Any such change
+should be derived and evaluated as a new immutable child rather than modifying
+this submitted stream after validation.
 
-The benchmark's finite, unequal-x input domain is part of the construction.
-This is a mixed affine point-add primitive, not a complete exceptional-case
-elliptic-curve group law or a complete implementation of Shor's algorithm.
-
-## Credit and references
-
-The point-addition architecture, modular arithmetic, bounded binary-GCD method,
-and original Qarton implementation are André Schrottenloher's work. This
-submission is a generated Rust replay and contest-ABI adaptation; it does not
-claim authorship of the underlying algorithms.
-
-- André Schrottenloher, *Optimized Point Addition Circuits for Shor's
-  Algorithm*, [arXiv:2606.02235](https://arxiv.org/abs/2606.02235).
-- André Schrottenloher's Python/Qarton implementation,
-  [`ec-point-addition`](https://gitlab.inria.fr/capsule/qarton-projects/ec-point-addition),
-  commit `9b23c9170a636a7097a02afb3a3d6cbb6425c9f4`.
-- Qarton 1.0.0, used for circuit construction, decomposition, allocation, and
-  resource counting before deterministic Rust replay generation.
+The public payload contains only the minimal generated replay implementation,
+its embedded operation data, and the documentation required by the contest.
