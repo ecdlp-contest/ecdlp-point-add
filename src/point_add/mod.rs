@@ -1,228 +1,786 @@
-//! Reversible secp256k1 point addition circuit.
-//!
-//! THE editable file for the research loop. Everything else in `src/` is
-//! stable harness; all circuit construction lives here.
-//!
-//! This circuit is specialized to secp256k1. The curve parameters
-//!   p = 2^256 - 2^32 - 977
-//!   a = 0, b = 7
-//! are hard-coded. Specialization lets later optimization passes exploit
-//! the Solinas structure of p (sparse low word, mostly-ones upper words)
-//! for faster modular reduction. Generalizing is an explicit non-goal.
-//!
-//! # Interface
-//! `build(b)` allocates four 256-wide registers in declaration order —
-//! target_x (qubits), target_y (qubits), offset_x (bits), offset_y (bits)
-//! — and emits gates that mutate the target registers into (P + Q) where
-//! P is the quantum point in targets and Q is the classical point in
-//! offsets. The harness validates against `WeierstrassEllipticCurve::add`.
-//!
-//! # Algorithm
-//! The live schedule is generated from
-//! `profiles/clean-point-add-algorithm.json` in the companion formal toolset.
-//! It uses the internal convention `mu = -lambda`, because Kaliski's terminal
-//! `r` coefficient is a negative scaled inverse:
-//!
-//!   1. `tx = Px-Qx`, `ty = Py-Qy`.
-//!   2. Pair 1 scale-corrects the negative raw inverse, producing
-//!      `mu = -lambda`; adding `mu*(Px-Qx)` clears `ty`.
-//!   3. The x block produces `tx = Rx-Qx` and `ty = mu*(Rx-Qx)`.
-//!   4. Pair 2 uses the negative inverse of `Rx-Qx` to clear `mu`, subtracts
-//!      `Qy` to produce `Ry`, and finally adds `Qx` to restore `Rx`.
-//!
-//! Field-level Kaliski and affine-composition theorems live in
-//! `EccFormal.KaliskiAlmostInverse` and `EccFormal.PointAddAlgorithm`.
-//! Primitive refinement, lowering, allocation, and operation-stream equality
-//! are separate evidence gates.
-//!
-//! # Primitive layer
-//! All modular arithmetic is built on a single Cuccaro ripple-carry
-//! adder operating on `(n+1)`-wide extended registers. Subtract =
-//! forward complement + add + back complement. Modular reduction
-//! after add/sub is: (cond-sub p) + (cond-add p) controlled by the
-//! resulting sign bit.
-//!
-//! # Current status
-//! Correctness-first, nonce-free contest baseline. Both inversion pairs use
-//! the conservative `2N - 1 = 511` Kaliski schedule and the slope is applied
-//! through ordinary reversible multiply/apply/uncompute blocks.
-//!
-//! This baseline was adapted from the ECDSA Fail Kaliski/apply implementation
-//! at commit `da90a484510cf223b525ea84b3f2da9bccd6f8b3`; only compatibility with
-//! the current trusted harness and removal of embedded diagnostics changed.
 
 use alloy_primitives::U256;
-use crate::circuit::{BitId, Op, OperationType, QubitId, RegisterId};
+use sha3::{
+    digest::{ExtendableOutput, Update, XofReader},
+    Shake256,
+};
 
-mod generated_epoch_fanout;
-mod generated_exact_solinas;
-mod generated_exact_square;
-mod generated_point_add;
-mod qarton_fixed_port;
-mod qarton_contest_gate_eff_port;
+use crate::circuit::{analyze_ops, BitId, Op, OperationType, QubitId, QubitOrBit, RegisterId};
+use crate::sim::Simulator;
+use crate::weierstrass_elliptic_curve::WeierstrassEllipticCurve;
 
-struct B {
+pub mod venting;
+
+mod emit;
+pub(crate) use emit::*;
+
+mod arith;
+pub(crate) use arith::*;
+
+use trailmix_ludicrous::BExt;
+mod frontier_native265_schedule;
+mod frontier_k2_five_row_universal_codec;
+mod frontier_k2_head_pair8_codec;
+mod frontier_k2_controlled_word_swap;
+mod frontier_k2_full_frame_slot_lifecycle;
+mod frontier_k2_low73_double_halve;
+mod frontier_k2_controlled_pseudomersenne;
+mod frontier_k2_exact_word_subtract_negate;
+mod frontier_native265_coordinate_subtract_shell;
+mod frontier_native265_coordinate_three_x;
+mod frontier_native265_encoded_block_store;
+mod frontier_native265_exact_block_cells;
+mod frontier_native265_source_materializer_topology;
+mod frontier_native265_source_materializer_lifecycle;
+mod frontier_native265_low_owner_k2_row;
+mod frontier_low_space_square;
+mod frontier_native265_candidate;
+
+
+mod rounds;
+pub(crate) use rounds::*;
+
+pub mod trailmix_ludicrous;
+mod pingpong_div;
+mod pp_profile;
+mod single_ccx_fanout;
+mod m60_dead_t10;
+mod d2_deep_strip;
+mod deep_strip_keys;
+mod dirtyscan;
+
+thread_local! {
+    pub(crate) static CUR_DIVSTEP: std::cell::Cell<u32> = std::cell::Cell::new(0xffff_ffff);
+    static D1_PHASE_CORRECTED_PRODUCT_CORE_SCOPE: std::cell::Cell<bool> =
+        std::cell::Cell::new(false);
+    static OP_SITE_TRACE: std::cell::RefCell<Vec<OpSite>> =
+        std::cell::RefCell::new(Vec::new());
+    static OP_TRACE_CONTEXT: std::cell::Cell<u32> = std::cell::Cell::new(0);
+}
+
+fn d1_phase_corrected_product_core_active() -> bool {
+    D1_PHASE_CORRECTED_PRODUCT_CORE_SCOPE.with(|scope| scope.get())
+}
+
+pub type OpSite = (&'static str, u32, u32);
+
+pub(crate) fn op_site_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TRACE_OP_SITES").is_some())
+}
+
+fn reset_op_site_trace() {
+    if op_site_trace_enabled() {
+        OP_SITE_TRACE.with(|sites| sites.borrow_mut().clear());
+    }
+}
+
+fn record_op_site(site: OpSite) {
+    if op_site_trace_enabled() {
+        OP_SITE_TRACE.with(|sites| sites.borrow_mut().push(site));
+    }
+}
+
+pub(crate) fn set_cur_divstep(v: u32) { CUR_DIVSTEP.with(|c| c.set(v)); }
+pub(crate) fn cur_divstep() -> u32 { CUR_DIVSTEP.with(|c| c.get()) }
+pub(crate) fn trace_calls_enabled() -> bool { std::env::var_os("TLM_TRACE_CALLS").is_some() }
+
+pub(crate) fn set_op_trace_context(context: u32) -> u32 {
+    if !op_site_trace_enabled() {
+        return 0;
+    }
+    OP_TRACE_CONTEXT.with(|slot| {
+        let old = slot.get();
+        slot.set(context);
+        old
+    })
+}
+
+pub(crate) fn restore_op_trace_context(context: u32) {
+    if op_site_trace_enabled() {
+        OP_TRACE_CONTEXT.with(|slot| slot.set(context));
+    }
+}
+
+pub(crate) fn take_op_site_trace_for_constprop(expected_len: usize) -> Option<Vec<OpSite>> {
+    if !op_site_trace_enabled() {
+        return None;
+    }
+    OP_SITE_TRACE.with(|sites| {
+        let mut sites = sites.borrow_mut();
+        assert_eq!(
+            sites.len(),
+            expected_len,
+            "op site trace length before constprop"
+        );
+        Some(std::mem::take(&mut *sites))
+    })
+}
+
+pub(crate) fn set_op_site_trace_from_constprop(sites: Vec<OpSite>) {
+    if op_site_trace_enabled() {
+        OP_SITE_TRACE.with(|slot| *slot.borrow_mut() = sites);
+    }
+}
+
+pub fn take_last_op_sites() -> Vec<OpSite> {
+    OP_SITE_TRACE.with(|sites| std::mem::take(&mut *sites.borrow_mut()))
+}
+
+pub struct B {
     pub ops: Vec<Op>,
-    pub next_qubit: u64,
-    pub next_bit: u64,
-    pub next_register: u64,
-    pub free_qubits: Vec<u64>,
+    pub count_only: bool,
+    pub counted_ops: usize,
+    pub counted_kind_ops: [usize; 18],
+    pub counted_phase_kind_ops: [usize; 18],
+    pub counted_phase_start_ops: usize,
+    pub counted_phase_rows: Vec<PhaseResource>,
+    pub counted_registers: Vec<Vec<QubitOrBit>>,
+    pub next_qubit: u32,
+    pub next_bit: u32,
+    pub next_register: u32,
+    pub free_qubits: Vec<u32>,
     pub active_qubits: u32,
     pub peak_qubits: u32,
     pub peak_ops_idx: usize,
     pub peak_phase: &'static str,
     pub phase: &'static str,
     pub peak_log: Vec<(u32, &'static str, usize)>,
-    // (ops_len_at_transition, new_phase)
+    pub phase_active_max: std::collections::BTreeMap<&'static str, u32>,
+    pub phase_active_regions: Vec<(usize, &'static str, u32)>,
+    pub current_phase_active_max: u32,
+
     pub phase_transitions: Vec<(usize, &'static str)>,
+    pub active_timeline: Vec<(usize, u32)>,
+
+    pub k2_shift2_log: Vec<QubitId>,
+
+    pub b0: B0Census,
+}
+
+#[derive(Default)]
+pub struct B0Census {
+    pub enabled: bool,
+    pub win_lo: usize,
+    pub win_hi: usize,
+
+    pub owner: std::collections::HashMap<u64, (&'static str, &'static str, u32)>,
+
+    pub batch_ctx: Option<(&'static str, u32)>,
+    pub best_active: u32,
+    pub best_ops: usize,
+    pub best_phase: &'static str,
+    pub best_snapshot: Option<std::collections::HashMap<u64, (&'static str, &'static str, u32)>>,
+    pub printed: bool,
+
+    pub phase_filter: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct CountSnapshot {
+    ops: usize,
+    kind_ops: [usize; 18],
+    phase_kind_ops: [usize; 18],
+    phase_start_ops: usize,
+    phase_rows_len: usize,
+    phase: &'static str,
+}
+
+#[derive(Clone, Debug)]
+pub struct PhaseResource {
+    pub phase: &'static str,
+    pub start: usize,
+    pub end: usize,
+    pub ops: usize,
+    pub toffoli_ops: usize,
+    pub ccx_ops: usize,
+    pub ccz_ops: usize,
+    pub hmr_ops: usize,
+    pub r_ops: usize,
 }
 
 impl B {
     fn new() -> Self {
-        Self { ops: Vec::new(), next_qubit: 0, next_bit: 0, next_register: 0, free_qubits: Vec::new(), active_qubits: 0, peak_qubits: 0, peak_ops_idx: 0, peak_phase: "", phase: "init", peak_log: Vec::new(), phase_transitions: Vec::new() }
+        reset_op_site_trace();
+        Self {
+            ops: Vec::new(),
+            count_only: false,
+            counted_ops: 0,
+            counted_kind_ops: [0; 18],
+            counted_phase_kind_ops: [0; 18],
+            counted_phase_start_ops: 0,
+            counted_phase_rows: Vec::new(),
+            counted_registers: Vec::new(),
+            next_qubit: 0,
+            next_bit: 0,
+            next_register: 0,
+            free_qubits: Vec::new(),
+            active_qubits: 0,
+            peak_qubits: 0,
+            peak_ops_idx: 0,
+            peak_phase: "",
+            phase: "init",
+            peak_log: Vec::new(),
+            phase_active_max: std::collections::BTreeMap::new(),
+            phase_active_regions: Vec::new(),
+            current_phase_active_max: 0,
+            phase_transitions: Vec::new(),
+            active_timeline: Vec::new(),
+            k2_shift2_log: Vec::new(),
+            b0: {
+                let lo = std::env::var("B0_WIN_LO")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok());
+                let hi = std::env::var("B0_WIN_HI")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok());
+                match (lo, hi) {
+                    (Some(lo), Some(hi)) => B0Census {
+                        enabled: true,
+                        win_lo: lo,
+                        win_hi: hi,
+                        phase_filter: std::env::var("B0_PHASE").ok().filter(|s| !s.is_empty()),
+                        ..Default::default()
+                    },
+                    _ => B0Census::default(),
+                }
+            },
+        }
+    }
+    fn new_count_only() -> Self {
+        let mut b = Self::new();
+        b.count_only = true;
+        b
+    }
+
+    pub fn new_for_test() -> Self {
+        Self::new()
+    }
+    pub fn take_ops(&mut self) -> Vec<Op> {
+        std::mem::take(&mut self.ops)
+    }
+    #[track_caller]
+    fn push_op(&mut self, op: Op) {
+        self.counted_ops += 1;
+        self.counted_kind_ops[op.kind as usize] += 1;
+        self.counted_phase_kind_ops[op.kind as usize] += 1;
+        if !self.count_only {
+            let loc = std::panic::Location::caller();
+            let context = OP_TRACE_CONTEXT.with(|slot| slot.get());
+            record_op_site((loc.file(), loc.line(), context));
+            self.ops.push(op);
+        }
+    }
+    fn count_snapshot(&self) -> CountSnapshot {
+        CountSnapshot {
+            ops: self.counted_ops,
+            kind_ops: self.counted_kind_ops,
+            phase_kind_ops: self.counted_phase_kind_ops,
+            phase_start_ops: self.counted_phase_start_ops,
+            phase_rows_len: self.counted_phase_rows.len(),
+            phase: self.phase,
+        }
+    }
+    fn count_delta_since(&self, snap: CountSnapshot) -> [usize; 18] {
+        let mut out = [0usize; 18];
+        for (idx, slot) in out.iter_mut().enumerate() {
+            *slot = self.counted_kind_ops[idx] - snap.kind_ops[idx];
+        }
+        out
+    }
+    fn restore_count_snapshot(&mut self, snap: CountSnapshot) {
+        self.counted_ops = snap.ops;
+        self.counted_kind_ops = snap.kind_ops;
+        self.counted_phase_kind_ops = snap.phase_kind_ops;
+        self.counted_phase_start_ops = snap.phase_start_ops;
+        self.counted_phase_rows.truncate(snap.phase_rows_len);
+        self.phase = snap.phase;
+    }
+    fn add_counted_kind(&mut self, kind: OperationType, count: usize) {
+        self.counted_ops += count;
+        self.counted_kind_ops[kind as usize] += count;
+        self.counted_phase_kind_ops[kind as usize] += count;
+    }
+    fn current_ops_len(&self) -> usize {
+        if self.count_only {
+            self.counted_ops
+        } else {
+            self.ops.len()
+        }
+    }
+    fn close_counted_phase(&mut self) {
+        if !self.count_only {
+            return;
+        }
+        let start = self.counted_phase_start_ops;
+        let end = self.counted_ops;
+        if start < end {
+            let ccx_ops = self.counted_phase_kind_ops[OperationType::CCX as usize];
+            let ccz_ops = self.counted_phase_kind_ops[OperationType::CCZ as usize];
+            let hmr_ops = self.counted_phase_kind_ops[OperationType::Hmr as usize];
+            let r_ops = self.counted_phase_kind_ops[OperationType::R as usize];
+            self.counted_phase_rows.push(PhaseResource {
+                phase: self.phase,
+                start,
+                end,
+                ops: end - start,
+                toffoli_ops: ccx_ops + ccz_ops,
+                ccx_ops,
+                ccz_ops,
+                hmr_ops,
+                r_ops,
+            });
+        }
+        self.counted_phase_start_ops = self.counted_ops;
+        self.counted_phase_kind_ops = [0; 18];
     }
     fn set_phase(&mut self, p: &'static str) {
+        self.close_phase_active_region();
+        self.close_counted_phase();
         self.phase = p;
-        self.phase_transitions.push((self.ops.len(), p));
+        if std::env::var("TRACE_PHASE_ACTIVE").is_ok() {
+            self.current_phase_active_max = self.active_qubits;
+        }
+        self.phase_transitions.push((self.current_ops_len(), p));
     }
+    fn record_active_timeline(&mut self) {
+        if std::env::var("PROFILE_ACTIVE_TIMELINE").is_ok() {
+            self.active_timeline
+                .push((self.current_ops_len(), self.active_qubits));
+        }
+    }
+    fn record_phase_active(&mut self) {
+        self.record_active_timeline();
+        if std::env::var("TRACE_PHASE_ACTIVE").is_ok() {
+            let entry = self.phase_active_max.entry(self.phase).or_insert(0);
+            if self.active_qubits > *entry {
+                *entry = self.active_qubits;
+            }
+            if self.active_qubits > self.current_phase_active_max {
+                self.current_phase_active_max = self.active_qubits;
+            }
+        }
+    }
+    fn close_phase_active_region(&mut self) {
+        if std::env::var("TRACE_PHASE_ACTIVE").is_ok() && self.current_phase_active_max > 0 {
+            self.phase_active_regions.push((
+                self.current_ops_len(),
+                self.phase,
+                self.current_phase_active_max,
+            ));
+            self.current_phase_active_max = 0;
+        }
+    }
+
+    fn b0_on_alloc(&mut self, qid: u64, file: &'static str, line: u32) {
+        if !self.b0.enabled || self.count_only {
+            return;
+        }
+        let ctx = match self.b0.batch_ctx {
+            Some((f, l)) => (self.phase, f, l),
+            None => (self.phase, file, line),
+        };
+        self.b0.owner.insert(qid, ctx);
+        self.b0_sample();
+    }
+    fn b0_on_free(&mut self, qid: u64) {
+        if !self.b0.enabled || self.count_only {
+            return;
+        }
+        self.b0.owner.remove(&qid);
+        self.b0_sample();
+    }
+    fn b0_sample(&mut self) {
+        if self.b0.printed {
+            return;
+        }
+        let cur = self.current_ops_len();
+        if cur > self.b0.win_hi {
+            self.b0_print();
+            return;
+        }
+        if cur >= self.b0.win_lo && self.active_qubits > self.b0.best_active {
+            if let Some(f) = &self.b0.phase_filter {
+                if !self.phase.contains(f.as_str()) {
+                    return;
+                }
+            }
+            self.b0.best_active = self.active_qubits;
+            self.b0.best_ops = cur;
+            self.b0.best_phase = self.phase;
+            self.b0.best_snapshot = Some(self.b0.owner.clone());
+        }
+    }
+
+    pub fn b0_finalize(&mut self) {
+        if self.b0.enabled && !self.b0.printed {
+            self.b0_print();
+        }
+    }
+    fn b0_print(&mut self) {
+        self.b0.printed = true;
+        let snap = match self.b0.best_snapshot.take() {
+            Some(s) => s,
+            None => return,
+        };
+        let mut hist: std::collections::HashMap<(&'static str, &'static str, u32), u32> =
+            std::collections::HashMap::new();
+        for v in snap.values() {
+            *hist.entry(*v).or_insert(0) += 1;
+        }
+        let mut rows: Vec<((&'static str, &'static str, u32), u32)> = hist.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        eprintln!(
+            "B0_CENSUS_BEGIN best_active={} best_ops={} best_phase={} n_live={} n_groups={} win=[{},{}]",
+            self.b0.best_active,
+            self.b0.best_ops,
+            self.b0.best_phase,
+            snap.len(),
+            rows.len(),
+            self.b0.win_lo,
+            self.b0.win_hi
+        );
+        for ((phase, file, line), cnt) in &rows {
+            eprintln!("B0_OWN count={cnt} phase={phase} caller={file}:{line}");
+        }
+        eprintln!("B0_CENSUS_END");
+    }
+    #[track_caller]
     fn alloc_qubit(&mut self) -> QubitId {
         self.active_qubits += 1;
+        self.record_phase_active();
+        if let Ok(threshold) = std::env::var("TRACE_ALLOC_NEAR_PEAK")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or(())
+        {
+            if self.active_qubits >= threshold {
+                let caller = std::panic::Location::caller();
+                eprintln!(
+                    "ALLOC_NEAR active={} next_idx={} phase='{}' ops_idx={} free_pool={} caller={}:{}",
+                    self.active_qubits,
+                    self.next_qubit,
+                    self.phase,
+                    self.current_ops_len(),
+                    self.free_qubits.len(),
+                    caller.file(),
+                    caller.line(),
+                );
+            }
+        }
         if self.active_qubits > self.peak_qubits {
             self.peak_qubits = self.active_qubits;
-            self.peak_ops_idx = self.ops.len();
+            self.peak_ops_idx = self.current_ops_len();
             self.peak_phase = self.phase;
+            if std::env::var("TRACE_EACH_PEAK").is_ok() {
+                eprintln!(
+                    "PEAK active={} next_idx={} phase='{}' ops_idx={}",
+                    self.active_qubits,
+                    self.next_qubit,
+                    self.phase,
+                    self.current_ops_len()
+                );
+            }
         }
         if std::env::var("TRACE_PEAK").is_ok() && self.active_qubits + 10 >= self.peak_qubits {
-            self.peak_log.push((self.active_qubits, self.phase, self.ops.len()));
+            self.peak_log
+                .push((self.active_qubits, self.phase, self.current_ops_len()));
         }
-        if let Some(q) = self.free_qubits.pop() { QubitId(q) }
-        else { let q = self.next_qubit; self.next_qubit += 1; QubitId(q) }
+        let qid = if let Some(q) = self.free_qubits.pop() {
+            QubitId(q.into())
+        } else {
+            let q = self.next_qubit;
+            self.next_qubit += 1;
+            QubitId(q.into())
+        };
+        if self.b0.enabled && !self.count_only {
+            let caller = std::panic::Location::caller();
+            self.b0_on_alloc(qid.0, caller.file(), caller.line());
+        }
+        qid
     }
-    fn alloc_qubits(&mut self, n: usize) -> Vec<QubitId> { (0..n).map(|_| self.alloc_qubit()).collect() }
-    fn alloc_bit(&mut self) -> BitId { let b = self.next_bit; self.next_bit += 1; BitId(b) }
-    fn alloc_bits(&mut self, n: usize) -> Vec<BitId> { (0..n).map(|_| self.alloc_bit()).collect() }
-    fn free(&mut self, q: QubitId) { self.r(q); self.free_qubits.push(q.0); if self.active_qubits > 0 { self.active_qubits -= 1; } }
-    fn free_vec(&mut self, qs: &[QubitId]) { for &q in qs { self.free(q); } }
+    #[track_caller]
+    fn alloc_qubits(&mut self, n: usize) -> Vec<QubitId> {
+        if self.b0.enabled {
+            let c = std::panic::Location::caller();
+            self.b0.batch_ctx = Some((c.file(), c.line()));
+            let out = (0..n).map(|_| self.alloc_qubit()).collect();
+            self.b0.batch_ctx = None;
+            out
+        } else {
+            (0..n).map(|_| self.alloc_qubit()).collect()
+        }
+    }
+    fn alloc_bit(&mut self) -> BitId {
+        let b = self.next_bit;
+        self.next_bit += 1;
+        BitId(b.into())
+    }
+    fn alloc_bits(&mut self, n: usize) -> Vec<BitId> {
+        (0..n).map(|_| self.alloc_bit()).collect()
+    }
+    fn free(&mut self, q: QubitId) {
+        self.r(q);
+        self.release_clean(q);
+    }
+    /// Return a qubit that the caller has unitarily restored to |0> without
+    /// emitting a reset. This preserves the measurement stream when a clean
+    /// temporary is parked and reused inside one reversible cell.
+    fn release_clean(&mut self, q: QubitId) {
+        self.free_qubits
+            .push(q.0.try_into().expect("qubit id fits in u32"));
+        if self.active_qubits > 0 {
+            self.active_qubits -= 1;
+        }
+        self.record_active_timeline();
+        self.b0_on_free(q.0);
+    }
+    fn free_vec(&mut self, qs: &[QubitId]) {
+        for &q in qs {
+            self.free(q);
+        }
+    }
+    fn reacquire(&mut self, q: QubitId) {
+        let pos = self
+            .free_qubits
+            .iter()
+            .position(|&free_q| u64::from(free_q) == q.0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "reacquire qubit {:?} that is not currently free (phase '{}', ops {})",
+                    q,
+                    self.phase,
+                    self.current_ops_len()
+                )
+            });
+        self.free_qubits.swap_remove(pos);
+        self.active_qubits += 1;
+        self.record_phase_active();
+        if self.active_qubits > self.peak_qubits {
+            self.peak_qubits = self.active_qubits;
+            self.peak_ops_idx = self.current_ops_len();
+            self.peak_phase = self.phase;
+            if std::env::var("TRACE_EACH_PEAK").is_ok() {
+                eprintln!(
+                    "PEAK active={} next_idx={} phase='{}' ops_idx={}",
+                    self.active_qubits,
+                    self.next_qubit,
+                    self.phase,
+                    self.current_ops_len()
+                );
+            }
+        }
+        if std::env::var("TRACE_PEAK").is_ok() && self.active_qubits + 10 >= self.peak_qubits {
+            self.peak_log
+                .push((self.active_qubits, self.phase, self.current_ops_len()));
+        }
+
+        if self.b0.enabled && !self.count_only {
+            self.b0_on_alloc(q.0, "reacquire", 0);
+        }
+    }
+    fn reacquire_vec(&mut self, qs: &[QubitId]) {
+        for &q in qs {
+            self.reacquire(q);
+        }
+    }
     fn declare_qubit_register(&mut self, qs: &[QubitId]) {
-        let r = RegisterId(self.next_register); self.next_register += 1;
-        for &q in qs { let mut op = Op::empty(); op.kind = OperationType::AppendToRegister; op.q_target = q; op.r_target = r; self.ops.push(op); }
-        let mut op = Op::empty(); op.kind = OperationType::Register; op.r_target = r; self.ops.push(op);
+        let r = RegisterId(self.next_register.into());
+        self.next_register += 1;
+        for &q in qs {
+            while self.counted_registers.len() <= r.0 as usize {
+                self.counted_registers.push(Vec::new());
+            }
+            self.counted_registers[r.0 as usize].push(QubitOrBit::Qubit(q));
+            let mut op = Op::empty();
+            op.kind = OperationType::AppendToRegister;
+            op.q_target = q;
+            op.r_target = r;
+            self.push_op(op);
+        }
+        let mut op = Op::empty();
+        op.kind = OperationType::Register;
+        op.r_target = r;
+        self.push_op(op);
     }
     fn declare_bit_register(&mut self, bs: &[BitId]) {
-        let r = RegisterId(self.next_register); self.next_register += 1;
-        for &b in bs { let mut op = Op::empty(); op.kind = OperationType::AppendToRegister; op.c_target = b; op.r_target = r; self.ops.push(op); }
-        let mut op = Op::empty(); op.kind = OperationType::Register; op.r_target = r; self.ops.push(op);
-    }
-    fn x(&mut self, q: QubitId) { let mut op = Op::empty(); op.kind = OperationType::X; op.q_target = q; self.ops.push(op); }
-    fn z(&mut self, q: QubitId) { let mut op = Op::empty(); op.kind = OperationType::Z; op.q_target = q; self.ops.push(op); }
-    fn cx(&mut self, ctrl: QubitId, tgt: QubitId) { let mut op = Op::empty(); op.kind = OperationType::CX; op.q_control1 = ctrl; op.q_target = tgt; self.ops.push(op); }
-    fn cz(&mut self, a: QubitId, b: QubitId) { let mut op = Op::empty(); op.kind = OperationType::CZ; op.q_control1 = a; op.q_target = b; self.ops.push(op); }
-    fn ccx(&mut self, c1: QubitId, c2: QubitId, tgt: QubitId) { let mut op = Op::empty(); op.kind = OperationType::CCX; op.q_control2 = c1; op.q_control1 = c2; op.q_target = tgt; self.ops.push(op); }
-    fn ccz(&mut self, c1: QubitId, c2: QubitId, tgt: QubitId) { let mut op = Op::empty(); op.kind = OperationType::CCZ; op.q_control2 = c1; op.q_control1 = c2; op.q_target = tgt; self.ops.push(op); }
-    fn swap(&mut self, a: QubitId, b: QubitId) { let mut op = Op::empty(); op.kind = OperationType::Swap; op.q_control1 = a; op.q_target = b; self.ops.push(op); }
-    fn r(&mut self, q: QubitId) { let mut op = Op::empty(); op.kind = OperationType::R; op.q_target = q; self.ops.push(op); }
-    fn x_if(&mut self, q: QubitId, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::X; op.q_target = q; op.c_condition = cond; self.ops.push(op); }
-    fn cx_if(&mut self, ctrl: QubitId, tgt: QubitId, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::CX; op.q_control1 = ctrl; op.q_target = tgt; op.c_condition = cond; self.ops.push(op); }
-    fn ccx_if(&mut self, c1: QubitId, c2: QubitId, tgt: QubitId, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::CCX; op.q_control2 = c1; op.q_control1 = c2; op.q_target = tgt; op.c_condition = cond; self.ops.push(op); }
-    fn push_condition(&mut self, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::PushCondition; op.c_condition = cond; self.ops.push(op); }
-    fn pop_condition(&mut self) { let mut op = Op::empty(); op.kind = OperationType::PopCondition; self.ops.push(op); }
-    // ── Measurement / phase / classical bit ops ──
-    fn hmr(&mut self, q: QubitId, c: BitId) { let mut op = Op::empty(); op.kind = OperationType::Hmr; op.q_target = q; op.c_target = c; self.ops.push(op); }
-    fn neg(&mut self) { let mut op = Op::empty(); op.kind = OperationType::Neg; self.ops.push(op); }
-    fn bit_invert(&mut self, c: BitId) { let mut op = Op::empty(); op.kind = OperationType::BitInvert; op.c_target = c; self.ops.push(op); }
-    fn bit_store0(&mut self, c: BitId) { let mut op = Op::empty(); op.kind = OperationType::BitStore0; op.c_target = c; self.ops.push(op); }
-    fn bit_store1(&mut self, c: BitId) { let mut op = Op::empty(); op.kind = OperationType::BitStore1; op.c_target = c; self.ops.push(op); }
-    // ── Classically-conditioned variants for all remaining gates ──
-    fn z_if(&mut self, q: QubitId, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::Z; op.q_target = q; op.c_condition = cond; self.ops.push(op); }
-    fn cz_if(&mut self, a: QubitId, b: QubitId, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::CZ; op.q_control1 = a; op.q_target = b; op.c_condition = cond; self.ops.push(op); }
-    fn ccz_if(&mut self, c1: QubitId, c2: QubitId, tgt: QubitId, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::CCZ; op.q_control2 = c1; op.q_control1 = c2; op.q_target = tgt; op.c_condition = cond; self.ops.push(op); }
-    fn swap_if(&mut self, a: QubitId, b: QubitId, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::Swap; op.q_control1 = a; op.q_target = b; op.c_condition = cond; self.ops.push(op); }
-    fn neg_if(&mut self, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::Neg; op.c_condition = cond; self.ops.push(op); }
-    fn hmr_if(&mut self, q: QubitId, c: BitId, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::Hmr; op.q_target = q; op.c_target = c; op.c_condition = cond; self.ops.push(op); }
-    fn bit_invert_if(&mut self, c: BitId, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::BitInvert; op.c_target = c; op.c_condition = cond; self.ops.push(op); }
-    fn bit_store0_if(&mut self, c: BitId, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::BitStore0; op.c_target = c; op.c_condition = cond; self.ops.push(op); }
-    fn bit_store1_if(&mut self, c: BitId, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::BitStore1; op.c_target = c; op.c_condition = cond; self.ops.push(op); }
-    fn r_if(&mut self, q: QubitId, cond: BitId) { let mut op = Op::empty(); op.kind = OperationType::R; op.q_target = q; op.c_condition = cond; self.ops.push(op); }
-    // ── Gidney measurement-based AND uncomputation (convenience) ──
-    // Uncomputes `tgt = c1 AND c2` using HMR + phase feedback.
-    // Cost: 0 Toffoli (1 HMR + 1 classically-conditioned CZ).
-    // Precondition: tgt holds (c1 AND c2) computed by a prior CCX.
-    fn uncompute_and(&mut self, c1: QubitId, c2: QubitId, tgt: QubitId) {
-        let m = self.alloc_bit();
-        self.hmr(tgt, m);
-        self.cz_if(c1, c2, m);
-        self.neg_if(m);
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  emit_inverse: run a closure, pop the ops it emitted, and re-emit them
-//  reversed.
-//
-//  The closure may contain `alloc_qubit` / `free` calls;
-//  the R ops that `free` produces are SKIPPED during
-//  reverse replay. This relies on the forward being "clean" — i.e. each
-//  free lands on a qubit that the forward gates already drove to |0⟩
-//  before the R. Under that invariant, the reverse gate sequence brings
-//  the same qubit back to |0⟩ at the "alloc" point (pre-forward-allocation),
-//  and the R we skipped is unnecessary.
-//
-//  The forward's internal alloc/free bookkeeping in the B's free
-//  pool is NOT undone by the reverse — the pool state at reverse exit
-//  equals the pool state at forward exit. Subsequent allocations in the
-//  parent scope reuse those qubit IDs, seeing them at |0⟩ (as zeroed by
-//  the reverse gate sequence).
-// ═══════════════════════════════════════════════════════════════════════════
-fn emit_inverse<F: FnOnce(&mut B)>(b: &mut B, f: F) {
-    let start = b.ops.len();
-    f(b);
-    let end = b.ops.len();
-    // Extract the forward slice and drop it from the builder.
-    let fwd: Vec<_> = b.ops[start..end].to_vec();
-    b.ops.truncate(start);
-    for op in fwd.into_iter().rev() {
-        match op.kind {
-            OperationType::X
-            | OperationType::Z
-            | OperationType::CX
-            | OperationType::CZ
-            | OperationType::CCX
-            | OperationType::CCZ
-            | OperationType::Swap => b.ops.push(op),
-            // R ops are the free markers. They're not directly reversible
-            // as gates, but in a clean forward they're preceded by gates
-            // that already zero the qubit. We skip them in reverse.
-            OperationType::R => {}
-            // Metadata ops (register declarations, debug prints) don't
-            // affect state and shouldn't appear inside an emit_inverse
-            // closure anyway, but skip them if they do.
-            OperationType::Register
-            | OperationType::AppendToRegister
-            | OperationType::DebugPrint => {}
-            _ => panic!(
-                "emit_inverse: non-invertible op kind {:?} inside forward block",
-                op.kind
-            ),
+        let r = RegisterId(self.next_register.into());
+        self.next_register += 1;
+        for &b in bs {
+            while self.counted_registers.len() <= r.0 as usize {
+                self.counted_registers.push(Vec::new());
+            }
+            self.counted_registers[r.0 as usize].push(QubitOrBit::Bit(b));
+            let mut op = Op::empty();
+            op.kind = OperationType::AppendToRegister;
+            op.c_target = b;
+            op.r_target = r;
+            self.push_op(op);
         }
+        let mut op = Op::empty();
+        op.kind = OperationType::Register;
+        op.r_target = r;
+        self.push_op(op);
     }
-}
+    fn x(&mut self, q: QubitId) {
+        let mut op = Op::empty();
+        op.kind = OperationType::X;
+        op.q_target = q;
+        self.push_op(op);
+    }
+    fn cx(&mut self, ctrl: QubitId, tgt: QubitId) {
+        if ctrl == tgt {
+            panic!("invalid CX with aliased control/target {:?}", ctrl);
+        }
+        let mut op = Op::empty();
+        op.kind = OperationType::CX;
+        op.q_control1 = ctrl;
+        op.q_target = tgt;
+        self.push_op(op);
+    }
+    #[track_caller]
+    fn ccx(&mut self, c1: QubitId, c2: QubitId, tgt: QubitId) {
+        if c1 == c2 {
+            if c1 != tgt {
+                self.cx(c1, tgt);
+            }
+            return;
+        }
+        if c1 == tgt || c2 == tgt {
+            panic!(
+                "invalid CCX with target aliased to a control: {:?}, {:?}, {:?}",
+                c1, c2, tgt
+            );
+        }
+        let mut op = Op::empty();
+        op.kind = OperationType::CCX;
+        op.q_control2 = c1;
+        op.q_control1 = c2;
+        op.q_target = tgt;
+        self.push_op(op);
+    }
+    fn cz(&mut self, a: QubitId, b: QubitId) {
+        if a == b {
+            let mut op = Op::empty();
+            op.kind = OperationType::Z;
+            op.q_target = a;
+            self.push_op(op);
+            return;
+        }
+        let mut op = Op::empty();
+        op.kind = OperationType::CZ;
+        op.q_control1 = a;
+        op.q_target = b;
+        self.push_op(op);
+    }
+    fn push_condition(&mut self, cond: BitId) {
+        let mut op = Op::empty();
+        op.kind = OperationType::PushCondition;
+        op.c_condition = cond;
+        self.push_op(op);
+    }
+    fn pop_condition(&mut self) {
+        let mut op = Op::empty();
+        op.kind = OperationType::PopCondition;
+        self.push_op(op);
+    }
+    fn swap(&mut self, a: QubitId, b: QubitId) {
+        if a == b {
+            return;
+        }
+        let mut op = Op::empty();
+        op.kind = OperationType::Swap;
+        op.q_control1 = a;
+        op.q_target = b;
+        self.push_op(op);
+    }
+    fn r(&mut self, q: QubitId) {
+        let mut op = Op::empty();
+        op.kind = OperationType::R;
+        op.q_target = q;
+        self.push_op(op);
+    }
+    fn x_if(&mut self, q: QubitId, cond: BitId) {
+        let mut op = Op::empty();
+        op.kind = OperationType::X;
+        op.q_target = q;
+        op.c_condition = cond;
+        self.push_op(op);
+    }
 
-/// Runs `compute`, then `body`, then the inverse of `compute` — the
-/// "with conjugate" pattern from qrisp. `compute` must emit only
-/// reversible gates (no alloc/free/R).
-fn conjugate<F, G>(b: &mut B, compute: F, body: G)
-where
-    F: Fn(&mut B),
-    G: FnOnce(&mut B),
-{
-    compute(b);
-    body(b);
-    emit_inverse(b, compute);
+    fn hmr(&mut self, q: QubitId, c: BitId) {
+        let mut op = Op::empty();
+        op.kind = OperationType::Hmr;
+        op.q_target = q;
+        op.c_target = c;
+        self.push_op(op);
+    }
+
+    fn z_if(&mut self, q: QubitId, cond: BitId) {
+        let mut op = Op::empty();
+        op.kind = OperationType::Z;
+        op.q_target = q;
+        op.c_condition = cond;
+        self.push_op(op);
+    }
+    fn cz_if(&mut self, a: QubitId, b: QubitId, cond: BitId) {
+        if a == b {
+            self.z_if(a, cond);
+            return;
+        }
+        let mut op = Op::empty();
+        op.kind = OperationType::CZ;
+        op.q_control1 = a;
+        op.q_target = b;
+        op.c_condition = cond;
+        self.push_op(op);
+    }
+
+    fn bit_store0(&mut self, dst: BitId) {
+        let mut op = Op::empty();
+        op.kind = OperationType::BitStore0;
+        op.c_target = dst;
+        self.push_op(op);
+    }
+
+    fn bit_store1(&mut self, dst: BitId) {
+        let mut op = Op::empty();
+        op.kind = OperationType::BitStore1;
+        op.c_target = dst;
+        self.push_op(op);
+    }
+
+    fn bit_invert(&mut self, dst: BitId) {
+        let mut op = Op::empty();
+        op.kind = OperationType::BitInvert;
+        op.c_target = dst;
+        self.push_op(op);
+    }
+
+    fn bit_copy(&mut self, dst: BitId, a: BitId) {
+        self.bit_store0(dst);
+        self.push_condition(a);
+        self.bit_store1(dst);
+        self.pop_condition();
+    }
+
+    fn bit_xor_into(&mut self, dst: BitId, a: BitId) {
+        self.push_condition(a);
+        self.bit_invert(dst);
+        self.pop_condition();
+    }
+
+    fn bit_and_xor_into(&mut self, dst: BitId, a: BitId, b: BitId) {
+        self.push_condition(a);
+        self.push_condition(b);
+        self.bit_invert(dst);
+        self.pop_condition();
+        self.pop_condition();
+    }
 }
 
 pub const N: usize = 256;
 
-/// secp256k1 prime:  p = 2^256 - 2^32 - 977.
 pub const SECP256K1_P: U256 = U256::from_limbs([
     0xFFFFFFFEFFFFFC2F,
     0xFFFFFFFFFFFFFFFF,
@@ -230,3972 +788,797 @@ pub const SECP256K1_P: U256 = U256::from_limbs([
     0xFFFFFFFFFFFFFFFF,
 ]);
 
-/// secp256k1 curve coefficient a = 0.
-pub const SECP256K1_A: U256 = U256::ZERO;
+pub const ONE_INV_DX3_AFFINE_PA_ENV: &str = "ONE_INV_DX3_AFFINE_PA";
+pub const ONE_INV_DX3_AFFINE_PA_BLOCKER: &str =
+    "ONE_INV_DX3_AFFINE_PA_BLOCKED: the dx^3 algebra gives Rx and Ry with \
+     one inversion of w=dx^3, but a clean in-place Google-ABI circuit must \
+     also uncompute w, dx^2, and the Kaliski input copy after tx/ty have been \
+     overwritten by Rx/Ry.  At that point dx is recoverable only by the inverse \
+     affine add P=R-Q, whose denominator is Rx-Qx.  That is a second inversion, \
+     or else a retained 256-bit dx witness / dirty reset, so this path cannot \
+     emit a clean one-inversion four-register PA.";
 
-/// secp256k1 curve coefficient b = 7.
-pub const SECP256K1_B: U256 = U256::from_limbs([7, 0, 0, 0]);
-
-// ─── helpers: bit access on U256 ────────────────────────────────────────────
-
-fn bit(c: U256, i: usize) -> bool {
-    // alloy's U256::bit returns bool for index < 256.
-    c.bit(i)
+fn direct_const_walks_enabled() -> bool {
+    std::env::var("KAL_DIRECT_CONST_WALKS").ok().as_deref() == Some("1")
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Cuccaro ripple-carry adder
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// Operates on two n-wide qubit registers `a` (addend, unchanged) and
-// `acc` (accumulator, becomes a + acc mod 2^n). Also takes:
-//   * c_in: one ancilla qubit, = 0 on entry, = 0 on exit (unchanged)
-//   * z   : one ancilla qubit, = 0 on entry, = carry_out ⊕ z_in on exit
-//           (i.e., the output carry is XORed into z; pass a fresh 0 bit
-//           to receive the high bit)
-//
-// Based on Cuccaro et al. 2004 (arXiv:quant-ph/0410184), Figure 3.
-//
-// `MAJ(x, y, w)` triple:
-//     CX(w, y)        # y ← y ⊕ w
-//     CX(w, x)        # x ← x ⊕ w
-//     CCX(x, y, w)    # w ← w ⊕ (x·y)        w becomes MAJ(w_old, y_old, x_old)
-//
-// `UMA(x, y, w)` triple (undoes MAJ, leaves sum bit in y):
-//     CCX(x, y, w)
-//     CX(w, x)
-//     CX(x, y)
-
-fn maj(b: &mut B, x: QubitId, y: QubitId, w: QubitId) {
-    b.cx(w, y);
-    b.cx(w, x);
-    b.ccx(x, y, w);
+fn secp_direct_const_arith_enabled() -> bool {
+    std::env::var("SECP_DIRECT_CONST_ARITH").ok().as_deref() == Some("1")
 }
 
-fn uma(b: &mut B, x: QubitId, y: QubitId, w: QubitId) {
-    b.ccx(x, y, w);
-    b.cx(w, x);
-    b.cx(x, y);
+fn r84_lowq_enabled() -> bool {
+    std::env::var("R84_LOWQ").ok().as_deref() == Some("1")
 }
 
-/// Fast Cuccaro add using carry ancillae + measurement-based UMA.
-/// Same interface as `cuccaro_add` but uses n-1 carry ancillae so the
-/// UMA sweep costs 0 Toffoli (measurement only). NOT emit_inverse-safe.
-fn cuccaro_add_fast(b: &mut B, a: &[QubitId], acc: &[QubitId], c_in: QubitId) {
-    let n = a.len();
-    assert_eq!(n, acc.len());
-    if n == 0 { return; }
-    if n == 1 {
-        b.cx(c_in, acc[0]);
-        b.cx(a[0], acc[0]);
-        return;
+fn r84_lowq_cin_borrow_enabled() -> bool {
+    std::env::var("R84_LOWQ_CIN_BORROW").ok().as_deref() == Some("1")
+}
+
+fn kal_vent_modadd_enabled() -> bool {
+    std::env::var("KAL_VENT_MODADD").ok().as_deref() == Some("1")
+}
+
+fn kal_vent_halve_enabled() -> bool {
+    std::env::var("KAL_VENT_HALVE").ok().as_deref() == Some("1")
+}
+
+const ALT_SEED_COUNT: usize = 5;
+const ALT_SEED_COMMIT: usize = 24;
+const ALT_SEED_SHOTS: usize = 4096;
+const ALT_SEED_CLASSICAL_LIMIT: usize = 2;
+
+fn secp256k1_curve() -> WeierstrassEllipticCurve {
+    WeierstrassEllipticCurve {
+        modulus: U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F",
+            16,
+        )
+        .unwrap(),
+        a: U256::from(0),
+        b: U256::from(7),
+        gx: U256::from_str_radix(
+            "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798",
+            16,
+        )
+        .unwrap(),
+        gy: U256::from_str_radix(
+            "483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8",
+            16,
+        )
+        .unwrap(),
+        order: U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+            16,
+        )
+        .unwrap(),
     }
+}
 
-    let carries = b.alloc_qubits(n - 1);
-
-    // Forward MAJ sweep with carry ancillae.
-    // Step 0: MAJ(c_in, acc[0], a[0]) → carry into carries[0]
-    b.cx(a[0], acc[0]);
-    b.cx(a[0], c_in);
-    b.ccx(c_in, acc[0], carries[0]);
-    b.cx(carries[0], a[0]);
-    // Steps 1..n-2: MAJ(a[i-1], acc[i], a[i]) → carry into carries[i]
-    for i in 1..n - 1 {
-        b.cx(a[i], acc[i]);
-        b.cx(a[i], a[i - 1]);
-        b.ccx(a[i - 1], acc[i], carries[i]);
-        b.cx(carries[i], a[i]);
+fn alt_seed_xof(ops: &[Op], tag: u64) -> sha3::Shake256Reader {
+    let mut hasher = Shake256::default();
+    hasher.update(b"quantum_ecc-alt-seed-v1");
+    hasher.update(&tag.to_le_bytes());
+    hasher.update(&(ops.len() as u64).to_le_bytes());
+    for op in ops {
+        hasher.update(&[op.kind as u8]);
+        hasher.update(&op.q_control2.0.to_le_bytes());
+        hasher.update(&op.q_control1.0.to_le_bytes());
+        hasher.update(&op.q_target.0.to_le_bytes());
+        hasher.update(&op.c_target.0.to_le_bytes());
+        hasher.update(&op.c_condition.0.to_le_bytes());
+        hasher.update(&op.r_target.0.to_le_bytes());
     }
-
-    // Final sum bit (same as original cuccaro_add)
-    b.cx(a[n - 2], acc[n - 1]);
-    b.cx(a[n - 1], acc[n - 1]);
-
-    // Backward UMA sweep with measurement-based carry uncompute (0 Toffoli).
-    for i in (1..n - 1).rev() {
-        b.cx(carries[i], a[i]);
-        let m = b.alloc_bit();
-        b.hmr(carries[i], m);
-        b.cz_if(a[i - 1], acc[i], m);
-        b.cx(a[i], a[i - 1]);
-        b.cx(a[i - 1], acc[i]);
-    }
-    // Step 0 UMA:
-    b.cx(carries[0], a[0]);
-    let m0 = b.alloc_bit();
-    b.hmr(carries[0], m0);
-    b.cz_if(c_in, acc[0], m0);
-    b.cx(a[0], c_in);
-    b.cx(c_in, acc[0]);
-
-    b.free_vec(&carries);
+    hasher.finalize_xof()
 }
 
-/// In-place addition `acc += a mod 2^n` on quantum n-bit registers.
-/// * `c_in` is a fresh ancilla qubit at 0 on entry and returns to 0.
-/// * `a` unchanged; `acc` becomes (a + acc) mod 2^n.
-/// Pure mod-2^n: the high carry is discarded (no `z` ancilla). This is
-/// honestly reversible because the last MAJ/UMA pair cancel out the
-/// carry information on `a[n-1]`.
-fn cuccaro_add(b: &mut B, a: &[QubitId], acc: &[QubitId], c_in: QubitId) {
-    let n = a.len();
-    assert_eq!(n, acc.len());
-    if n == 0 { return; }
-    if n == 1 {
-        // acc[0] += a[0] + c_in  mod 2 ; c_in → 0
-        b.cx(c_in, acc[0]);
-        b.cx(a[0], acc[0]);
-        return;
-    }
-
-    // Forward MAJ sweep.
-    maj(b, c_in, acc[0], a[0]);
-    for i in 1..n - 1 {
-        maj(b, a[i - 1], acc[i], a[i]);
-    }
-
-    // Final sum bit: sum[n-1] = acc[n-1] XOR a[n-1] XOR carry_in_to_n-1,
-    // where carry_in_to_n-1 is in a[n-2] after the MAJ sweep.
-    b.cx(a[n - 2], acc[n - 1]);
-    b.cx(a[n - 1], acc[n - 1]);
-
-    // Reverse UMA sweep (skips the final MAJ since we didn't do it).
-    for i in (1..n - 1).rev() {
-        uma(b, a[i - 1], acc[i], a[i]);
-    }
-    uma(b, c_in, acc[0], a[0]);
-}
-
-/// Reverse of `cuccaro_add`: performs `acc -= a mod 2^n`.
-/// Implemented as the exact inverse gate sequence of `cuccaro_add`.
-fn cuccaro_sub(b: &mut B, a: &[QubitId], acc: &[QubitId], c_in: QubitId) {
-    let n = a.len();
-    assert_eq!(n, acc.len());
-    if n == 0 { return; }
-    if n == 1 {
-        // Inverse of (cx c_in acc; cx a acc) is the same two gates in reverse.
-        b.cx(a[0], acc[0]);
-        b.cx(c_in, acc[0]);
-        return;
-    }
-
-    // Inverse of `uma(c_in, acc[0], a[0])`, then the rest of UMA sweep
-    // in reverse order.
-    inv_uma(b, c_in, acc[0], a[0]);
-    for i in 1..n - 1 {
-        inv_uma(b, a[i - 1], acc[i], a[i]);
-    }
-
-    // Inverse of the final sum writes (both CX self-inverse; reverse order).
-    b.cx(a[n - 1], acc[n - 1]);
-    b.cx(a[n - 2], acc[n - 1]);
-
-    // Inverse of the forward MAJ sweep.
-    for i in (1..n - 1).rev() {
-        inv_maj(b, a[i - 1], acc[i], a[i]);
-    }
-    inv_maj(b, c_in, acc[0], a[0]);
-}
-
-fn inv_maj(b: &mut B, x: QubitId, y: QubitId, w: QubitId) {
-    // maj = CX(w,y); CX(w,x); CCX(x,y,w)
-    // inv = CCX(x,y,w); CX(w,x); CX(w,y)
-    b.ccx(x, y, w);
-    b.cx(w, x);
-    b.cx(w, y);
-}
-
-fn inv_uma(b: &mut B, x: QubitId, y: QubitId, w: QubitId) {
-    // uma = CCX(x,y,w); CX(w,x); CX(x,y)
-    // inv = CX(x,y); CX(w,x); CCX(x,y,w)
-    b.cx(x, y);
-    b.cx(w, x);
-    b.ccx(x, y, w);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Loading classical operands into a fresh qubit register
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// Cuccaro needs two qubit registers. To add a classical constant or a
-// classical bit register to a quantum register, we allocate a fresh
-// qubit register, load the classical value into it, run Cuccaro, then
-// unload. The load/unload is not counted against Toffolis.
-
-fn load_const(b: &mut B, n: usize, c: U256) -> Vec<QubitId> {
-    let qs = b.alloc_qubits(n);
-    for i in 0..n {
-        if bit(c, i) {
-            b.x(qs[i]);
-        }
-    }
-    qs
-}
-
-fn unload_const(b: &mut B, qs: &[QubitId], c: U256) {
-    for i in 0..qs.len() {
-        if bit(c, i) {
-            b.x(qs[i]);
-        }
-    }
-    b.free_vec(qs);
-}
-
-fn load_bits(b: &mut B, bits: &[BitId]) -> Vec<QubitId> {
-    let n = bits.len();
-    let qs = b.alloc_qubits(n);
-    for i in 0..n {
-        // qs[i] ← bits[i] via conditional X
-        b.x_if(qs[i], bits[i]);
-    }
-    qs
-}
-
-fn unload_bits(b: &mut B, qs: &[QubitId], bits: &[BitId]) {
-    for i in 0..qs.len() {
-        b.x_if(qs[i], bits[i]);
-    }
-    b.free_vec(qs);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Extended registers and modular reduction
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// All modular arithmetic operates on "extended" registers of width n+1
-// where bit n is an overflow/sign ancilla. The primitive quantum
-// registers handed to us (Px, Py) are exactly n=256 wide; the extension
-// bit is a transient ancilla allocated for the duration of a mod-op.
-
-/// Build an (n+1)-bit view by attaching a freshly-allocated 0 ancilla.
-fn ext_reg(b: &mut B, reg: &[QubitId]) -> (Vec<QubitId>, QubitId) {
-    let ovf = b.alloc_qubit();
-    let mut r = reg.to_vec();
-    r.push(ovf);
-    (r, ovf)
-}
-
-/// Release the overflow ancilla (which must be 0 on exit).
-fn unext_reg(b: &mut B, ovf: QubitId) {
-    b.free(ovf);
-}
-
-/// `acc := (acc + a) mod p`. Both `acc` and `a` are n-bit quantum registers
-/// with value in [0, p). Solinas reduction using c = 2^n - p: sum ∈ [0, 2p),
-/// then add c, branch on top bit to either clear it (reduction) or undo
-/// the add (no reduction). Saves one full (n+1)-wide Cuccaro compared to
-/// the sub-p/add-p/csub-p pattern.
-fn mod_add_qq(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
-    let n = acc.len();
-    assert_eq!(n, a.len());
-    debug_assert_eq!(n, 256);
-
-    let (acc_ext, acc_ovf) = ext_reg(b, acc);
-    let (a_ext, a_ovf) = ext_reg(b, a);
-
-    // Step 1: (n+1)-bit add. acc_ext ∈ [0, 2p).
-    add_nbit_qq(b, &a_ext, &acc_ext);
-
-    // Step 2: add c. If sum was >= p, the top bit of (sum + c) becomes 1.
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-    add_nbit_const(b, &acc_ext, c);
-
-    // Step 3: flag := acc_ovf (= top bit of sum + c).
-    let flag = b.alloc_qubit();
-    b.cx(acc_ovf, flag);
-
-    // Step 4: if flag=0 (no reduction needed), undo the add of c.
-    b.x(flag);
-    csub_nbit_const(b, &acc_ext, c, flag);
-    b.x(flag);
-
-    // Step 5: if flag=1, clear the top bit (drops 2^n → yields sum - p).
-    b.cx(flag, acc_ovf);
-
-    // Step 6: uncompute flag. Same identity as the old version:
-    //   flag == (acc_final < a_orig)
-    // because in the flag=1 case acc_final = acc_orig + a - p < a (since acc_orig < p),
-    // and in the flag=0 case acc_final = acc_orig + a ≥ a.
-    cmp_lt_into(b, &acc_ext[..n], &a_ext[..n], flag);
-    b.free(flag);
-
-    unext_reg(b, a_ovf);
-    unext_reg(b, acc_ovf);
-    let _ = (acc_ext, a_ext);
-}
-
-fn mod_sub_qq(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
-    // mod_add_qq is a bijection on (acc, a): (acc, a) ↦ (acc + a mod p, a).
-    // Its gate-level inverse therefore acts as (acc, a) ↦ (acc - a mod p, a),
-    // which is exactly what we want. emit_inverse replays the forward's gates
-    // reversed, skipping R markers — valid because mod_add_qq is clean
-    // (every ancilla is driven to |0⟩ before its R).
-    let a_copy: Vec<QubitId> = a.to_vec();
-    emit_inverse(b, move |b| mod_add_qq(b, acc, &a_copy, p));
-}
-
-/// Fast `acc := (acc - a) mod p`. Direct sub + conditional add-p + flag
-/// uncompute via neg+cmp_lt+neg. All ops use measurement-based Cuccaro.
-fn mod_sub_qq_fast(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
-    let n = acc.len();
-    assert_eq!(n, a.len());
-    debug_assert_eq!(n, 256);
-
-    let (acc_ext, acc_ovf) = ext_reg(b, acc);
-    let (a_ext, a_ovf) = ext_reg(b, a);
-
-    // Step 1: (n+1)-bit sub.
-    sub_nbit_qq_fast(b, &a_ext, &acc_ext);
-
-    // Step 2: flag = acc_ovf (=1 iff underflow, i.e. acc < a).
-    let flag = b.alloc_qubit();
-    b.cx(acc_ovf, flag);
-    // We only need the borrow as a separate flag; the low register is
-    // corrected modulo 2^n, so clear the extension bit immediately.
-    b.cx(flag, acc_ovf);
-
-    // Step 3: underflow correction. With p = 2^n - c, the wrapped 256-bit
-    // subtraction needs only a conditional subtract of c on the low register.
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-    csub_nbit_const_fast(b, &acc_ext[..n], c, flag);
-
-    // Step 4: uncompute flag. Identity: flag = NOT(acc_final < (p - a)).
-    // Negate a in place, compare, un-negate.
-    b.x(flag);
-    mod_neg_inplace_fast(b, &a_ext[..n], p);
-    cmp_lt_into_fast(b, &acc_ext[..n], &a_ext[..n], flag);
-    mod_neg_inplace_fast(b, &a_ext[..n], p);
-    b.free(flag);
-
-    unext_reg(b, a_ovf);
-    unext_reg(b, acc_ovf);
-    let _ = (acc_ext, a_ext);
-}
-
-/// Fast mod_neg using measurement-based Cuccaro for the addition.
-fn mod_neg_inplace_fast(b: &mut B, v: &[QubitId], p: U256) {
-    for &q in v { b.x(q); }
-    let n = v.len();
-    let ca = load_const(b, n, p.wrapping_add(U256::from(1)));
-    add_nbit_qq_fast(b, &ca, v);
-    unload_const(b, &ca, p.wrapping_add(U256::from(1)));
-}
-
-fn mod_add_qc(b: &mut B, acc: &[QubitId], c: U256, p: U256) {
-    // acc := (acc + c) mod p. c is a compile-time constant.
-    let n = acc.len();
-    let a = load_const(b, n, c);
-    mod_add_qq_fast(b, acc, &a, p);
-    unload_const(b, &a, c);
-}
-
-fn mod_sub_qc(b: &mut B, acc: &[QubitId], c: U256, p: U256) {
-    // acc := (acc - c) mod p = acc + (p - c) mod p.
-    let n = acc.len();
-    let c_neg = (p - (c % p)) % p;
-    let a = load_const(b, n, c_neg);
-    mod_add_qq_fast(b, acc, &a, p);
-    unload_const(b, &a, c_neg);
-}
-
-fn mod_add_qb(b: &mut B, acc: &[QubitId], bits: &[BitId], p: U256) {
-    // acc := (acc + bits) mod p. `bits` is a classical bit register.
-    let a = load_bits(b, bits);
-    mod_add_qq_fast(b, acc, &a, p);
-    unload_bits(b, &a, bits);
-}
-
-fn mod_add_double_qb(b: &mut B, acc: &[QubitId], bits: &[BitId], p: U256) {
-    // acc := acc + 2*bits mod p. Reuse a single loaded copy of the classical
-    // point and walk it through the cheap secp256k1 double/halve pair.
-    let a = load_bits(b, bits);
-    mod_double_inplace_fast(b, &a, p);
-    mod_add_qq_fast(b, acc, &a, p);
-    mod_halve_inplace_fast(b, &a, p);
-    unload_bits(b, &a, bits);
-}
-
-fn mod_sub_qb(b: &mut B, acc: &[QubitId], bits: &[BitId], p: U256) {
-    // acc -= bits mod p. Uses fast mod_sub_qq via neg+add+neg.
-    let a = load_bits(b, bits);
-    mod_sub_qq_fast(b, acc, &a, p);
-    unload_bits(b, &a, bits);
-}
-
-/// `v := (p - v) mod p`. Operates on an n-bit register in [0, p).
-///
-/// Implementation uses the reversible identity:
-///     p - v = NOT(v) + (p + 1)         (all arithmetic mod 2^n)
-/// which holds because NOT(v) = 2^n - 1 - v, so NOT(v) + p + 1 = 2^n + (p - v).
-///
-/// For v = 0 the result is p, not 0 (non-canonical but ≡ 0 mod p).
-/// EC preconditions (dx, dy nonzero) avoid this case in practice.
-fn mod_neg_inplace(b: &mut B, v: &[QubitId], p: U256) {
-    for &q in v {
-        b.x(q);
-    }
-    add_nbit_const(b, v, p.wrapping_add(U256::from(1)));
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Non-modular n-bit primitives
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Fast Cuccaro sub: `acc -= a mod 2^n` with measurement UMA (0 Toffoli
-/// for UMA sweep). Exact gate-level inverse of `cuccaro_add_fast`.
-fn cuccaro_sub_fast(b: &mut B, a: &[QubitId], acc: &[QubitId], c_in: QubitId) {
-    let n = a.len();
-    assert_eq!(n, acc.len());
-    if n == 0 { return; }
-    if n == 1 {
-        b.cx(a[0], acc[0]);
-        b.cx(c_in, acc[0]);
-        return;
-    }
-
-    let carries = b.alloc_qubits(n - 1);
-
-    // Forward inv_UMA sweep with carry ancillae (reversed UMA from cuccaro_sub).
-    // Step 0:
-    b.cx(c_in, acc[0]);
-    b.cx(a[0], c_in);
-    b.ccx(c_in, acc[0], carries[0]);
-    b.cx(carries[0], a[0]);
-    // Steps 1..n-2:
-    for i in 1..n - 1 {
-        b.cx(a[i - 1], acc[i]);
-        b.cx(a[i], a[i - 1]);
-        b.ccx(a[i - 1], acc[i], carries[i]);
-        b.cx(carries[i], a[i]);
-    }
-
-    // Final sum bit (reversed from cuccaro_add)
-    b.cx(a[n - 1], acc[n - 1]);
-    b.cx(a[n - 2], acc[n - 1]);
-
-    // Backward inv_MAJ sweep with measurement.
-    for i in (1..n - 1).rev() {
-        b.cx(carries[i], a[i]);
-        let m = b.alloc_bit();
-        b.hmr(carries[i], m);
-        b.cz_if(a[i - 1], acc[i], m);
-        b.cx(a[i], a[i - 1]);
-        b.cx(a[i], acc[i]);
-    }
-    b.cx(carries[0], a[0]);
-    let m0 = b.alloc_bit();
-    b.hmr(carries[0], m0);
-    b.cz_if(c_in, acc[0], m0);
-    b.cx(a[0], c_in);
-    b.cx(a[0], acc[0]);
-
-    b.free_vec(&carries);
-}
-
-/// Fast `acc += a mod 2^n` using measurement-based Cuccaro.
-fn add_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
-    assert_eq!(a.len(), acc.len());
-    let c_in = b.alloc_qubit();
-    cuccaro_add_fast(b, a, acc, c_in);
-    b.free(c_in);
-}
-
-/// Fast `acc -= a mod 2^n` using measurement-based Cuccaro.
-fn sub_nbit_qq_fast(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
-    assert_eq!(a.len(), acc.len());
-    let c_in = b.alloc_qubit();
-    cuccaro_sub_fast(b, a, acc, c_in);
-    b.free(c_in);
-}
-
-/// `acc += a mod 2^n`. Caller must pre-extend both slices if they want the
-/// top carry absorbed into the accumulator (i.e. pass n+1-bit slices with
-/// top bits 0 to get a full n+1-bit add). The carry-out beyond the slice
-/// is discarded via `R` on the `z` ancilla — safe when both inputs fit
-/// in n-1 bits (as in our mod-p layer where both < 2p < 2^{n+1}).
-fn add_nbit_qq(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
-    assert_eq!(a.len(), acc.len());
-    let c_in = b.alloc_qubit();
-    cuccaro_add(b, a, acc, c_in);
-    b.free(c_in);
-}
-
-fn sub_nbit_qq(b: &mut B, a: &[QubitId], acc: &[QubitId]) {
-    assert_eq!(a.len(), acc.len());
-    let c_in = b.alloc_qubit();
-    cuccaro_sub(b, a, acc, c_in);
-    b.free(c_in);
-}
-
-fn add_nbit_const(b: &mut B, acc: &[QubitId], c: U256) {
-    let n = acc.len();
-    let a = load_const(b, n, c);
-    add_nbit_qq(b, &a, acc);
-    unload_const(b, &a, c);
-}
-
-fn sub_nbit_const(b: &mut B, acc: &[QubitId], c: U256) {
-    let n = acc.len();
-    let a = load_const(b, n, c);
-    sub_nbit_qq(b, &a, acc);
-    unload_const(b, &a, c);
-}
-
-fn csub_nbit_const(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
-    // acc -= (ctrl ? c : 0). Mirror of cadd_nbit_const.
-    let n = acc.len();
-    let a = b.alloc_qubits(n);
-    for i in 0..n {
-        if bit(c, i) {
-            b.cx(ctrl, a[i]);
-        }
-    }
-    sub_nbit_qq(b, &a, acc);
-    for i in 0..n {
-        if bit(c, i) {
-            b.cx(ctrl, a[i]);
-        }
-    }
-    b.free_vec(&a);
-}
-
-fn cadd_nbit_const(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
-    // Conditional add of constant c, controlled by qubit ctrl.
-    // Trick: load c into a qubit register via CX-from-ctrl gates
-    // (so the loaded value is (ctrl ? c : 0)), then unconditional add,
-    // then unload.
-    let n = acc.len();
-    let a = b.alloc_qubits(n);
-    for i in 0..n {
-        if bit(c, i) {
-            b.cx(ctrl, a[i]);
-        }
-    }
-    add_nbit_qq(b, &a, acc);
-    for i in 0..n {
-        if bit(c, i) {
-            b.cx(ctrl, a[i]);
-        }
-    }
-    b.free_vec(&a);
-}
-
-fn csub_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
-    let n = acc.len();
-    let a = b.alloc_qubits(n);
-    for i in 0..n {
-        if bit(c, i) {
-            b.cx(ctrl, a[i]);
-        }
-    }
-    sub_nbit_qq_fast(b, &a, acc);
-    for i in 0..n {
-        if bit(c, i) {
-            b.cx(ctrl, a[i]);
-        }
-    }
-    b.free_vec(&a);
-}
-
-fn cadd_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256, ctrl: QubitId) {
-    let n = acc.len();
-    let a = b.alloc_qubits(n);
-    for i in 0..n {
-        if bit(c, i) {
-            b.cx(ctrl, a[i]);
-        }
-    }
-    add_nbit_qq_fast(b, &a, acc);
-    for i in 0..n {
-        if bit(c, i) {
-            b.cx(ctrl, a[i]);
-        }
-    }
-    b.free_vec(&a);
-}
-
-fn add_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256) {
-    let n = acc.len();
-    let a = load_const(b, n, c);
-    add_nbit_qq_fast(b, &a, acc);
-    unload_const(b, &a, c);
-}
-
-fn sub_nbit_const_fast(b: &mut B, acc: &[QubitId], c: U256) {
-    let n = acc.len();
-    let a = load_const(b, n, c);
-    sub_nbit_qq_fast(b, &a, acc);
-    unload_const(b, &a, c);
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Modular multiplication
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// Shift-and-add, MSB-to-LSB. `acc += x*y mod p`. Iteration:
-//
-//     for i from n-1 down to 0:
-//         acc := 2*acc mod p
-//         if y[i]:  acc := acc + x mod p
-//
-// For q*q mul, y[i] is a qubit; we implement the conditional add by
-// CCX-copying x (gated on y[i]) into a temporary, adding, and
-// uncopying. For q*b mul, y[i] is a classical bit and the copy is
-// done with CX_if gates.
-
-/// `v := 2*v mod p`. In-place via shift-left (swap cascade) + Solinas-style
-/// mod reduction. For secp256k1, p = 2^n - c with c = 2^32 + 977, so
-/// `T - p = T + c - 2^n`. The reduction becomes: add c, branch on the top
-/// bit of the (n+1)-wide shifted register — if set, clear it; else undo
-/// the add. Costs two full (n+1)-wide Cuccaro adds instead of three.
-fn mod_double_inplace(b: &mut B, v: &[QubitId], p: U256) {
-    let n = v.len();
-    let ovf = b.alloc_qubit();
-
-    // Shift left by 1 via swaps: introduces a 0 into v[0], pushes v[n-1] → ovf.
-    b.swap(v[n - 1], ovf);
-    for i in (0..n - 1).rev() {
-        b.swap(v[i], v[i + 1]);
-    }
-
-    let mut v_ext: Vec<QubitId> = v.to_vec();
-    v_ext.push(ovf);
-
-    // c = 2^n - p (= 2^32 + 977 for secp256k1). Assumes n == 256 so that
-    // 2^n wraps cleanly in U256::MAX + 1 arithmetic.
-    debug_assert_eq!(n, 256);
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-
-    // S := T + c. Fits in n+1 bits.
-    add_nbit_const(b, &v_ext, c);
-
-    // flag := (S >= 2^n) = S[n]. S[n]==1 iff we need the reduction.
-    let flag = b.alloc_qubit();
-    b.cx(ovf, flag);
-
-    // If flag=0, undo the add (we didn't need to reduce).
-    b.x(flag);
-    csub_nbit_const(b, &v_ext, c, flag);
-    b.x(flag);
-
-    // If flag=1, clear the top bit (drops the 2^n from S, giving T - p).
-    b.cx(flag, ovf);
-
-    // Uncompute flag via parity: flag == v[0] after the operation.
-    // Case flag=0: v = T = 2*v_orig (even) → v[0]=0.
-    // Case flag=1: v = T - p. T even, p odd → v is odd → v[0]=1.
-    b.cx(v[0], flag);
-    b.free(flag);
-    b.free(ovf);
-}
-
-/// Fast `v := 2*v mod p` using measurement-based Cuccaro.
-fn mod_double_inplace_fast(b: &mut B, v: &[QubitId], p: U256) {
-    let n = v.len();
-    let ovf = b.alloc_qubit();
-    b.swap(v[n - 1], ovf);
-    for i in (0..n - 1).rev() { b.swap(v[i], v[i + 1]); }
-    debug_assert_eq!(n, 256);
-    // For secp256k1, p = 2^n - c. After the shift, the old top bit is in
-    // `ovf` and the low register holds T mod 2^n for T = 2*v. If ovf=1 then
-    // T = 2^n + low and T mod p = low + c; otherwise T mod p = low.
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-    cadd_nbit_const_fast(b, v, c, ovf);
-    // Result parity equals the old top bit: even if ovf=0, odd if ovf=1.
-    b.cx(v[0], ovf);
-    b.free(ovf);
-}
-
-/// `v := 2*v` assuming v[n-1] = 0 (no wrap). Just a shift-left cascade.
-/// 0 Toffoli. Used in Kaliski STEP 7+8 for small iters where r[255]=0 guaranteed.
-fn mod_double_no_corr(b: &mut B, v: &[QubitId]) {
-    let n = v.len();
-    for i in (0..n - 1).rev() { b.swap(v[i], v[i + 1]); }
-}
-
-/// `v := v/2` assuming v[0] = 0 (v was even after corresponding no-corr double).
-/// Exact inverse of `mod_double_no_corr`. 0 Toffoli.
-fn mod_halve_no_corr(b: &mut B, v: &[QubitId]) {
-    let n = v.len();
-    for i in 0..n - 1 { b.swap(v[i], v[i + 1]); }
-}
-
-/// Shift v left by k bits mod p. Returns (spill, flag_inv, ovf) which MUST
-/// be passed to mod_shift_right_by_k for cleanup. Bennett-pattern: flags
-/// stay alive across the body so the inverse can cleanly cancel them.
-///
-/// k must be small enough that spill·c < p. For k≤22 with secp256k1 this holds.
-fn lowq_shift22() -> bool {
-    std::env::var("LOWQ_SHIFT22").is_ok()
-}
-
-fn mod_shift_left_by_k(b: &mut B, v: &[QubitId], p: U256, k: usize) -> (Vec<QubitId>, QubitId, QubitId) {
-    let n = v.len();
-    debug_assert_eq!(n, 256);
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-
-    let spill = b.alloc_qubits(k);
-    let ovf = b.alloc_qubit();
-    let flag_inv = b.alloc_qubit();
-
-    // Step 1: k rounds of shift-by-1, capturing top bits into spill.
-    for shift_i in 0..k {
-        b.swap(v[n-1], spill[k-1-shift_i]);
-        for i in (0..n-1).rev() { b.swap(v[i], v[i+1]); }
-    }
-
-    // Step 2: add spill · c to v_ext (using ovf as bit n).
-    // c = 2^32 + 977 = 2^32 + 2^10 - 2^6 + 2^4 + 2^0.
-    // Consolidate 4 bits (6,7,8,9) of 977 into 2^10 - 2^6: saves 2 Cuccaros per shift.
-    // Op list: ADD at 0, 4, 10, 32; SUB at 6. Total 5 ops instead of 7.
-    let mut v_ext = v.to_vec();
-    v_ext.push(ovf);
-    let cuccaro_op = |b: &mut B, pos: usize, is_sub: bool| {
-        let pad_width = n + 1 - pos;
-        let padded = b.alloc_qubits(pad_width);
-        for i in 0..k.min(pad_width) { b.cx(spill[i], padded[i]); }
-        let v_slice: Vec<QubitId> = v_ext[pos..n+1].to_vec();
-        let c_in = b.alloc_qubit();
-        if lowq_shift22() {
-            if is_sub {
-                cuccaro_sub(b, &padded, &v_slice, c_in);
-            } else {
-                cuccaro_add(b, &padded, &v_slice, c_in);
-            }
-        } else if is_sub {
-            // Fast cuccaro: saves ~n CCX per op. Peak during this op (~514
-            // transient) is still below the mod_add_qq_fast peak (517) inside
-            // the enclosing Solinas, so no global peak increase.
-            cuccaro_sub_fast(b, &padded, &v_slice, c_in);
-        } else {
-            cuccaro_add_fast(b, &padded, &v_slice, c_in);
-        }
-        b.free(c_in);
-        for i in 0..k.min(pad_width) { b.cx(spill[i], padded[i]); }
-        b.free_vec(&padded);
+fn run_alt_seed_checks(ops: &[Op]) {
+    let n_seeds = if std::env::var("ALT_SEED_COMMIT").is_ok() {
+        ALT_SEED_COMMIT
+    } else {
+        ALT_SEED_COUNT
     };
-    b.set_phase("shift22_cuccaro_op_0");
-    cuccaro_op(b, 0, false);
-    b.set_phase("shift22_cuccaro_op_4");
-    cuccaro_op(b, 4, false);
-    b.set_phase("shift22_cuccaro_op_6");
-    cuccaro_op(b, 6, true);
-    b.set_phase("shift22_cuccaro_op_10");
-    cuccaro_op(b, 10, false);
-    b.set_phase("shift22_cuccaro_op_32");
-    cuccaro_op(b, 32, false);
 
-    // Step 3: const add.
-    b.set_phase("shift22_step3");
-    if lowq_shift22() {
-        add_nbit_const(b, &v_ext, c);
-    } else {
-        add_nbit_const_fast(b, &v_ext, c);
+    let curve = secp256k1_curve();
+    let (total_qubits, num_bits, _num_regs, regs) = analyze_ops(ops.iter());
+    assert!(regs.len() == 4);
+    for (i, r) in regs.iter().enumerate() {
+        assert_eq!(r.len(), 256, "register {i} should be 256 wide");
     }
-    b.x(ovf);
-    b.cx(ovf, flag_inv); // flag_inv = NOT(top_bit_after_add) = (value < p)
-    b.x(ovf);
-
-    // Step 4: conditional const sub.
-    b.set_phase("shift22_step4");
-    if lowq_shift22() {
-        csub_nbit_const(b, &v_ext, c, flag_inv);
-    } else {
-        csub_nbit_const_fast(b, &v_ext, c, flag_inv);
+    for q in &regs[0] {
+        assert!(matches!(q, QubitOrBit::Qubit(_)));
     }
-    b.x(flag_inv);
-    b.cx(flag_inv, ovf);
-    b.x(flag_inv);
-
-    (spill, flag_inv, ovf)
-}
-
-/// Gate-level inverse of mod_shift_left_by_k.
-fn mod_shift_right_by_k(b: &mut B, v: &[QubitId], p: U256, k: usize, spill: Vec<QubitId>, flag_inv: QubitId, ovf: QubitId) {
-    let n = v.len();
-    debug_assert_eq!(n, 256);
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-
-    let mut v_ext = v.to_vec();
-    v_ext.push(ovf);
-
-    // Reverse step 4.
-    b.x(flag_inv);
-    b.cx(flag_inv, ovf);
-    b.x(flag_inv);
-    b.set_phase("rshift22_rev_step4");
-    if lowq_shift22() {
-        cadd_nbit_const(b, &v_ext, c, flag_inv);
-    } else {
-        cadd_nbit_const_fast(b, &v_ext, c, flag_inv);
+    for q in &regs[1] {
+        assert!(matches!(q, QubitOrBit::Qubit(_)));
+    }
+    for q in &regs[2] {
+        assert!(matches!(q, QubitOrBit::Bit(_)));
+    }
+    for q in &regs[3] {
+        assert!(matches!(q, QubitOrBit::Bit(_)));
     }
 
-    // Reverse step 3.
-    b.x(ovf);
-    b.cx(ovf, flag_inv);
-    b.x(ovf);
-    b.set_phase("rshift22_rev_step3");
-    if lowq_shift22() {
-        sub_nbit_const(b, &v_ext, c);
-    } else {
-        sub_nbit_const_fast(b, &v_ext, c);
-    }
-    b.free(flag_inv);
-    b.set_phase("rshift22_rev_step2");
+    eprintln!(
+        "=== alternate-seed diagnostic ({} seeds × {} shots, classical_limit={}, parallel) ===",
+        n_seeds, ALT_SEED_SHOTS, ALT_SEED_CLASSICAL_LIMIT,
+    );
 
-    // Reverse step 2: inverse of the consolidated op list (5 ops, in reverse order, flipped signs).
-    let cuccaro_op = |b: &mut B, pos: usize, is_sub: bool| {
-        let pad_width = n + 1 - pos;
-        let padded = b.alloc_qubits(pad_width);
-        for i in 0..k.min(pad_width) { b.cx(spill[i], padded[i]); }
-        let v_slice: Vec<QubitId> = v_ext[pos..n+1].to_vec();
-        let c_in = b.alloc_qubit();
-        if lowq_shift22() {
-            if is_sub {
-                cuccaro_sub(b, &padded, &v_slice, c_in);
-            } else {
-                cuccaro_add(b, &padded, &v_slice, c_in);
-            }
-        } else if is_sub {
-            cuccaro_sub_fast(b, &padded, &v_slice, c_in);
-        } else {
-            cuccaro_add_fast(b, &padded, &v_slice, c_in);
+    let results: Vec<(u64, usize, usize, usize)> = std::thread::scope(|scope| {
+        let curve = &curve;
+        let regs = &regs;
+        let mut handles = Vec::with_capacity(n_seeds);
+        for tag_idx in 0..n_seeds {
+            let tag = (tag_idx as u64) + 1;
+            let handle = scope.spawn(move || {
+                const BATCH: usize = 64;
+                let mut xof = alt_seed_xof(ops, tag);
+                let mut targets = Vec::with_capacity(ALT_SEED_SHOTS);
+                let mut offsets = Vec::with_capacity(ALT_SEED_SHOTS);
+                let mut expected = Vec::with_capacity(ALT_SEED_SHOTS);
+                while targets.len() < ALT_SEED_SHOTS {
+                    let mut rb = [[0u8; 32]; 2];
+                    xof.read(&mut rb[0]);
+                    xof.read(&mut rb[1]);
+                    let k1 = U256::from_le_bytes(rb[0]);
+                    let k2 = U256::from_le_bytes(rb[1]);
+                    let t = curve.mul(curve.gx, curve.gy, k1);
+                    let o = curve.mul(curve.gx, curve.gy, k2);
+                    if t.0 == o.0 {
+                        continue;
+                    }
+                    if t.0.is_zero() && t.1.is_zero() {
+                        continue;
+                    }
+                    if o.0.is_zero() && o.1.is_zero() {
+                        continue;
+                    }
+                    let e = curve.add(t.0, t.1, o.0, o.1);
+                    targets.push(t);
+                    offsets.push(o);
+                    expected.push(e);
+                }
+
+                let mut sim = Simulator::new(total_qubits as usize, num_bits as usize, &mut xof);
+                let mut classical_failures = 0usize;
+                let mut phase_garbage_batches = 0usize;
+                let mut ancilla_garbage_batches = 0usize;
+                let num_batches = (ALT_SEED_SHOTS + BATCH - 1) / BATCH;
+                for batch in 0..num_batches {
+                    let bs = BATCH.min(ALT_SEED_SHOTS - batch * BATCH);
+                    let cond_mask: u64 = if bs == 64 { u64::MAX } else { (1u64 << bs) - 1 };
+                    sim.clear_for_shot();
+                    for shot in 0..bs {
+                        let i = batch * BATCH + shot;
+                        sim.set_register(&regs[0], targets[i].0, shot);
+                        sim.set_register(&regs[1], targets[i].1, shot);
+                        sim.set_register(&regs[2], offsets[i].0, shot);
+                        sim.set_register(&regs[3], offsets[i].1, shot);
+                    }
+                    sim.apply_iter(ops.iter());
+                    for shot in 0..bs {
+                        let i = batch * BATCH + shot;
+                        let gx = sim.get_register(&regs[0], shot);
+                        let gy = sim.get_register(&regs[1], shot);
+                        if gx != expected[i].0 || gy != expected[i].1 {
+                            classical_failures += 1;
+                        }
+                    }
+                    let phase = sim.phase & cond_mask;
+                    if phase != 0 {
+                        phase_garbage_batches += 1;
+                    }
+                    for register in regs {
+                        for qb in register {
+                            if let QubitOrBit::Qubit(q) = *qb {
+                                *sim.qubit_mut(q) = 0;
+                            }
+                        }
+                    }
+                    let mut garbage = false;
+                    for q in 0..total_qubits {
+                        if (sim.qubit(QubitId(q)) & cond_mask) != 0 {
+                            garbage = true;
+                            break;
+                        }
+                    }
+                    if garbage {
+                        ancilla_garbage_batches += 1;
+                    }
+                }
+                (
+                    tag,
+                    classical_failures,
+                    phase_garbage_batches,
+                    ancilla_garbage_batches,
+                )
+            });
+            handles.push(handle);
         }
-        b.free(c_in);
-        for i in 0..k.min(pad_width) { b.cx(spill[i], padded[i]); }
-        b.free_vec(&padded);
-    };
-    // Reverse: undo ADD at 32, 10; undo SUB at 6; undo ADD at 4, 0.
-    cuccaro_op(b, 32, true);   // undo +spill·2^32
-    cuccaro_op(b, 10, true);   // undo +spill·2^10
-    cuccaro_op(b, 6, false);   // undo -spill·2^6
-    cuccaro_op(b, 4, true);    // undo +spill·2^4
-    cuccaro_op(b, 0, true);    // undo +spill·2^0
-
-    // Reverse step 1: reverse swap cascades.
-    for shift_i in (0..k).rev() {
-        for i in 0..n-1 { b.swap(v[i], v[i+1]); }
-        b.swap(v[n-1], spill[k-1-shift_i]);
-    }
-
-    b.free(ovf);
-    b.free_vec(&spill);
-}
-
-/// Fast `v := v/2 mod p`. Explicit reverse of `mod_double_inplace` with
-/// measurement-based Cuccaro (not emit_inverse).
-fn mod_halve_inplace_fast(b: &mut B, v: &[QubitId], p: U256) {
-    let n = v.len();
-    let ovf = b.alloc_qubit();
-    debug_assert_eq!(n, 256);
-    // If v is odd, then v = low + c for some even `low`; subtract c before
-    // shifting and reinsert the parity bit at the top. If v is even, this is
-    // just an ordinary right shift.
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-    b.cx(v[0], ovf);
-    csub_nbit_const_fast(b, v, c, ovf);
-    for i in 0..n - 1 { b.swap(v[i], v[i + 1]); }
-    b.swap(v[n - 1], ovf);
-    b.free(ovf);
-}
-
-/// `v := v/2 mod p`. Gate-inverse of `mod_double_inplace`.
-fn mod_halve_inplace(b: &mut B, v: &[QubitId], p: U256) {
-    let v_copy: Vec<QubitId> = v.to_vec();
-    emit_inverse(b, move |b| mod_double_inplace(b, &v_copy, p));
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Conditional modular add/sub helpers
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// Used by the multipliers. Each variant loads `(ctrl ? a : 0)` into a
-// fresh temporary via CCX or CX_if, runs the unconditional mod_add_qq /
-// mod_sub_qq, then unloads.
-
-/// Like `cmp_lt_into` but uses carry-ancilla + measurement-based uncompute
-/// for the inv_MAJ sweep. Saves n CCX. NOT emit_inverse-safe.
-fn cmp_lt_into_fast(b: &mut B, u: &[QubitId], v: &[QubitId], flag: QubitId) {
-    let n = u.len();
-    assert_eq!(n, v.len());
-    let c_in = b.alloc_qubit();
-    let carries = b.alloc_qubits(n);
-    for i in 0..n { b.x(u[i]); }
-
-    // Forward MAJ sweep with carry ancillae
-    b.cx(u[0], v[0]);
-    b.cx(u[0], c_in);
-    b.ccx(c_in, v[0], carries[0]);
-    b.cx(carries[0], u[0]);
-    for i in 1..n {
-        b.cx(u[i], v[i]);
-        b.cx(u[i], u[i - 1]);
-        b.ccx(u[i - 1], v[i], carries[i]);
-        b.cx(carries[i], u[i]);
-    }
-
-    b.cx(u[n - 1], flag);
-
-    // Backward inv_MAJ with measurement
-    for i in (1..n).rev() {
-        b.cx(carries[i], u[i]);
-        let m = b.alloc_bit();
-        b.hmr(carries[i], m);
-        b.cz_if(u[i - 1], v[i], m);
-        b.cx(u[i], u[i - 1]);
-        b.cx(u[i], v[i]);
-    }
-    b.cx(carries[0], u[0]);
-    let m0 = b.alloc_bit();
-    b.hmr(carries[0], m0);
-    b.cz_if(c_in, v[0], m0);
-    b.cx(u[0], c_in);
-    b.cx(u[0], v[0]);
-
-    for i in 0..n { b.x(u[i]); }
-    b.free_vec(&carries);
-    b.free(c_in);
-}
-
-/// Like `mod_add_qq` but uses `cmp_lt_into_fast` for the flag uncompute.
-/// NOT safe inside emit_inverse blocks.
-fn mod_add_qq_fast(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
-    let n = acc.len();
-    assert_eq!(n, a.len());
-    debug_assert_eq!(n, 256);
-
-    let (acc_ext, acc_ovf) = ext_reg(b, acc);
-    let (a_ext, a_ovf) = ext_reg(b, a);
-
-    // Use fast (measurement-based) Cuccaro everywhere.
-    add_nbit_qq_fast(b, &a_ext, &acc_ext);
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-    // add_nbit_const with fast Cuccaro
-    {
-        let n1 = acc_ext.len();
-        let ca = load_const(b, n1, c);
-        add_nbit_qq_fast(b, &ca, &acc_ext);
-        unload_const(b, &ca, c);
-    }
-    let flag = b.alloc_qubit();
-    b.cx(acc_ovf, flag);
-    b.x(flag);
-    // csub_nbit_const with fast Cuccaro
-    {
-        let n1 = acc_ext.len();
-        let ca = b.alloc_qubits(n1);
-        for i in 0..n1 { if bit(c, i) { b.cx(flag, ca[i]); } }
-        sub_nbit_qq_fast(b, &ca, &acc_ext);
-        for i in 0..n1 { if bit(c, i) { b.cx(flag, ca[i]); } }
-        b.free_vec(&ca);
-    }
-    b.x(flag);
-    b.cx(flag, acc_ovf);
-    cmp_lt_into_fast(b, &acc_ext[..n], &a_ext[..n], flag);
-    b.free(flag);
-
-    unext_reg(b, a_ovf);
-    unext_reg(b, acc_ovf);
-    let _ = (acc_ext, a_ext);
-}
-
-/// Specialization of mod_add_qq_fast when acc = 0 on entry. Replaces the
-/// initial Cuccaro add with CX-copy (0 CCX instead of n-1 CCX).
-/// Saves 255 CCX per call.
-fn mod_add_qq_fast_from_zero(b: &mut B, acc: &[QubitId], a: &[QubitId], p: U256) {
-    let n = acc.len();
-    assert_eq!(n, a.len());
-    debug_assert_eq!(n, 256);
-
-    let (acc_ext, acc_ovf) = ext_reg(b, acc);
-    let (a_ext, a_ovf) = ext_reg(b, a);
-
-    // acc is 0 on entry. CX-copy a into acc (0 CCX). Top bits both 0.
-    for i in 0..n { b.cx(a[i], acc[i]); }
-    // acc_ovf and a_ovf are both 0 (both freshly allocated as 0 by ext_reg).
-
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-    {
-        let n1 = acc_ext.len();
-        let ca = load_const(b, n1, c);
-        add_nbit_qq_fast(b, &ca, &acc_ext);
-        unload_const(b, &ca, c);
-    }
-    let flag = b.alloc_qubit();
-    b.cx(acc_ovf, flag);
-    b.x(flag);
-    {
-        let n1 = acc_ext.len();
-        let ca = b.alloc_qubits(n1);
-        for i in 0..n1 { if bit(c, i) { b.cx(flag, ca[i]); } }
-        sub_nbit_qq_fast(b, &ca, &acc_ext);
-        for i in 0..n1 { if bit(c, i) { b.cx(flag, ca[i]); } }
-        b.free_vec(&ca);
-    }
-    b.x(flag);
-    b.cx(flag, acc_ovf);
-    cmp_lt_into_fast(b, &acc_ext[..n], &a_ext[..n], flag);
-    b.free(flag);
-
-    unext_reg(b, a_ovf);
-    unext_reg(b, acc_ovf);
-    let _ = (acc_ext, a_ext);
-}
-
-/// Specialization of mod_mul_add_into_acc_schoolbook when acc = 0 on entry.
-/// Uses mod_add_qq_fast_from_zero for the first Solinas reduction step.
-/// Saves ~255 CCX per call.
-fn mod_mul_write_into_zero_acc_schoolbook(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-) {
-    let n = acc.len();
-    debug_assert_eq!(n, 256);
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-
-    let tmp_ext = b.alloc_qubits(2 * n);
-    schoolbook_mul_into_addsub(b, x, y, &tmp_ext);
-
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
-    // First add: acc is known to be 0, so use the fast-from-zero variant.
-    mod_add_qq_fast_from_zero(b, acc, &lo, p);
-    let _ = c;
-    // 977 = 2^10 - 2^6 + 2^4 + 2^0 consolidation. 5 ops instead of 7.
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..2 { mod_double_inplace_fast(b, &hi, p); }
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);
-    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);
-    b.set_phase("sol_halve_tail");
-    for _ in 0..10 {
-        mod_halve_inplace_fast(b, &hi, p);
-    }
-
-    b.set_phase("schoolbook_mul_inverse");
-    schoolbook_mul_into_addsub_inverse(b, x, y, &tmp_ext);
-    b.free_vec(&tmp_ext);
-}
-
-fn cmod_add_qq(b: &mut B, acc: &[QubitId], a: &[QubitId], ctrl: QubitId, p: U256) {
-    let n = acc.len();
-    let f = b.alloc_qubits(n);
-    for i in 0..n {
-        b.ccx(ctrl, a[i], f[i]);
-    }
-    mod_add_qq_fast(b, acc, &f, p);
-    // Gidney measurement-based AND uncomputation: f[i] = ctrl AND a[i],
-    // which is unchanged by mod_add_qq (Cuccaro restores the addend).
-    // HMR + classically-conditioned CZ costs 0 Toffoli vs 256 CCX.
-    for i in 0..n {
-        let m = b.alloc_bit();
-        b.hmr(f[i], m);
-        b.cz_if(ctrl, a[i], m);
-    }
-    b.free_vec(&f);
-}
-
-fn cmod_sub_qq(b: &mut B, acc: &[QubitId], a: &[QubitId], ctrl: QubitId, p: U256) {
-    let n = acc.len();
-    let f = b.alloc_qubits(n);
-    for i in 0..n {
-        b.ccx(ctrl, a[i], f[i]);
-    }
-    mod_sub_qq_fast(b, acc, &f, p);
-    for i in 0..n {
-        let m = b.alloc_bit();
-        b.hmr(f[i], m);
-        b.cz_if(ctrl, a[i], m);
-    }
-    b.free_vec(&f);
-}
-
-fn cmod_add_qq_bit(b: &mut B, acc: &[QubitId], a: &[QubitId], ctrl: BitId, p: U256) {
-    let n = acc.len();
-    let f = b.alloc_qubits(n);
-    for i in 0..n {
-        b.cx_if(a[i], f[i], ctrl);
-    }
-    mod_add_qq_fast(b, acc, &f, p);
-    for i in 0..n {
-        b.cx_if(a[i], f[i], ctrl);
-    }
-    b.free_vec(&f);
-}
-
-fn cmod_sub_qq_bit(b: &mut B, acc: &[QubitId], a: &[QubitId], ctrl: BitId, p: U256) {
-    let n = acc.len();
-    let f = b.alloc_qubits(n);
-    for i in 0..n {
-        b.cx_if(a[i], f[i], ctrl);
-    }
-    mod_sub_qq_fast(b, acc, &f, p);
-    for i in 0..n {
-        b.cx_if(a[i], f[i], ctrl);
-    }
-    b.free_vec(&f);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Montgomery multiplication with sparse REDC
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// mont_mul(a, b) = a * b * R^{-1} mod p where R = 2^256.
-//
-// REDC steps:
-//   1. t = a * b (2n-bit product)
-//   2. m = (t mod R) * c^{-1} mod R
-//   3. result = (t + m * p) / R
-//
-// For secp256k1:
-//   - p = 2^256 - c where c = 2^32 + 977
-//   - c^{-1} mod 2^32 = 0x9D84D9F1 (19 bits set)
-//   - m is computed from t_low using sparse multiplication (~600 CCX)
-//   - result = t_high + m (one n-bit addition)
-//
-// Savings: Solinas reduction ≈ 1800 CCX, Montgomery REDC ≈ 600 CCX
-// Per multiplication savings: ~1200 CCX
-//
-// Precomputed constant: c^{-1} with set bit positions
-const MONT_CINV_POS: [usize; 19] = [0, 4, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 21, 22, 24, 25, 26, 27, 28];
-
-/// Montgomery multiply using sparse REDC reduction.
-/// Computes: acc := (acc * x) * R^{-1} mod p
-fn mont_mul(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    _p: U256,
-) {
-    let n = acc.len();
-    debug_assert_eq!(n, 256);
-    let tmp = b.alloc_qubits(2 * n);
-
-    // Phase 1: raw product t = acc * x
-    schoolbook_mul_into_addsub(b, acc, x, &tmp);
-
-
-    // Phase 2: compute m = t_low * c^{-1} mod 2^32
-    // c^{-1} = 0x9D84D9F1, sparse with 19 set bits
-    let m = b.alloc_qubits(32);
-
-    // Copy t_low to m, then add shifted copies for each set bit
-    // This is the sparse multiplication: m = sum of (t_low << pos)
-    for i in 0..32 {
-        b.cx(tmp[i], m[i]);
-    }
-    // Add shifted copies for each set bit position
-    for pos in &MONT_CINV_POS[1..] {  // Skip 0, already copied
-        let shift = *pos;
-        for i in 0..(32 - shift) {
-            b.cx(tmp[i], m[i + shift]);
-        }
-    }
-
-    // Phase 3: result = t_high + m (the cheap reduction!)
-    for i in 0..n {
-        b.cx(tmp[n + i], acc[i]);
-    }
-    for i in 0..32 {
-        b.cx(m[i], acc[i]);
-    }
-
-    // Cleanup: uncompute in reverse order
-    for pos in MONT_CINV_POS[1..].iter().rev() {
-        let shift = *pos;
-        for i in (0..(32 - shift)).rev() {
-            b.cx(tmp[i], m[i + shift]);
-        }
-    }
-    for i in 0..32 {
-        b.cx(tmp[i], m[i]);
-    }
-    schoolbook_mul_into_addsub_inverse(b, acc, x, &tmp);
-    b.free_vec(&m);
-    b.free_vec(&tmp);
-}
-
-/// Montgomery square: acc := acc^2 * R^{-1} mod p
-fn mont_square(
-    b: &mut B,
-    acc: &[QubitId],
-    _p: U256,
-) {
-    let n = acc.len();
-    debug_assert_eq!(n, 256);
-    let tmp = b.alloc_qubits(2 * n);
-
-    // Phase 1: t = acc * acc (symmetric)
-    schoolbook_square_symmetric(b, acc, &tmp);
-
-    // Phase 2: m = t_low * c^{-1} mod 2^32
-    let m = b.alloc_qubits(32);
-    for i in 0..32 { b.cx(tmp[i], m[i]); }
-    for pos in &MONT_CINV_POS[1..] {
-        let shift = *pos;
-        for i in 0..(32 - shift) {
-            b.cx(tmp[i], m[i + shift]);
-        }
-    }
-
-    // Phase 3: result = t_high + m
-    for i in 0..n { b.cx(tmp[n + i], acc[i]); }
-    for i in 0..32 { b.cx(m[i], acc[i]); }
-
-    // Cleanup
-    for pos in MONT_CINV_POS[1..].iter().rev() {
-        let shift = *pos;
-        for i in (0..(32 - shift)).rev() {
-            b.cx(tmp[i], m[i + shift]);
-        }
-    }
-    for i in 0..32 { b.cx(tmp[i], m[i]); }
-    schoolbook_square_symmetric_inverse(b, acc, &tmp);
-    b.free_vec(&m);
-    b.free_vec(&tmp);
-}
-
-fn mod_mul_add_qq(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-) {
-    // acc += x * y mod p. Walk the multiplicand in place to avoid the
-    // doubled tmp register and its qubit cost. For squaring, snapshot the
-    // original control bits once before the in-place doubling walk.
-    let n = acc.len();
-    let is_squaring = x[0] == y[0];
-    if is_squaring {
-        let ctrl_copy = b.alloc_qubits(n);
-        for i in 0..n { b.cx(x[i], ctrl_copy[i]); }
-        for i in 0..n {
-            cmod_add_qq(b, acc, x, ctrl_copy[i], p);
-            if i < n - 1 { mod_double_inplace_fast(b, x, p); }
-        }
-        for _ in 0..(n - 1) { mod_halve_inplace_fast(b, x, p); }
-        for i in 0..n { b.cx(x[i], ctrl_copy[i]); }
-        b.free_vec(&ctrl_copy);
-    } else {
-        for i in 0..n {
-            cmod_add_qq(b, acc, x, y[i], p);
-            if i < n - 1 { mod_double_inplace_fast(b, x, p); }
-        }
-        for _ in 0..(n - 1) { mod_halve_inplace_fast(b, x, p); }
-    }
-}
-
-/// Horner-method multiplication: acc += x * y mod p.
-/// REQUIRES acc = 0 on entry. Doubles the accumulator (MSB-first),
-/// avoiding the tmp register and 255 halvings entirely.
-fn mod_mul_horner_add_qq(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-) {
-    let n = acc.len();
-    for i in (0..n).rev() {
-        if i < n - 1 { mod_double_inplace_fast(b, acc, p); }
-        cmod_add_qq(b, acc, x, y[i], p);
-    }
-}
-
-/// Exact inverse of `mod_mul_horner_add_qq` on the accumulator:
-/// if `acc` currently holds `x * y mod p`, this maps it back to 0 while
-/// leaving `x` and `y` unchanged.
-fn mod_mul_horner_unadd_qq(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-) {
-    let n = acc.len();
-    let is_squaring = x[0] == y[0];
-    if is_squaring {
-        for i in 0..n {
-            cmod_sub_qq(b, acc, x, y[i], p);
-            if i < n - 1 { mod_halve_inplace_fast(b, acc, p); }
-        }
-    } else {
-        mod_neg_inplace_fast(b, x, p);
-        for i in 0..n {
-            cmod_add_qq(b, acc, x, y[i], p);
-            if i < n - 1 { mod_halve_inplace_fast(b, acc, p); }
-        }
-        mod_neg_inplace_fast(b, x, p);
-    }
-}
-
-/// Horner-method multiplication: acc -= x * y mod p (= acc += (p-x)*y).
-/// REQUIRES acc = 0 on entry.
-fn mod_mul_horner_sub_qq(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-) {
-    let n = acc.len();
-    let is_squaring = x[0] == y[0];
-    // Negate x, then Horner-add. For squaring: x=y, negating x also
-    // negates y, giving (-x)*(-x)=x² (ADDITION, not subtraction).
-    // So squaring can't use 2-neg trick.
-    if is_squaring {
-        mod_neg_inplace_fast(b, x, p);
-        for i in (0..n).rev() {
-            if i < n - 1 { mod_double_inplace_fast(b, acc, p); }
-            cmod_add_qq(b, acc, x, y[i], p);
-        }
-        mod_neg_inplace_fast(b, x, p);
-    } else {
-        mod_neg_inplace_fast(b, x, p);
-        for i in (0..n).rev() {
-            if i < n - 1 { mod_double_inplace_fast(b, acc, p); }
-            cmod_add_qq(b, acc, x, y[i], p);
-        }
-        mod_neg_inplace_fast(b, x, p);
-    }
-}
-
-/// Schoolbook: tmp_ext (2n bits) += x * y. Generic for x == y (squaring) or
-fn schoolbook_mul_into(b: &mut B, x: &[QubitId], y: &[QubitId], tmp_ext: &[QubitId]) {
-    let n = x.len();
-    debug_assert_eq!(n, y.len());
-    debug_assert_eq!(tmp_ext.len(), 2 * n);
-    for i in 0..n {
-        let row = b.alloc_qubits(n);
-        for k in 0..n {
-            b.ccx(y[i], x[k], row[k]);
-        }
-        let pad = b.alloc_qubit();
-        let mut row_padded = row.clone();
-        row_padded.push(pad);
-        let slice: Vec<QubitId> = tmp_ext[i..i+n+1].to_vec();
-        let c_in = b.alloc_qubit();
-        cuccaro_add_fast(b, &row_padded, &slice, c_in);
-        b.free(c_in);
-        b.free(pad);
-        for k in 0..n {
-            let m = b.alloc_bit();
-            b.hmr(row[k], m);
-            b.cz_if(y[i], x[k], m);
-        }
-        b.free_vec(&row);
-    }
-}
-
-fn schoolbook_mul_into_inverse(b: &mut B, x: &[QubitId], y: &[QubitId], tmp_ext: &[QubitId]) {
-    let n = x.len();
-    for i in (0..n).rev() {
-        let row = b.alloc_qubits(n);
-        for k in 0..n {
-            b.ccx(y[i], x[k], row[k]);
-        }
-        let pad = b.alloc_qubit();
-        let mut row_padded = row.clone();
-        row_padded.push(pad);
-        let slice: Vec<QubitId> = tmp_ext[i..i+n+1].to_vec();
-        let c_in = b.alloc_qubit();
-        cuccaro_sub_fast(b, &row_padded, &slice, c_in);
-        b.free(c_in);
-        b.free(pad);
-        for k in 0..n {
-            let m = b.alloc_bit();
-            b.hmr(row[k], m);
-            b.cz_if(y[i], x[k], m);
-        }
-        b.free_vec(&row);
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────────────
-// Litinski add-subtract (arXiv:2410.00899) primitives
-// ─────────────────────────────────────────────────────────────────────────────────────
-
-/// Controlled add-subtract on (n+1)-bit `acc` with n-bit `x` (padded with 0 at top).
-///   ctrl=1 : acc += x  (mod 2^(n+1))
-///   ctrl=0 : acc -= x  (mod 2^(n+1))
-/// Implementation: conditionally two's-complement (~x + 1) via flip-x plus c_in,
-/// then run a single unconditional Gidney/Cuccaro add. Cost = n-1 Toffoli (same as
-/// uncontrolled (n+1)-bit add without carry-out).
-fn controlled_add_subtract_fast(b: &mut B, x: &[QubitId], acc: &[QubitId], ctrl: QubitId) {
-    let n = x.len();
-    debug_assert_eq!(acc.len(), n + 1);
-
-    // x_ext: n+1 bits with top pad bit = 0. Only the low n bits of x_ext are flipped
-    // when ctrl=0 (two's-complement subtract via ~a + 1). The pad bit stays 0.
-    let pad = b.alloc_qubit();
-    let mut x_ext = x.to_vec();
-    x_ext.push(pad);
-
-    let c_in = b.alloc_qubit();
-
-    // If ctrl=0, we want x_ext[0..n] = ~x and c_in = 1. Encode via x(ctrl) + cx.
-    b.x(ctrl);
-    for i in 0..n { b.cx(ctrl, x_ext[i]); }
-    b.cx(ctrl, c_in);
-
-    cuccaro_add_fast(b, &x_ext, acc, c_in);
-
-    b.cx(ctrl, c_in);
-    for i in 0..n { b.cx(ctrl, x_ext[i]); }
-    b.x(ctrl);
-
-    b.free(c_in);
-    b.free(pad);
-}
-
-/// Inverse of controlled_add_subtract_fast: swap add↔sub.
-///   ctrl=1 : acc -= x
-///   ctrl=0 : acc += x
-fn controlled_add_subtract_fast_inverse(b: &mut B, x: &[QubitId], acc: &[QubitId], ctrl: QubitId) {
-    let n = x.len();
-    debug_assert_eq!(acc.len(), n + 1);
-
-    let pad = b.alloc_qubit();
-    let mut x_ext = x.to_vec();
-    x_ext.push(pad);
-
-    let c_in = b.alloc_qubit();
-
-    b.x(ctrl);
-    for i in 0..n { b.cx(ctrl, x_ext[i]); }
-    b.cx(ctrl, c_in);
-
-    cuccaro_sub_fast(b, &x_ext, acc, c_in);
-
-    b.cx(ctrl, c_in);
-    for i in 0..n { b.cx(ctrl, x_ext[i]); }
-    b.x(ctrl);
-
-    b.free(c_in);
-    b.free(pad);
-}
-
-/// Litinski 2024 add-subtract schoolbook: tmp_ext += x * y.
-///
-/// Precondition: tmp_ext has 2n bits and holds value A_in.
-/// Postcondition: tmp_ext holds A_in + x*y (mod 2^{2n}).
-fn schoolbook_mul_into_addsub(b: &mut B, x: &[QubitId], y: &[QubitId], tmp_ext: &[QubitId]) {
-    let n = x.len();
-    debug_assert_eq!(y.len(), n);
-    debug_assert_eq!(tmp_ext.len(), 2 * n);
-
-    // wide = [low, tmp_ext[0], ..., tmp_ext[2n-1]]  =  2n+1 bits.
-    // This treats the (2n+1)-bit number `wide` as Litinski's accumulator.
-    // After all ops, wide = 2*A_in_shifted + 2*x*y  (i.e. 2*(A_in + xy)).
-    // `/2 relabel` reads out xy at wide[1..2n+1] = tmp_ext.
-    //
-    // To add A_in into the 2*(A_in + xy) result correctly, we need to bring A_in
-    // in as `2*A_in` in wide. That is done pre-loop: swap tmp_ext values up one bit.
-    // But Litinski's derivation assumes A_in = 0. To support non-zero A_in we'd
-    // need to double tmp_ext at the start and halve at the end.
-    //
-    // Fortunately ALL call sites pass tmp_ext starting at 0 (fresh alloc), so we
-    // can just assume A_in = 0.
-    let low = b.alloc_qubit();
-    let mut wide: Vec<QubitId> = Vec::with_capacity(2 * n + 1);
-    wide.push(low);
-    wide.extend_from_slice(tmp_ext);
-
-    // n controlled add-subtracts (Litinski Fig 2b).
-    for k in 0..n {
-        let slice: Vec<QubitId> = wide[k..k + n + 1].to_vec();
-        controlled_add_subtract_fast(b, x, &slice, y[k]);
-    }
-
-    // Corrections:
-    //   Using y as ctrl and x as operand, the intermediate value is:
-    //     2xy + 2^{2n} - 2^n (x+y+1) + x
-    //   Target: 2xy. So apply +2^n(y+1) + 2^n*x - 2^{2n} - x.
-
-    // +2^n * (y + 1): (n+1)-bit add of y_ext (top=0) into wide[n..2n+1] with c_in=1.
-    {
-        let pad = b.alloc_qubit();
-        let mut y_ext = y.to_vec();
-        y_ext.push(pad);
-        let slice: Vec<QubitId> = wide[n..2 * n + 1].to_vec();
-        let c_in = b.alloc_qubit();
-        b.x(c_in);
-        cuccaro_add_fast(b, &y_ext, &slice, c_in);
-        b.x(c_in);
-        b.free(c_in);
-        b.free(pad);
-    }
-
-    // -2^{2n}: toggle wide[2n].
-    b.x(wide[2 * n]);
-
-    // -x as full (2n+1)-bit sub. Use in-place cuccaro_sub (no carry ancillae) to
-    // keep peak qubits low during this otherwise-expensive full-width correction.
-    // Costs n-1 extra Toffoli vs cuccaro_sub_fast but saves 2n peak qubits.
-    {
-        let mut x_ext: Vec<QubitId> = x.to_vec();
-        while x_ext.len() < 2 * n + 1 {
-            x_ext.push(b.alloc_qubit());
-        }
-        let c_in = b.alloc_qubit();
-        cuccaro_sub(b, &x_ext, &wide, c_in);
-        b.free(c_in);
-        for _ in n..2 * n + 1 {
-            let q = x_ext.pop().unwrap();
-            b.free(q);
-        }
-    }
-
-    // +2^n * x: (n+1)-bit add of x_ext into wide[n..2n+1].
-    {
-        let pad = b.alloc_qubit();
-        let mut x_ext = x.to_vec();
-        x_ext.push(pad);
-        let slice: Vec<QubitId> = wide[n..2 * n + 1].to_vec();
-        let c_in = b.alloc_qubit();
-        cuccaro_add_fast(b, &x_ext, &slice, c_in);
-        b.free(c_in);
-        b.free(pad);
-    }
-
-    // wide = 2xy. /2 relabel: xy is at wide[1..2n+1] = tmp_ext. wide[0]=low should be 0.
-    b.free(low);
-}
-
-/// Exact gate-level inverse of `schoolbook_mul_into_addsub`.
-fn schoolbook_mul_into_addsub_inverse(b: &mut B, x: &[QubitId], y: &[QubitId], tmp_ext: &[QubitId]) {
-    let n = x.len();
-    debug_assert_eq!(y.len(), n);
-    debug_assert_eq!(tmp_ext.len(), 2 * n);
-
-    let low = b.alloc_qubit();
-    let mut wide: Vec<QubitId> = Vec::with_capacity(2 * n + 1);
-    wide.push(low);
-    wide.extend_from_slice(tmp_ext);
-
-    // Reverse correction 4: sub x at bit n.
-    {
-        let pad = b.alloc_qubit();
-        let mut x_ext = x.to_vec();
-        x_ext.push(pad);
-        let slice: Vec<QubitId> = wide[n..2 * n + 1].to_vec();
-        let c_in = b.alloc_qubit();
-        cuccaro_sub_fast(b, &x_ext, &slice, c_in);
-        b.free(c_in);
-        b.free(pad);
-    }
-    // Reverse correction 3 (sub x full-width): add x back with borrow propagation.
-    // Use in-place cuccaro_add (no carries) to keep peak low, matching forward.
-    {
-        let mut x_ext: Vec<QubitId> = x.to_vec();
-        while x_ext.len() < 2 * n + 1 {
-            x_ext.push(b.alloc_qubit());
-        }
-        let c_in = b.alloc_qubit();
-        cuccaro_add(b, &x_ext, &wide, c_in);
-        b.free(c_in);
-        for _ in n..2 * n + 1 {
-            let q = x_ext.pop().unwrap();
-            b.free(q);
-        }
-    }
-    // Reverse correction 2: toggle wide[2n].
-    b.x(wide[2 * n]);
-    // Reverse correction 1: sub (y+1) at bit n.
-    {
-        let pad = b.alloc_qubit();
-        let mut y_ext = y.to_vec();
-        y_ext.push(pad);
-        let slice: Vec<QubitId> = wide[n..2 * n + 1].to_vec();
-        let c_in = b.alloc_qubit();
-        b.x(c_in);
-        cuccaro_sub_fast(b, &y_ext, &slice, c_in);
-        b.x(c_in);
-        b.free(c_in);
-        b.free(pad);
-    }
-    // Reverse n add-subtract rows.
-    for k in (0..n).rev() {
-        let slice: Vec<QubitId> = wide[k..k + n + 1].to_vec();
-        controlled_add_subtract_fast_inverse(b, x, &slice, y[k]);
-    }
-
-    b.free(low);
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  1-level Karatsuba multiplication
-// ═══════════════════════════════════════════════════════════════════════════
-
-fn karatsuba_half_sum_compute(b: &mut B, lo: &[QubitId], hi: &[QubitId], acc: &[QubitId]) {
-    let h = lo.len();
-    debug_assert_eq!(h, hi.len());
-    debug_assert_eq!(acc.len(), h + 1);
-    for i in 0..h { b.cx(lo[i], acc[i]); }
-    let hi_pad = b.alloc_qubit();
-    let mut hi_ext = hi.to_vec();
-    hi_ext.push(hi_pad);
-    add_nbit_qq_fast(b, &hi_ext, acc);
-    b.free(hi_pad);
-}
-
-fn karatsuba_half_sum_uncompute(b: &mut B, lo: &[QubitId], hi: &[QubitId], acc: &[QubitId]) {
-    let h = lo.len();
-    let hi_pad = b.alloc_qubit();
-    let mut hi_ext = hi.to_vec();
-    hi_ext.push(hi_pad);
-    sub_nbit_qq_fast(b, &hi_ext, acc);
-    b.free(hi_pad);
-    for i in 0..h { b.cx(lo[i], acc[i]); }
-}
-
-fn karatsuba_forward(
-    b: &mut B,
-    x: &[QubitId],
-    y: &[QubitId],
-    tmp_ext: &[QubitId],
-    z1_reg: &[QubitId],
-) {
-    let n = x.len();
-    let h = n / 2;
-    let x_lo: Vec<QubitId> = x[0..h].to_vec();
-    let x_hi: Vec<QubitId> = x[h..n].to_vec();
-    let y_lo: Vec<QubitId> = y[0..h].to_vec();
-    let y_hi: Vec<QubitId> = y[h..n].to_vec();
-
-    {
-        let slice: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
-        schoolbook_mul_into_addsub(b, &x_lo, &y_lo, &slice);
-    }
-    {
-        let slice: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
-        schoolbook_mul_into_addsub(b, &x_hi, &y_hi, &slice);
-    }
-
-    let x_sum = b.alloc_qubits(h + 1);
-    let y_sum = b.alloc_qubits(h + 1);
-    karatsuba_half_sum_compute(b, &x_lo, &x_hi, &x_sum);
-    karatsuba_half_sum_compute(b, &y_lo, &y_hi, &y_sum);
-    // z1_reg width = 2*(h+1). Use addsub variant on (h+1)-sized inputs.
-    schoolbook_mul_into_addsub(b, &x_sum, &y_sum, z1_reg);
-    karatsuba_half_sum_uncompute(b, &y_lo, &y_hi, &y_sum);
-    karatsuba_half_sum_uncompute(b, &x_lo, &x_hi, &x_sum);
-    b.free_vec(&y_sum);
-    b.free_vec(&x_sum);
-
-    {
-        let pad = b.alloc_qubits(2);
-        let mut z0_ext: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
-        z0_ext.extend_from_slice(&pad);
-        sub_nbit_qq_fast(b, &z0_ext, z1_reg);
-        b.free_vec(&pad);
-    }
-    {
-        let pad = b.alloc_qubits(2);
-        let mut z2_ext: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
-        z2_ext.extend_from_slice(&pad);
-        sub_nbit_qq_fast(b, &z2_ext, z1_reg);
-        b.free_vec(&pad);
-    }
-    {
-        let pad = b.alloc_qubits(3 * h - 2 * (h + 1));
-        let mut z1_ext: Vec<QubitId> = z1_reg.to_vec();
-        z1_ext.extend_from_slice(&pad);
-        let acc_slice: Vec<QubitId> = tmp_ext[h..4*h].to_vec();
-        b.set_phase("kara_z1_add");
-        add_nbit_qq_fast(b, &z1_ext, &acc_slice);
-        b.free_vec(&pad);
-    }
-}
-
-fn karatsuba_inverse(
-    b: &mut B,
-    x: &[QubitId],
-    y: &[QubitId],
-    tmp_ext: &[QubitId],
-    z1_reg: &[QubitId],
-) {
-    let n = x.len();
-    let h = n / 2;
-    let x_lo: Vec<QubitId> = x[0..h].to_vec();
-    let x_hi: Vec<QubitId> = x[h..n].to_vec();
-    let y_lo: Vec<QubitId> = y[0..h].to_vec();
-    let y_hi: Vec<QubitId> = y[h..n].to_vec();
-
-    {
-        let pad = b.alloc_qubits(3 * h - 2 * (h + 1));
-        let mut z1_ext: Vec<QubitId> = z1_reg.to_vec();
-        z1_ext.extend_from_slice(&pad);
-        let acc_slice: Vec<QubitId> = tmp_ext[h..4*h].to_vec();
-        sub_nbit_qq_fast(b, &z1_ext, &acc_slice);
-        b.free_vec(&pad);
-    }
-    {
-        let pad = b.alloc_qubits(2);
-        let mut z2_ext: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
-        z2_ext.extend_from_slice(&pad);
-        add_nbit_qq_fast(b, &z2_ext, z1_reg);
-        b.free_vec(&pad);
-    }
-    {
-        let pad = b.alloc_qubits(2);
-        let mut z0_ext: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
-        z0_ext.extend_from_slice(&pad);
-        add_nbit_qq_fast(b, &z0_ext, z1_reg);
-        b.free_vec(&pad);
-    }
-
-    let x_sum = b.alloc_qubits(h + 1);
-    let y_sum = b.alloc_qubits(h + 1);
-    karatsuba_half_sum_compute(b, &x_lo, &x_hi, &x_sum);
-    karatsuba_half_sum_compute(b, &y_lo, &y_hi, &y_sum);
-    schoolbook_mul_into_addsub_inverse(b, &x_sum, &y_sum, z1_reg);
-    karatsuba_half_sum_uncompute(b, &y_lo, &y_hi, &y_sum);
-    karatsuba_half_sum_uncompute(b, &x_lo, &x_hi, &x_sum);
-    b.free_vec(&y_sum);
-    b.free_vec(&x_sum);
-
-    {
-        let slice: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
-        schoolbook_mul_into_addsub_inverse(b, &x_hi, &y_hi, &slice);
-    }
-    {
-        let slice: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
-        schoolbook_mul_into_addsub_inverse(b, &x_lo, &y_lo, &slice);
-    }
-}
-
-fn mod_mul_add_into_acc_karatsuba_with_tmp_ext(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-    tmp_ext: &[QubitId],
-) {
-    let n = acc.len();
-    debug_assert_eq!(n, 256);
-    debug_assert_eq!(tmp_ext.len(), 2 * n);
-    let h = n / 2;
-    let z1_reg = b.alloc_qubits(2 * (h + 1));
-    karatsuba_forward(b, x, y, tmp_ext, &z1_reg);
-
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
-    mod_add_qq_fast(b, acc, &lo, p);
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..2 { mod_double_inplace_fast(b, &hi, p); }
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);
-    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);
-    for _ in 0..10 { mod_halve_inplace_fast(b, &hi, p); }
-
-    karatsuba_inverse(b, x, y, tmp_ext, &z1_reg);
-    b.free_vec(&z1_reg);
-}
-
-fn mod_mul_add_into_acc_karatsuba(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-) {
-    let tmp_ext = b.alloc_qubits(2 * acc.len());
-    mod_mul_add_into_acc_karatsuba_with_tmp_ext(b, acc, x, y, p, &tmp_ext);
-    b.free_vec(&tmp_ext);
-}
-
-fn mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-    tmp_ext: &[QubitId],
-) {
-    let n = acc.len();
-    debug_assert_eq!(n, 256);
-    debug_assert_eq!(tmp_ext.len(), 2 * n);
-    let h = n / 2;
-    let z1_reg = b.alloc_qubits(2 * (h + 1));
-    b.set_phase("kara_fwd");
-    karatsuba_forward(b, x, y, tmp_ext, &z1_reg);
-    b.set_phase("kara_solinas");
-
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
-    b.set_phase("sol_addlo");
-    mod_add_qq_fast_from_zero(b, acc, &lo, p);
-    b.set_phase("sol_add0");
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    b.set_phase("sol_add4");
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..2 { mod_double_inplace_fast(b, &hi, p); }
-    b.set_phase("sol_sub6");
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    b.set_phase("sol_add10");
-    mod_add_qq_fast(b, acc, &hi, p);
-    b.set_phase("kara_solinas_shift22L");
-    b.set_phase("kara_solinas_post32_add");
-    // The generated walk retains non-fast mod_add at this peak-sensitive site,
-    // saving its 256 carry qubits at the expense of about n Toffolis.
-    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);
-    b.set_phase("kara_solinas_shift22R");
-    b.set_phase("kara_solinas_post_halve");
-    for _ in 0..10 { mod_halve_inplace_fast(b, &hi, p); }
-
-    b.set_phase("kara_inv");
-    karatsuba_inverse(b, x, y, tmp_ext, &z1_reg);
-    b.free_vec(&z1_reg);
-}
-
-fn mod_mul_write_into_zero_acc_karatsuba(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-) {
-    let tmp_ext = b.alloc_qubits(2 * acc.len());
-    mod_mul_write_into_zero_acc_karatsuba_with_tmp_ext(b, acc, x, y, p, &tmp_ext);
-    b.free_vec(&tmp_ext);
-}
-
-// ─── 2-level Karatsuba variants (recursive on inner half-mults) ───
-// Costs 2 extra z1_inner registers of ~2*(n/4+1) qubits each (~260 total for n=256).
-// Higher peak qubits; use only at low-peak mul sites.
-
-fn karatsuba_forward_2level(
-    b: &mut B,
-    x: &[QubitId],
-    y: &[QubitId],
-    tmp_ext: &[QubitId],
-    z1_reg: &[QubitId],
-    z1_inner_a: &[QubitId],
-    z1_inner_b: &[QubitId],
-) {
-    let n = x.len();
-    let h = n / 2;
-    let x_lo: Vec<QubitId> = x[0..h].to_vec();
-    let x_hi: Vec<QubitId> = x[h..n].to_vec();
-    let y_lo: Vec<QubitId> = y[0..h].to_vec();
-    let y_hi: Vec<QubitId> = y[h..n].to_vec();
-
-    {
-        let slice: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
-        karatsuba_forward(b, &x_lo, &y_lo, &slice, z1_inner_a);
-    }
-    {
-        let slice: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
-        karatsuba_forward(b, &x_hi, &y_hi, &slice, z1_inner_b);
-    }
-
-    let x_sum = b.alloc_qubits(h + 1);
-    let y_sum = b.alloc_qubits(h + 1);
-    karatsuba_half_sum_compute(b, &x_lo, &x_hi, &x_sum);
-    karatsuba_half_sum_compute(b, &y_lo, &y_hi, &y_sum);
-    schoolbook_mul_into_addsub(b, &x_sum, &y_sum, z1_reg);
-    karatsuba_half_sum_uncompute(b, &y_lo, &y_hi, &y_sum);
-    karatsuba_half_sum_uncompute(b, &x_lo, &x_hi, &x_sum);
-    b.free_vec(&y_sum);
-    b.free_vec(&x_sum);
-
-    {
-        let pad = b.alloc_qubits(2);
-        let mut z0_ext: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
-        z0_ext.extend_from_slice(&pad);
-        sub_nbit_qq_fast(b, &z0_ext, z1_reg);
-        b.free_vec(&pad);
-    }
-    {
-        let pad = b.alloc_qubits(2);
-        let mut z2_ext: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
-        z2_ext.extend_from_slice(&pad);
-        sub_nbit_qq_fast(b, &z2_ext, z1_reg);
-        b.free_vec(&pad);
-    }
-    {
-        let pad = b.alloc_qubits(3 * h - 2 * (h + 1));
-        let mut z1_ext: Vec<QubitId> = z1_reg.to_vec();
-        z1_ext.extend_from_slice(&pad);
-        let acc_slice: Vec<QubitId> = tmp_ext[h..4*h].to_vec();
-        add_nbit_qq_fast(b, &z1_ext, &acc_slice);
-        b.free_vec(&pad);
-    }
-}
-
-fn karatsuba_inverse_2level(
-    b: &mut B,
-    x: &[QubitId],
-    y: &[QubitId],
-    tmp_ext: &[QubitId],
-    z1_reg: &[QubitId],
-    z1_inner_a: &[QubitId],
-    z1_inner_b: &[QubitId],
-) {
-    let n = x.len();
-    let h = n / 2;
-    let x_lo: Vec<QubitId> = x[0..h].to_vec();
-    let x_hi: Vec<QubitId> = x[h..n].to_vec();
-    let y_lo: Vec<QubitId> = y[0..h].to_vec();
-    let y_hi: Vec<QubitId> = y[h..n].to_vec();
-
-    {
-        let pad = b.alloc_qubits(3 * h - 2 * (h + 1));
-        let mut z1_ext: Vec<QubitId> = z1_reg.to_vec();
-        z1_ext.extend_from_slice(&pad);
-        let acc_slice: Vec<QubitId> = tmp_ext[h..4*h].to_vec();
-        sub_nbit_qq_fast(b, &z1_ext, &acc_slice);
-        b.free_vec(&pad);
-    }
-    {
-        let pad = b.alloc_qubits(2);
-        let mut z2_ext: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
-        z2_ext.extend_from_slice(&pad);
-        add_nbit_qq_fast(b, &z2_ext, z1_reg);
-        b.free_vec(&pad);
-    }
-    {
-        let pad = b.alloc_qubits(2);
-        let mut z0_ext: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
-        z0_ext.extend_from_slice(&pad);
-        add_nbit_qq_fast(b, &z0_ext, z1_reg);
-        b.free_vec(&pad);
-    }
-
-    let x_sum = b.alloc_qubits(h + 1);
-    let y_sum = b.alloc_qubits(h + 1);
-    karatsuba_half_sum_compute(b, &x_lo, &x_hi, &x_sum);
-    karatsuba_half_sum_compute(b, &y_lo, &y_hi, &y_sum);
-    schoolbook_mul_into_addsub_inverse(b, &x_sum, &y_sum, z1_reg);
-    karatsuba_half_sum_uncompute(b, &y_lo, &y_hi, &y_sum);
-    karatsuba_half_sum_uncompute(b, &x_lo, &x_hi, &x_sum);
-    b.free_vec(&y_sum);
-    b.free_vec(&x_sum);
-
-    {
-        let slice: Vec<QubitId> = tmp_ext[2*h..4*h].to_vec();
-        karatsuba_inverse(b, &x_hi, &y_hi, &slice, z1_inner_b);
-    }
-    {
-        let slice: Vec<QubitId> = tmp_ext[0..2*h].to_vec();
-        karatsuba_inverse(b, &x_lo, &y_lo, &slice, z1_inner_a);
-    }
-}
-
-fn mod_mul_add_into_acc_karatsuba2(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-) {
-    let n = acc.len();
-    debug_assert_eq!(n, 256);
-    let h = n / 2;
-    let h2 = h / 2;
-    let tmp_ext = b.alloc_qubits(2 * n);
-    let z1_reg = b.alloc_qubits(2 * (h + 1));
-    let z1_inner_a = b.alloc_qubits(2 * (h2 + 1));
-    let z1_inner_b = b.alloc_qubits(2 * (h2 + 1));
-    karatsuba_forward_2level(b, x, y, &tmp_ext, &z1_reg, &z1_inner_a, &z1_inner_b);
-
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
-    mod_add_qq_fast(b, acc, &lo, p);
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..2 { mod_double_inplace_fast(b, &hi, p); }
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);
-    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);
-    b.set_phase("kara2_add_halve_tail");
-    for _ in 0..10 { mod_halve_inplace_fast(b, &hi, p); }
-
-    b.set_phase("karatsuba2_add_inv");
-    karatsuba_inverse_2level(b, x, y, &tmp_ext, &z1_reg, &z1_inner_a, &z1_inner_b);
-    b.free_vec(&z1_inner_b);
-    b.free_vec(&z1_inner_a);
-    b.free_vec(&z1_reg);
-    b.free_vec(&tmp_ext);
-}
-
-fn mod_mul_write_into_zero_acc_karatsuba2(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-) {
-    let n = acc.len();
-    debug_assert_eq!(n, 256);
-    let h = n / 2;
-    let h2 = h / 2;
-    let tmp_ext = b.alloc_qubits(2 * n);
-    let z1_reg = b.alloc_qubits(2 * (h + 1));
-    let z1_inner_a = b.alloc_qubits(2 * (h2 + 1));
-    let z1_inner_b = b.alloc_qubits(2 * (h2 + 1));
-    karatsuba_forward_2level(b, x, y, &tmp_ext, &z1_reg, &z1_inner_a, &z1_inner_b);
-
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
-    mod_add_qq_fast_from_zero(b, acc, &lo, p);
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..2 { mod_double_inplace_fast(b, &hi, p); }
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);
-    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);
-    for _ in 0..10 { mod_halve_inplace_fast(b, &hi, p); }
-
-    karatsuba_inverse_2level(b, x, y, &tmp_ext, &z1_reg, &z1_inner_a, &z1_inner_b);
-    b.free_vec(&z1_inner_b);
-    b.free_vec(&z1_inner_a);
-    b.free_vec(&z1_reg);
-    b.free_vec(&tmp_ext);
-}
-
-/// Add x*y mod p to acc, via schoolbook into a wide accumulator + Solinas
-/// reduction + Bennett uncompute. Saves ~100k CCX vs Horner-on-acc per call.
-fn mod_mul_add_into_acc_schoolbook(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-) {
-    let n = acc.len();
-    debug_assert_eq!(n, 256);
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-
-    let tmp_ext = b.alloc_qubits(2 * n);
-    schoolbook_mul_into_addsub(b, x, y, &tmp_ext);
-
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
-    let _ = c;
-    mod_add_qq_fast(b, acc, &lo, p);
-    // Solinas with 977 = 2^10 - 2^6 + 2^4 + 2^0. c = 2^32 + 977 = {+2^0, +2^4, -2^6, +2^10, +2^32}.
-    // 5 ops instead of 7 (saves 2 per call). Use shift_left_by_22 for the 10→32 gap.
-    mod_add_qq_fast(b, acc, &hi, p);  // position 0
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);  // position 4
-    for _ in 0..2 { mod_double_inplace_fast(b, &hi, p); }
-    mod_sub_qq_fast(b, acc, &hi, p);  // position 6 (SUB because of 977 consolidation)
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);  // position 10
-    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);  // position 32
-    b.set_phase("sol_halve_tail");
-    for _ in 0..10 {
-        mod_halve_inplace_fast(b, &hi, p);
-    }
-
-    b.set_phase("schoolbook_mul_inverse");
-    schoolbook_mul_into_addsub_inverse(b, x, y, &tmp_ext);
-    b.free_vec(&tmp_ext);
-}
-
-/// Symmetric schoolbook for squaring: x² = sum_i x[i]·2^(2i) + sum_{i<j} 2·x[i]·x[j]·2^(i+j).
-/// Each cross-product is computed ONCE (instead of twice in full schoolbook),
-/// halving the AND count + Cuccaro_add length. Saves ~130k CCX per squaring.
-///
-/// Row i layout (width n-i): bit 0 = diagonal x[i] at position 2i, bit 1 = 0
-/// (gap), bit k+2 = cross-product (x[i] AND x[i+1+k]) at position i+(i+1+k)+1.
-fn schoolbook_square_symmetric(b: &mut B, x: &[QubitId], tmp_ext: &[QubitId]) {
-    let n = x.len();
-    debug_assert_eq!(tmp_ext.len(), 2 * n);
-    for i in 0..n {
-        // Width: bit 0 = diag at pos 2i, bit 1 = gap, bits 2..(n-i) = cross-
-        // products at positions 2i+2..i+n. Last bit index = n-i, so width = n-i+1.
-        // Edge case: i = n-1 has only the diagonal, width = 1.
-        let width = if i == n - 1 { 1 } else { n - i + 1 };
-        let num_cross = if i + 1 < n { n - i - 1 } else { 0 };
-        // num_cross = number of cross-products in this row = width - 2 when width >= 2.
-        let row = b.alloc_qubits(width);
-        b.cx(x[i], row[0]);
-        for k in 0..num_cross {
-            b.ccx(x[i], x[i+1+k], row[k+2]);
-        }
-        let pad = b.alloc_qubit();
-        let mut row_padded = row.clone();
-        row_padded.push(pad);
-        let slice: Vec<QubitId> = tmp_ext[2*i..2*i+width+1].to_vec();
-        let c_in = b.alloc_qubit();
-        cuccaro_add_fast(b, &row_padded, &slice, c_in);
-        b.free(c_in);
-        b.free(pad);
-        b.cx(x[i], row[0]);
-        for k in 0..num_cross {
-            let m = b.alloc_bit();
-            b.hmr(row[k+2], m);
-            b.cz_if(x[i], x[i+1+k], m);
-        }
-        b.free_vec(&row);
-    }
-}
-
-fn schoolbook_square_symmetric_inverse(b: &mut B, x: &[QubitId], tmp_ext: &[QubitId]) {
-    let n = x.len();
-    for i in (0..n).rev() {
-        let width = if i == n - 1 { 1 } else { n - i + 1 };
-        let num_cross = if i + 1 < n { n - i - 1 } else { 0 };
-        let row = b.alloc_qubits(width);
-        b.cx(x[i], row[0]);
-        for k in 0..num_cross {
-            b.ccx(x[i], x[i+1+k], row[k+2]);
-        }
-        let pad = b.alloc_qubit();
-        let mut row_padded = row.clone();
-        row_padded.push(pad);
-        let slice: Vec<QubitId> = tmp_ext[2*i..2*i+width+1].to_vec();
-        let c_in = b.alloc_qubit();
-        cuccaro_sub_fast(b, &row_padded, &slice, c_in);
-        b.free(c_in);
-        b.free(pad);
-        b.cx(x[i], row[0]);
-        for k in 0..num_cross {
-            let m = b.alloc_bit();
-            b.hmr(row[k+2], m);
-            b.cz_if(x[i], x[i+1+k], m);
-        }
-        b.free_vec(&row);
-    }
-}
-
-/// Schoolbook squarer with Bennett uncompute. For squaring `tmp_ext = x*x`
-/// (2n bits, no mod reduction), then ADD with Solinas reduction to acc,
-/// then uncompute tmp_ext via gate-level inverse.
-fn squaring_add_to_acc_schoolbook(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    p: U256,
-) {
-    let n = acc.len();
-    debug_assert_eq!(n, 256);
-    debug_assert_eq!(x.len(), n);
-
-    let tmp_ext = b.alloc_qubits(2 * n);
-    schoolbook_square_symmetric(b, x, &tmp_ext);
-
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
-    mod_add_qq_fast(b, acc, &lo, p);
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);
-    for _ in 0..2 { mod_double_inplace_fast(b, &hi, p); }
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);
-    generated_exact_solinas::add_power32_from_power10(b, acc, &hi, p);
-    for _ in 0..10 {
-        mod_halve_inplace_fast(b, &hi, p);
-    }
-
-    schoolbook_square_symmetric_inverse(b, x, &tmp_ext);
-    b.free_vec(&tmp_ext);
-}
-
-/// acc -= x * y mod p via Karatsuba. Not squaring (x ≠ y).
-fn mod_mul_sub_into_acc_karatsuba(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-) {
-    // Negate x in place, run karatsuba add, then restore x.
-    mod_neg_inplace_fast(b, x, p);
-    mod_mul_add_into_acc_karatsuba(b, acc, x, y, p);
-    mod_neg_inplace_fast(b, x, p);
-}
-
-/// Schoolbook squarer with Bennett uncompute. For squaring `tmp_ext = x*x`
-/// (2n bits, no mod reduction), then sub from acc with on-the-fly Solinas
-/// reduction, then uncompute tmp_ext via gate-level inverse. Saves ~170k
-/// CCX vs walk-x squaring (459k → 289k) by avoiding 256 expensive
-/// cmod_add_qq calls (each 5n) in favor of 2n²=131k of cheap AND+Cuccaro.
-fn squaring_sub_from_acc_schoolbook(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    p: U256,
-) {
-    let n = acc.len();
-    debug_assert_eq!(n, 256);
-    debug_assert_eq!(x.len(), n);
-    let c = U256::MAX.wrapping_sub(p).wrapping_add(U256::from(1));
-
-    // Wide accumulator (2n bits) starts at 0.
-    let tmp_ext = b.alloc_qubits(2 * n);
-
-    // Phase 1: symmetric schoolbook tmp_ext = x*x (~half the CCX of full).
-    schoolbook_square_symmetric(b, x, &tmp_ext);
-
-    // Phase 2: subtract (lo + hi*c mod p) from acc.
-    // For each set bit k of c, sub (hi shifted by k mod p) from acc, by
-    // walking hi via mod_double in place. Sub lo first.
-    let lo: Vec<QubitId> = tmp_ext[0..n].to_vec();
-    let hi: Vec<QubitId> = tmp_ext[n..2*n].to_vec();
-    mod_sub_qq_fast(b, acc, &lo, p);
-    let _ = c;
-    // 977 consolidation: c = {+2^0, +2^4, -2^6, +2^10, +2^32}. For acc-=hi·c, signs flip:
-    // acc -= hi·2^0, acc -= hi·2^4, acc += hi·2^6, acc -= hi·2^10, acc -= hi·2^32.
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_sub_qq_fast(b, acc, &hi, p);
-    for _ in 0..2 { mod_double_inplace_fast(b, &hi, p); }
-    mod_add_qq_fast(b, acc, &hi, p);  // sign flipped
-    for _ in 0..4 { mod_double_inplace_fast(b, &hi, p); }
-    mod_sub_qq_fast(b, acc, &hi, p);
-    generated_exact_solinas::sub_power32_from_power10(b, acc, &hi, p);
-    for _ in 0..10 {
-        mod_halve_inplace_fast(b, &hi, p);
-    }
-
-    // Phase 3: uncompute tmp_ext via symmetric schoolbook inverse.
-    schoolbook_square_symmetric_inverse(b, x, &tmp_ext);
-
-    b.free_vec(&tmp_ext);
-}
-
-/// Schoolbook: tmp_ext (2n bits) += x * x. Each row i adds (x[i] AND x)
-/// shifted by i, captured in n+1 bits to absorb carry into position i+n.
-fn schoolbook_square_into(b: &mut B, x: &[QubitId], tmp_ext: &[QubitId]) {
-    let n = x.len();
-    debug_assert_eq!(tmp_ext.len(), 2 * n);
-    for i in 0..n {
-        let row = b.alloc_qubits(n);
-        for k in 0..n {
-            b.ccx(x[i], x[k], row[k]);
-        }
-        let pad = b.alloc_qubit();
-        let mut row_padded = row.clone();
-        row_padded.push(pad);
-        let slice: Vec<QubitId> = tmp_ext[i..i+n+1].to_vec();
-        let c_in = b.alloc_qubit();
-        cuccaro_add_fast(b, &row_padded, &slice, c_in);
-        b.free(c_in);
-        b.free(pad);
-        // Unload row via measurement-based AND uncompute.
-        for k in 0..n {
-            let m = b.alloc_bit();
-            b.hmr(row[k], m);
-            b.cz_if(x[i], x[k], m);
-        }
-        b.free_vec(&row);
-    }
-}
-
-/// Gate-level inverse of schoolbook_square_into. Subtracts the same
-/// row contributions in reverse iteration order, returning tmp_ext to 0.
-fn schoolbook_square_into_inverse(b: &mut B, x: &[QubitId], tmp_ext: &[QubitId]) {
-    let n = x.len();
-    for i in (0..n).rev() {
-        let row = b.alloc_qubits(n);
-        for k in 0..n {
-            b.ccx(x[i], x[k], row[k]);
-        }
-        let pad = b.alloc_qubit();
-        let mut row_padded = row.clone();
-        row_padded.push(pad);
-        let slice: Vec<QubitId> = tmp_ext[i..i+n+1].to_vec();
-        let c_in = b.alloc_qubit();
-        cuccaro_sub_fast(b, &row_padded, &slice, c_in);
-        b.free(c_in);
-        b.free(pad);
-        for k in 0..n {
-            let m = b.alloc_bit();
-            b.hmr(row[k], m);
-            b.cz_if(x[i], x[k], m);
-        }
-        b.free_vec(&row);
-    }
-}
-
-fn mod_mul_sub_qq(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[QubitId],
-    p: U256,
-) {
-    // acc -= x * y mod p. Negate x, run schoolbook ADD (cheaper than sub),
-    // then restore x. For x≠y we can walk the negated multiplicand in place
-    // and halve it back afterwards, avoiding the doubled tmp register. For
-    // squaring we snapshot the original control bits once into `ctrl_copy`,
-    // then reuse the same in-place walk on the negated x.
-    let n = acc.len();
-    let is_squaring = x[0] == y[0]; // same register → squaring
-    if is_squaring {
-        generated_exact_square::squaring_sub_from_acc_half_products_exact(b, acc, x, p);
-        return;
-    }
-    if false {
-        // Hold the original x bits fixed for control while x itself walks
-        // through (-x)*2^i mod p.
-        let ctrl_copy = b.alloc_qubits(n);
-        for i in 0..n { b.cx(x[i], ctrl_copy[i]); }
-        mod_neg_inplace_fast(b, x, p);
-        for i in 0..n {
-            cmod_add_qq(b, acc, x, ctrl_copy[i], p);
-            if i < n - 1 { mod_double_inplace_fast(b, x, p); }
-        }
-        for _ in 0..(n - 1) { mod_halve_inplace_fast(b, x, p); }
-        mod_neg_inplace_fast(b, x, p);
-        for i in 0..n { b.cx(x[i], ctrl_copy[i]); }
-        b.free_vec(&ctrl_copy);
-    } else {
-        // Keep x negated during the loop and walk it in place.
-        mod_neg_inplace_fast(b, x, p);
-        for i in 0..n {
-            cmod_add_qq(b, acc, x, y[i], p);
-            if i < n - 1 { mod_double_inplace_fast(b, x, p); }
-        }
-        for _ in 0..(n - 1) { mod_halve_inplace_fast(b, x, p); }
-        mod_neg_inplace_fast(b, x, p);
-    }
-}
-
-fn mod_mul_add_qb(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[BitId],
-    p: U256,
-) {
-    let n = acc.len();
-    let tmp = b.alloc_qubits(n);
-    for i in 0..n { b.cx(x[i], tmp[i]); }
-    for i in 0..n {
-        // Mask the whole conditional-add body by y[i]: on shots where
-        // y[i]=0 nothing needs to happen AND nothing should be counted.
-        b.push_condition(y[i]);
-        cmod_add_qq_bit(b, acc, &tmp, y[i], p);
-        b.pop_condition();
-        if i < n - 1 { mod_double_inplace_fast(b, &tmp, p); }
-    }
-    for _ in 0..(n - 1) { mod_halve_inplace_fast(b, &tmp, p); }
-    for i in 0..n { b.cx(x[i], tmp[i]); }
-    b.free_vec(&tmp);
-}
-
-fn mod_mul_sub_qb(
-    b: &mut B,
-    acc: &[QubitId],
-    x: &[QubitId],
-    y: &[BitId],
-    p: U256,
-) {
-    let n = acc.len();
-    let tmp = b.alloc_qubits(n);
-    for i in 0..n { b.cx(x[i], tmp[i]); }
-    for i in 0..n {
-        b.push_condition(y[i]);
-        cmod_sub_qq_bit(b, acc, &tmp, y[i], p);
-        b.pop_condition();
-        if i < n - 1 { mod_double_inplace_fast(b, &tmp, p); }
-    }
-    for _ in 0..(n - 1) { mod_halve_inplace_fast(b, &tmp, p); }
-    for i in 0..n { b.cx(x[i], tmp[i]); }
-    b.free_vec(&tmp);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Kaliski almost-inverse
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Fredkin (controlled swap): swap (a, t) if ctrl. Decomposed as CX/CCX/CX.
-fn cswap(b: &mut B, ctrl: QubitId, a: QubitId, t: QubitId) {
-    b.cx(t, a);
-    b.ccx(ctrl, a, t);
-    b.cx(t, a);
-}
-
-fn cmod_double_inplace(b: &mut B, v: &[QubitId], p: U256, ctrl: QubitId) {
-    let n = v.len();
-    let ovf = b.alloc_qubit();
-    let mut v_ext: Vec<QubitId> = v.to_vec();
-    v_ext.push(ovf);
-
-    // Conditional left-shift: if ctrl=1, v[n-1] → ovf; v[i] → v[i+1].
-    cswap(b, ctrl, v[n - 1], ovf);
-    for i in (0..n - 1).rev() {
-        cswap(b, ctrl, v[i], v[i + 1]);
-    }
-
-    csub_nbit_const(b, &v_ext, p, ctrl);
-    cadd_nbit_const(b, &v_ext, p, ovf);
-    // ovf ends at 0 by the same argument as mod_double_inplace.
-    b.free(ovf);
-}
-
-/// `cmod_halve_inplace` = exact inverse of `cmod_double_inplace`.
-fn cmod_halve_inplace(b: &mut B, v: &[QubitId], p: U256, ctrl: QubitId) {
-    let n = v.len();
-    let ovf = b.alloc_qubit();
-    let mut v_ext: Vec<QubitId> = v.to_vec();
-    v_ext.push(ovf);
-
-    // Inverse of: cadd(v_ext, p, ovf).
-    csub_nbit_const(b, &v_ext, p, ovf);
-    // Inverse of: csub(v_ext, p, ctrl).
-    cadd_nbit_const(b, &v_ext, p, ctrl);
-    // Inverse of cswap cascade (self-inverse; reversed order).
-    for i in 0..n - 1 {
-        cswap(b, ctrl, v[i], v[i + 1]);
-    }
-    cswap(b, ctrl, v[n - 1], ovf);
-
-    b.free(ovf);
-}
-
-/// Run `body` with `flag` holding (u < v), then uncompute the flag and
-/// restore u, v. Uses carry-ancilla + measurement-based uncomputation
-/// for the inv_MAJ sweep (0 Toffoli instead of n CCX).
-/// Cost ≈ n CCX (forward MAJ) + body + 0 CCX (measurement inv_MAJ).
-fn with_lt<F: FnOnce(&mut B)>(
-    b: &mut B,
-    u: &[QubitId],
-    v: &[QubitId],
-    flag: QubitId,
-    body: F,
-) {
-    let n = u.len();
-    assert_eq!(n, v.len());
-    let c_in = b.alloc_qubit();
-    let carries = b.alloc_qubits(n);
-    for i in 0..n { b.x(u[i]); }
-
-    // Forward MAJ sweep with separate carry ancillae.
-    // maj_with_carry: CX(w,y); CX(w,x); CCX(x_new,y_new,carry); CX(carry,w)
-    // Step 0: (x=c_in, y=v[0], w=u[0])
-    b.cx(u[0], v[0]);
-    b.cx(u[0], c_in);
-    b.ccx(c_in, v[0], carries[0]);
-    b.cx(carries[0], u[0]);
-    // Steps 1..n-1: (x=u[i-1], y=v[i], w=u[i])
-    for i in 1..n {
-        b.cx(u[i], v[i]);
-        b.cx(u[i], u[i - 1]);
-        b.ccx(u[i - 1], v[i], carries[i]);
-        b.cx(carries[i], u[i]);
-    }
-
-    b.cx(u[n - 1], flag);
-    body(b);
-    b.cx(u[n - 1], flag);
-
-    // Backward inv_MAJ sweep with measurement-based carry uncompute (0 Toffoli).
-    // inv_maj_with_carry: CX(carry,w); HMR+CZ(carry,x,y); CX(w,x); CX(w,y)
-    for i in (1..n).rev() {
-        b.cx(carries[i], u[i]);             // restore w = u[i]
-        let m = b.alloc_bit();
-        b.hmr(carries[i], m);               // measure carry
-        b.cz_if(u[i - 1], v[i], m);         // phase correction
-        b.cx(u[i], u[i - 1]);               // restore x = u[i-1]
-        b.cx(u[i], v[i]);                   // restore y = v[i]
-    }
-    // Step 0: (x=c_in, y=v[0], w=u[0])
-    b.cx(carries[0], u[0]);
-    let m0 = b.alloc_bit();
-    b.hmr(carries[0], m0);
-    b.cz_if(c_in, v[0], m0);
-    b.cx(u[0], c_in);
-    b.cx(u[0], v[0]);
-
-    for i in 0..n { b.x(u[i]); }
-    b.free_vec(&carries);
-    b.free(c_in);
-}
-
-/// Symmetric helper: runs `body` with `flag` holding (u > v).
-fn with_gt<F: FnOnce(&mut B)>(
-    b: &mut B,
-    u: &[QubitId],
-    v: &[QubitId],
-    flag: QubitId,
-    body: F,
-) {
-    with_lt(b, v, u, flag, body)
-}
-
-/// Run `body` with `flag` holding (v == 0), then uncompute. Single forward
-/// OR chain + body + single inverse OR chain — half the cost of two
-/// `cmp_eq_zero_into` calls.
-fn with_eq_zero<F: FnOnce(&mut B)>(
-    b: &mut B,
-    v: &[QubitId],
-    flag: QubitId,
-    body: F,
-) {
-    let n = v.len();
-    assert!(n > 0);
-    if n == 1 {
-        b.x(v[0]);
-        b.cx(v[0], flag);
-        body(b);
-        b.cx(v[0], flag);
-        b.x(v[0]);
-        return;
-    }
-    let or_chain: Vec<QubitId> = b.alloc_qubits(n - 1);
-    or_step(b, v[0], v[1], or_chain[0]);
-    for i in 1..n - 1 {
-        or_step(b, or_chain[i - 1], v[i + 1], or_chain[i]);
-    }
-    // or_chain[n-2] = (v != 0). Take complement for "== 0".
-    b.x(or_chain[n - 2]);
-    b.cx(or_chain[n - 2], flag);
-    b.x(or_chain[n - 2]);
-    body(b);
-    b.x(or_chain[n - 2]);
-    b.cx(or_chain[n - 2], flag);
-    b.x(or_chain[n - 2]);
-    for i in (1..n - 1).rev() {
-        or_step(b, or_chain[i - 1], v[i + 1], or_chain[i]);
-    }
-    or_step(b, v[0], v[1], or_chain[0]);
-    b.free_vec(&or_chain);
-}
-
-/// flag ^= (u < v).  Non-destructive on u and v.
-///
-/// Uses a MAJ-only carry chain instead of the full sub+add pattern.
-/// Identity: u < v iff carry-out of (~u + v) = 1, since
-///   ~u + v = (2^n - 1 - u) + v = (v - u) + (2^n - 1)
-/// which overflows 2^n iff v - u ≥ 1 iff v > u. We negate u in place,
-/// run a forward MAJ sweep over (~u, v, c_in=0), capture u[n-1] (which
-/// holds the high carry after the chain), then run the inverse MAJ
-/// sweep + un-negate to restore u and v. Cost ≈ 2n CCX, half of the
-/// previous sub+add (≈ 4n CCX).
-fn cmp_lt_into(b: &mut B, u: &[QubitId], v: &[QubitId], flag: QubitId) {
-    let n = u.len();
-    assert_eq!(n, v.len());
-
-    let c_in = b.alloc_qubit();
-
-    // ~u in place (X is free in the metric).
-    for i in 0..n { b.x(u[i]); }
-
-    // Forward MAJ sweep — n MAJs (one more than cuccaro_add, which omits
-    // the top one because it doesn't need the carry-out).
-    maj(b, c_in, v[0], u[0]);
-    for i in 1..n {
-        maj(b, u[i - 1], v[i], u[i]);
-    }
-    // u[n-1] now holds the high carry = (u < v).
-    b.cx(u[n - 1], flag);
-
-    // Inverse sweep restores u and v to their (negated u) state.
-    for i in (1..n).rev() {
-        inv_maj(b, u[i - 1], v[i], u[i]);
-    }
-    inv_maj(b, c_in, v[0], u[0]);
-
-    // Un-negate u.
-    for i in 0..n { b.x(u[i]); }
-
-    b.free(c_in);
-}
-
-/// flag ^= (v != 0). Computes OR of all bits of v into a scratch ancilla,
-/// CXs into flag, then properly uncomputes the scratch.
-///
-/// We use the simple chain: `or[0] = v[0]`, `or[i] = or[i-1] OR v[i]`.
-/// OR via de Morgan: `or[i] = NOT((NOT or[i-1]) AND (NOT v[i]))`, i.e.
-///   x(or[i-1]); x(v[i]); ccx(or[i-1], v[i], or[i]); x(or[i]);
-///   x(v[i]); x(or[i-1]);
-/// Each `or[i]` is a fresh ancilla. We compute the chain, CX `or[n-1]`
-/// into `flag`, then reverse the chain to return every ancilla to |0⟩.
-fn cmp_neq_zero_into(b: &mut B, v: &[QubitId], flag: QubitId) {
-    let n = v.len();
-    assert!(n > 0);
-    if n == 1 {
-        b.cx(v[0], flag);
-        return;
-    }
-
-    let or_chain: Vec<QubitId> = b.alloc_qubits(n - 1);
-    // or_chain[0] = v[0] OR v[1]
-    or_step(b, v[0], v[1], or_chain[0]);
-    for i in 1..n - 1 {
-        or_step(b, or_chain[i - 1], v[i + 1], or_chain[i]);
-    }
-
-    // flag ^= or_chain[n-2]
-    b.cx(or_chain[n - 2], flag);
-
-    // Uncompute.
-    for i in (1..n - 1).rev() {
-        or_step(b, or_chain[i - 1], v[i + 1], or_chain[i]);
-    }
-    or_step(b, v[0], v[1], or_chain[0]);
-
-    b.free_vec(&or_chain);
-}
-
-/// out ^= (x OR y). `out` starts 0. Uses the de-Morgan form:
-///   x(x); x(y); ccx(x, y, out); x(out); x(y); x(x);
-/// After this, out = x OR y (assuming out started at 0). Its inverse is
-/// the same gate sequence run in reverse — since it's symmetric (all gates
-/// involutions, palindromic structure), running the exact same helper
-/// again uncomputes it.
-fn or_step(b: &mut B, x: QubitId, y: QubitId, out: QubitId) {
-    b.x(x);
-    b.x(y);
-    b.ccx(x, y, out);
-    b.x(out);
-    b.x(y);
-    b.x(x);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Primitives for the Kaliski port (qrisp-style)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// 2-controlled X with per-control polarity. `polarity=true` means positive
-/// control; `false` means anti-control (ctrl=0 triggers).
-fn mcx2_polar(
-    b: &mut B,
-    c1: QubitId, p1: bool,
-    c2: QubitId, p2: bool,
-    target: QubitId,
-) {
-    if !p1 { b.x(c1); }
-    if !p2 { b.x(c2); }
-    b.ccx(c1, c2, target);
-    if !p2 { b.x(c2); }
-    if !p1 { b.x(c1); }
-}
-
-/// 3-controlled X with per-control polarity. Uses a borrowed scratch qubit
-/// (must be supplied clean, returns clean).
-fn mcx3_polar(
-    b: &mut B,
-    c1: QubitId, p1: bool,
-    c2: QubitId, p2: bool,
-    c3: QubitId, p3: bool,
-    target: QubitId,
-    scratch: QubitId,
-) {
-    if !p1 { b.x(c1); }
-    if !p2 { b.x(c2); }
-    if !p3 { b.x(c3); }
-    b.ccx(c1, c2, scratch);
-    b.ccx(scratch, c3, target);
-    b.ccx(c1, c2, scratch);
-    if !p3 { b.x(c3); }
-    if !p2 { b.x(c2); }
-    if !p1 { b.x(c1); }
-}
-
-/// flag ^= (v == 0).  Uses cmp_neq_zero_into internally.
-fn cmp_eq_zero_into(b: &mut B, v: &[QubitId], flag: QubitId) {
-    b.x(flag);
-    cmp_neq_zero_into(b, v, flag);
-}
-
-/// flag ^= (u > v).  Symmetric to cmp_lt_into(v, u, flag).
-fn cmp_gt_into(b: &mut B, u: &[QubitId], v: &[QubitId], flag: QubitId) {
-    cmp_lt_into(b, v, u, flag);
-}
-
-/// Controlled n-bit subtract mod 2^n: if ctrl, acc -= a. Both are n-wide
-/// qubit slices. Not a mod-p operation.
-fn cucc_sub_ctrl(b: &mut B, a: &[QubitId], acc: &[QubitId], ctrl: QubitId) {
-    let n = a.len();
-    let tmp = b.alloc_qubits(n);
-    for i in 0..n { b.ccx(ctrl, a[i], tmp[i]); }
-    sub_nbit_qq(b, &tmp, acc);
-    for i in 0..n { b.ccx(ctrl, a[i], tmp[i]); }
-    b.free_vec(&tmp);
-}
-
-/// Controlled n-bit add mod 2^n: if ctrl, acc += a.
-fn cucc_add_ctrl(b: &mut B, a: &[QubitId], acc: &[QubitId], ctrl: QubitId) {
-    let n = a.len();
-    let tmp = b.alloc_qubits(n);
-    for i in 0..n { b.ccx(ctrl, a[i], tmp[i]); }
-    add_nbit_qq(b, &tmp, acc);
-    for i in 0..n { b.ccx(ctrl, a[i], tmp[i]); }
-    b.free_vec(&tmp);
-}
-
-/// Controlled shift-right by 1 of an n-bit register. ASSUMES v[0]=0 when
-/// ctrl=1 (so no information is lost). Implemented as a controlled swap
-/// cascade: if ctrl=1, new v[i] = old v[i+1] for i < n-1, new v[n-1] = 0.
-fn c_shift_right_1(b: &mut B, v: &[QubitId], ctrl: QubitId) {
-    let n = v.len();
-    for i in 0..(n - 1) {
-        cswap(b, ctrl, v[i], v[i + 1]);
-    }
-}
-
-/// Unconditional shift-left by 1 of an (n+1)-bit register. ASSUMES r[n]=0
-/// before the shift. After the shift: r[0]=0, r[i] = old r[i-1] for i ∈ [1, n].
-fn shift_left_1(b: &mut B, r: &[QubitId]) {
-    let n1 = r.len();  // n+1
-    // Swap r[n] ↔ r[0] first: r[0] gets the known-0 top bit.
-    b.swap(r[n1 - 1], r[0]);
-    // Then propagate: swap r[n] ↔ r[n-1], r[n-1] ↔ r[n-2], ..., r[2] ↔ r[1].
-    for i in (2..n1).rev() {
-        b.swap(r[i], r[i - 1]);
-    }
-}
-
-/// Inverse of `shift_left_1`: shifts an (n+1)-bit register right by 1.
-/// ASSUMES r[0]=0 before the shift (i.e., was even).
-#[allow(dead_code)]
-fn shift_right_1(b: &mut B, r: &[QubitId]) {
-    let n1 = r.len();
-    for i in 2..n1 {
-        b.swap(r[i], r[i - 1]);
-    }
-    b.swap(r[n1 - 1], r[0]);
-}
-
-/// flag ^= (r > c).  r is (n+1)-wide; c is a compile-time constant.
-/// Non-destructive: r is restored at the end.
-fn cmp_gt_const_n1(b: &mut B, r: &[QubitId], c: U256, flag: QubitId) {
-    let n1 = r.len();
-    let c_plus_1 = c.wrapping_add(U256::from(1));
-    sub_nbit_const(b, r, c_plus_1);
-    // If r - (c+1) >= 0 (top bit 0), then r > c.
-    b.x(r[n1 - 1]);
-    b.cx(r[n1 - 1], flag);
-    b.x(r[n1 - 1]);
-    add_nbit_const(b, r, c_plus_1);
-}
-
-/// Classical modular inverse via Fermat's little theorem. Used ONLY at
-/// circuit-construction time to compute correction constants.
-#[allow(dead_code)]
-fn classical_modinv(a: U256, p: U256) -> U256 {
-    // a^(p-2) mod p via square-and-multiply.
-    let exponent = p.wrapping_sub(U256::from(2));
-    let mut result = U256::from(1);
-    let mut base = a % p;
-    for i in 0..256 {
-        if exponent.bit(i) {
-            result = mulmod(result, base, p);
-        }
-        base = mulmod(base, base, p);
-    }
-    result
-}
-
-/// Classical modular multiplication used to compute correction constants
-/// at build time.
-fn mulmod(a: U256, b: U256, p: U256) -> U256 {
-    // Naive (a * b) mod p — both < p < 2^256, so the product may overflow
-    // 256 bits. Use U256's widening mul if available; else do it in u512
-    // via chunks. alloy's U256 has `mul_mod`.
-    a.mul_mod(b, p)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Kaliski binary almost-inverse (qrisp-style, standard form)
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// Faithful port of `kaliski_mod_inv` from the qrisp reference at
-// `quantum-elliptic-curve-logarithm/src/quantum/ec_arithmetic.py`.
-//
-// The function computes `v_in := v_in^{-1} mod p` in place, using a
-// self-contained scratch region that is zeroed at function exit. Every
-// per-iteration ancilla is uncomputed via the `conjugate` pattern or via
-// classical invariants (e.g. `a ^= NOT s[0]` at the end of each iteration).
-//
-// Difference from qrisp: we work in STANDARD form, no Montgomery
-// conversion. The final r register holds `-v_orig^{-1} * 2^{2n} mod p`
-// instead of the Montgomery version. We compensate via a single in-place
-// classical-constant multiplication by K = (2^{-2n}) mod p at function
-// end, which gets us back to v_orig^{-1}.
-//
-// Assumption: v_in is a nonzero element of (Z/p)*. The test harness
-// filters out the v_orig = 0 case before calling `build`, so we skip the
-// two phase-fix blocks that qrisp needs for v_orig = 0.
-
-/// Emit the inner iteration body. Takes the persistent state as parameters.
-/// Per-iteration transients (`is_zero`, `l_gt`) are allocated and freed
-/// WITHIN this function, via the conjugate pattern. The persistent flags
-/// `a_f, b_f, add_f` carry no data across iterations (each iteration resets
-/// them via classical uncomputation).
-/// Threshold: for iter_idx < R_SMALL_THRESHOLD, r's top bit is guaranteed 0
-/// (since max(r,s) doubles per iter starting from max=1, so max ≤ 2^iter_idx).
-/// In that range, mod_double(r)'s Solinas cadd is identity — replace with
-/// a plain shift (0 Toffoli) for ~255 CCX savings per iter.
-const R_SMALL_THRESHOLD: usize = 255;
-
-/// For nonzero secp256k1 inputs, the first 256 Kaliski iterations are always
-/// nonterminal, so `f = 1` and `v_w != 0` at step entry are guaranteed.
-///
-/// Proof sketch: let `s = u + v`. Every Kaliski step satisfies `s' >= s/2`.
-/// Starting from `(u, v) = (p, v0)` with `1 <= v0 < p`, we have
-/// `s0 = p + v0 >= p + 1`, and `p + 1` is strictly between `2^255` and
-/// `2^256`. Termination requires reaching `(1, 0)`, i.e. `s = 1`, so any run
-/// needs at least `ceil(log2(s0)) = 256` steps. Therefore the first 256 step
-/// entries are guaranteed bulk / nonterminal.
-const BULK_PREFIX_SAFE_ITERS: usize = 304;
-
-fn bulk_prefix_safe_iters() -> usize {
-    std::env::var("KAL_BULK3_ITERS")
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut total_classical = 0usize;
+    let mut total_phase_batches = 0usize;
+    let mut total_ancilla_batches = 0usize;
+    for (tag, classical_failures, phase_garbage_batches, ancilla_garbage_batches) in &results {
+        total_classical += classical_failures;
+        total_phase_batches += phase_garbage_batches;
+        total_ancilla_batches += ancilla_garbage_batches;
+        eprintln!(
+            "ALT-SEED tag={} classical_mismatches={} phase_batches={} ancilla_batches={}",
+            tag, classical_failures, phase_garbage_batches, ancilla_garbage_batches,
+        );
+    }
+
+    println!("METRIC altseed_classical_total={}", total_classical);
+    println!("METRIC altseed_phase_batches_total={}", total_phase_batches);
+    println!(
+        "METRIC altseed_ancilla_batches_total={}",
+        total_ancilla_batches
+    );
+
+    let phase_limit: usize = std::env::var("ALT_SEED_PHASE_LIMIT")
         .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(BULK_PREFIX_SAFE_ITERS)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        total_phase_batches <= phase_limit,
+        "ALT-SEED PHASE FAILURE: {} phase-garbage batches (limit {}) across {} seeds × {} shots",
+        total_phase_batches,
+        phase_limit,
+        n_seeds,
+        ALT_SEED_SHOTS,
+    );
+    assert!(
+        total_ancilla_batches == 0,
+        "ALT-SEED ANCILLA FAILURE: {} ancilla-garbage batches across {} seeds × {} shots",
+        total_ancilla_batches,
+        n_seeds,
+        ALT_SEED_SHOTS,
+    );
+    assert!(
+        total_classical <= ALT_SEED_CLASSICAL_LIMIT,
+        "ALT-SEED CLASSICAL FAILURE: {} classical mismatches exceeds limit {} across {} seeds × {} shots",
+        total_classical,
+        ALT_SEED_CLASSICAL_LIMIT,
+        n_seeds,
+        ALT_SEED_SHOTS,
+    );
 }
 
-fn bulk_prefix_enabled() -> bool {
-    match std::env::var("KAL_BULK3_EXPERIMENT") {
-        Ok(v) => v != "0",
-        Err(_) => false,
+#[cfg(test)]
+mod d1_inplace_lowerer_tests {
+    use super::*;
+
+    fn build_product_ops() -> Vec<Op> {
+        let mut b = B::new();
+        let h = b.alloc_qubits(N);
+        b.declare_qubit_register(&h);
+        let n = b.alloc_qubits(N);
+        b.declare_qubit_register(&n);
+        d1_inplace_product_lowerer_with_kaliski_clean(&mut b, &h, &n, SECP256K1_P, 400);
+        b.ops
     }
-}
 
-/// Specialized real forward primitive for the first few guaranteed-bulk
-/// Kaliski iterations where `f = 1` and `v_w != 0` are known a priori.
-///
-/// This keeps the same persistent-state interface as `kaliski_iteration`
-/// (notably `m_i` ends in the same value that the generic step would have
-/// produced), but drops STEP 0 / `f` handling entirely.
-///
-/// Not wired into the live inversion path yet: a direct forward-only swap-in
-/// attempt did not preserve full point-add correctness, so this remains an
-/// experimental helper while the history/backward compatibility conditions are
-/// worked out.
-fn kaliski_iteration_bulk_prefix3(
-    b: &mut B,
-    p: U256,
-    u: &[QubitId],
-    v_w: &[QubitId],
-    r: &[QubitId],
-    s: &[QubitId],
-    m_i: QubitId,
-    iter_idx: usize,
-) {
-    let a_f = b.alloc_qubit();
-    let b_f = b.alloc_qubit();
-    let add_f = b.alloc_qubit();
-    let f1 = b.alloc_qubit();
-    b.x(f1);
-
-    let _kal_saved_phase = b.phase;
-
-    // Reproduce the generic step-0 HMR history exactly on the guaranteed
-    // nonterminal prefix. Classically this is a no-op because v_w != 0 and
-    // m_i starts at 0, but the measurement-based uncompute phase history still
-    // matters.
-    b.set_phase("kal_bulk_step0_eqzero");
-    let or_width = if iter_idx < u.len() { u.len() } else { 2 * u.len() - iter_idx };
-    let dummy_m = b.alloc_qubit();
-    with_eq_zero_fast(b, &v_w[0..or_width], add_f, |b| {
-        b.ccx(f1, add_f, dummy_m);
-    });
-    b.cx(dummy_m, f1);
-    b.free(dummy_m);
-
-    b.set_phase("kal_bulk_step1");
-    // Specialized STEP 1 for f=1, plus the generic z HMR history.
-    b.x(a_f);
-    b.cx(u[0], a_f); // a_f = !u0
-    b.x(v_w[0]);
-    b.ccx(u[0], v_w[0], m_i); // m_i = u0 & !v0
-    b.x(v_w[0]);
-    b.cx(a_f, b_f);
-    b.cx(m_i, b_f); // b_f = a_f xor m_i
-    let z = b.alloc_qubit();
-    b.ccx(f1, u[0], z);
-    {
-        let zm = b.alloc_bit();
-        b.hmr(z, zm);
-        b.cz_if(f1, u[0], zm);
+    fn build_quotient_ops() -> Vec<Op> {
+        let mut b = B::new();
+        let h = b.alloc_qubits(N);
+        b.declare_qubit_register(&h);
+        let n = b.alloc_qubits(N);
+        b.declare_qubit_register(&n);
+        d1_inplace_quotient_lowerer_with_kaliski_clean(&mut b, &h, &n, SECP256K1_P, 400);
+        b.ops
     }
-    b.free(z);
 
-    b.set_phase("kal_bulk_step2");
-    let l_gt = b.alloc_qubit();
-    with_gt(b, u, v_w, l_gt, |b| {
-        b.x(b_f);
-        let t = b.alloc_qubit();
-        b.ccx(l_gt, b_f, t);
-        b.cx(t, a_f);
-        b.cx(t, m_i);
-        {
-            let tm = b.alloc_bit();
-            b.hmr(t, tm);
-            b.cz_if(l_gt, b_f, tm);
+    fn toffoli_count(ops: &[Op]) -> usize {
+        ops.iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count()
+    }
+
+    fn assert_two_word_d1_abi(ops: &[Op]) -> (u32, u32, u32) {
+        let (qubits, bits, registers, regs) = analyze_ops(ops.iter().copied());
+        assert_eq!(registers, 2);
+        assert_eq!(regs.len(), 2);
+        for reg in regs {
+            assert_eq!(reg.len(), N);
+            assert!(reg.iter().all(|item| matches!(item, QubitOrBit::Qubit(_))));
         }
-        b.free(t);
-        let add_dummy = b.alloc_qubit();
-        b.ccx(f1, l_gt, add_dummy);
-        {
-            let am = b.alloc_bit();
-            b.hmr(add_dummy, am);
-            b.cz_if(f1, l_gt, am);
+        (qubits, bits, registers)
+    }
+
+    #[test]
+    fn d1_inplace_product_lowerer_component_stats_are_pinned() {
+        let ops = build_product_ops();
+        let (qubits, bits, registers) = assert_two_word_d1_abi(&ops);
+        assert_eq!(qubits, 2475);
+        assert_eq!(bits, 1_141_762);
+        assert_eq!(registers, 2);
+        assert_eq!(toffoli_count(&ops), 1_919_786);
+    }
+
+    #[test]
+    fn d1_inplace_quotient_lowerer_component_stats_are_pinned() {
+        let ops = build_quotient_ops();
+        let (qubits, bits, registers) = assert_two_word_d1_abi(&ops);
+        assert_eq!(qubits, 2475);
+        assert_eq!(bits, 0);
+        assert_eq!(registers, 2);
+        assert_eq!(toffoli_count(&ops), 1_919_786);
+        assert!(ops
+            .iter()
+            .all(|op| op.c_condition == crate::circuit::NO_BIT));
+        assert!(ops.iter().all(|op| {
+            !matches!(
+                op.kind,
+                OperationType::Hmr | OperationType::Neg | OperationType::R
+            )
+        }));
+    }
+
+    #[test]
+    fn round8_output_side_cleanup_hook_is_env_gated() {
+        let saved = std::env::var("ROUND8_QTAIL_OUTPUT_SIDE_CLEANUP").ok();
+        std::env::remove_var("ROUND8_QTAIL_OUTPUT_SIDE_CLEANUP");
+        assert!(!round8_qtail_output_side_cleanup_enabled());
+        std::env::set_var("ROUND8_QTAIL_OUTPUT_SIDE_CLEANUP", "1");
+        assert!(round8_qtail_output_side_cleanup_enabled());
+        match saved {
+            Some(value) => std::env::set_var("ROUND8_QTAIL_OUTPUT_SIDE_CLEANUP", value),
+            None => std::env::remove_var("ROUND8_QTAIL_OUTPUT_SIDE_CLEANUP"),
         }
-        b.free(add_dummy);
-        b.x(b_f);
-    });
-    b.free(l_gt);
+    }
 
-    b.set_phase("kal_bulk_step3_cswap");
-    for j in 0..u.len() { cswap(b, a_f, u[j], v_w[j]); }
-    let rs_width_step3 = if iter_idx + 1 < u.len() { iter_idx + 1 } else { u.len() };
-    for j in 0..rs_width_step3 { cswap(b, a_f, r[j], s[j]); }
+    #[test]
+    fn round8_output_side_cleanup_hook_fails_closed_until_emitter_exists() {
+        let mut b = B::new();
+        let tx = b.alloc_qubits(N);
+        let ty = b.alloc_qubits(N);
+        let ox = b.alloc_bits(N);
+        let oy = b.alloc_bits(N);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            round8_emit_output_side_cleanup_or_fail(&mut b, &tx, &ty, &ox, &oy, SECP256K1_P);
+        }))
+        .expect_err("output-side qtail hook must fail closed");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("panic has message");
+        assert!(message.contains("ROUND8_QTAIL_OUTPUT_SIDE_CLEANUP=1"));
+        assert!(message.contains("regular c=Rx-Qx inverse"));
+        assert!(message.contains("Round368 singular"));
+        assert!(message.contains("9024 Google"));
+    }
 
-    b.set_phase("kal_bulk_step4");
-    // Specialized STEP 4 with add_f = !b_f.
-    b.x(add_f);
-    b.cx(b_f, add_f);
-    {
-        let n = u.len();
-        let tmp = b.alloc_qubits(n);
-        for i in 0..n { b.ccx(add_f, u[i], tmp[i]); }
-        sub_nbit_qq_fast(b, &tmp, v_w);
-        let transform_width = if iter_idx + 1 < n { iter_idx + 1 } else { n };
-        for i in 0..transform_width { b.cx(r[i], u[i]); }
-        for i in 0..transform_width { b.ccx(add_f, u[i], tmp[i]); }
-        for i in 0..transform_width { b.cx(r[i], u[i]); }
-        let add_width = if iter_idx + 2 < n { iter_idx + 2 } else { n };
-        let mut tmp_slice: Vec<QubitId> = tmp[0..transform_width].to_vec();
-        let tmp_pad = if add_width > transform_width {
-            let q = b.alloc_qubit();
-            tmp_slice.push(q);
-            Some(q)
-        } else {
-            None
-        };
-        let s_slice: Vec<QubitId> = s[0..add_width].to_vec();
-        add_nbit_qq_fast(b, &tmp_slice, &s_slice);
-        if let Some(q) = tmp_pad { b.free(q); }
-        for i in 0..n {
-            let m = b.alloc_bit();
-            b.hmr(tmp[i], m);
-            if i < transform_width {
-                b.cz_if(add_f, r[i], m);
-            } else {
-                b.cz_if(add_f, u[i], m);
+    #[test]
+    fn round8_output_side_regular_phase_repair_probe_is_separately_gated() {
+        let saved = std::env::var("ROUND8_QTAIL_OUTPUT_SIDE_REGULAR_PHASE_REPAIR").ok();
+        std::env::remove_var("ROUND8_QTAIL_OUTPUT_SIDE_REGULAR_PHASE_REPAIR");
+        assert!(!round8_qtail_output_side_regular_phase_repair_enabled());
+        std::env::set_var("ROUND8_QTAIL_OUTPUT_SIDE_REGULAR_PHASE_REPAIR", "1");
+        assert!(round8_qtail_output_side_regular_phase_repair_enabled());
+        match saved {
+            Some(value) => {
+                std::env::set_var("ROUND8_QTAIL_OUTPUT_SIDE_REGULAR_PHASE_REPAIR", value)
             }
+            None => std::env::remove_var("ROUND8_QTAIL_OUTPUT_SIDE_REGULAR_PHASE_REPAIR"),
         }
-        b.free_vec(&tmp);
     }
 
-    b.set_phase("kal_bulk_step5");
-    b.x(b_f);
-    {
-        let sm = b.alloc_bit();
-        b.hmr(add_f, sm);
-        b.cz_if(f1, b_f, sm);
+    #[test]
+    fn round8_qtail_round217_product_reuse_hook_is_env_gated() {
+        let saved = std::env::var("ROUND8_QTAIL_ROUND217_PRODUCT_REUSE").ok();
+        std::env::remove_var("ROUND8_QTAIL_ROUND217_PRODUCT_REUSE");
+        assert!(!round8_qtail_round217_product_reuse_enabled());
+        std::env::set_var("ROUND8_QTAIL_ROUND217_PRODUCT_REUSE", "1");
+        assert!(round8_qtail_round217_product_reuse_enabled());
+        match saved {
+            Some(value) => std::env::set_var("ROUND8_QTAIL_ROUND217_PRODUCT_REUSE", value),
+            None => std::env::remove_var("ROUND8_QTAIL_ROUND217_PRODUCT_REUSE"),
+        }
     }
-    b.x(b_f);
-    b.cx(m_i, b_f);
-    b.cx(a_f, b_f);
 
-    b.set_phase("kal_bulk_step6_7_8");
-    for i in 0..(u.len() - 1) { b.swap(v_w[i], v_w[i + 1]); }
-    if iter_idx < R_SMALL_THRESHOLD {
-        mod_double_no_corr(b, r);
+    #[test]
+    fn round8_qtail_round217_product_reuse_hook_fails_closed_before_body() {
+        let plan = round218_b5_transport::round218_b5_source_live_product_lowerer_body_plan();
+        assert!(!plan.body_emits_gates);
+        assert!(!plan.codegen_allowed_now);
+        assert_eq!(
+            plan.selected_route,
+            "round217_sampled_product_m2_contract_path"
+        );
+        assert!(plan
+            .phase_blocks
+            .iter()
+            .any(|block| block.phase.contains("hash_history")));
+    }
+
+    #[test]
+    fn round218_source_live_product_lowerer_plan_rejects_full_source_alias() {
+        let plan = round218_b5_transport::round218_b5_source_live_product_lowerer_body_plan();
+        assert!(!plan.body_emits_gates);
+        assert!(!plan.codegen_allowed_now);
+        assert!(plan
+            .phase_blocks
+            .iter()
+            .all(|block| !block.backend_primitive.contains("full_source_product")));
+        assert!(plan
+            .missing_object
+            .contains("promotable no-history qtail/Round217 product splice"));
+    }
+}
+
+fn set_default_env(name: &str, value: &str) {
+    if std::env::var_os(name).is_none() {
+        std::env::set_var(name, value);
+    }
+}
+
+const Q1153_SECOND512_SUBMISSION_NONCE: &str = "193806910775884";
+
+fn configure_q1153_second512_submission_defaults() {
+    set_default_env("DIALOG_TAIL_NONCE", Q1153_SECOND512_SUBMISSION_NONCE);
+    set_default_env("TLM_TARGET_Q", "1153");
+    set_default_env("TLM_FOLD_CHUNK_ZERO_CIN", "1");
+    set_default_env("TLM_FFG_MAX_G", "47");
+    set_default_env("TLM_APPLY_ADD_SKIP_LASTK", "1");
+    set_default_env("TLM_FOLD_TAIL_CINC", "1");
+    set_default_env("TLM_CODEC_DIAMOND_MCX", "1");
+    set_default_env("SINGLE_CCX_FANOUT_DISABLE", "0");
+
+    set_default_env("TLM_FFG_RELEASE_CY0_DURING_SUFFIX", "1");
+    set_default_env("TLM_FFG_RELEASE_CY0_CALLS", "178,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,203,208,210,211,212,213,215,217,219,221,226,232,234,235,236,237,239");
+    set_default_env("TLM_APPLY_FWD_CSWAP_SKIP_LAST", "3");
+    set_default_env("TLM_COORD_RSUB_FUSED", "1");
+    set_default_env("TLM_SQUARE_VENT_MARGIN", "0");
+    set_default_env("TLM_COORD_ADD3X_TRUNC", "1");
+    set_default_env("TLM_SQUARE_VENT_SHIFTED", "1");
+    set_default_env("TLM_SQUARE_SHIFTED128_LOW_TAGS", "a,b,c");
+    set_default_env("TLM_SQUARE_PEAK_CAP", "1153");
+    set_default_env("TLM_CUCCARO_SKIP_STRUCTURAL_DEAD_CALLS", "1");
+}
+
+fn configure_ecdsafail_submission_route() {
+    set_default_env("DIALOG_GCD_VENTED_BODY_ODD_LOWBIT", "1");
+    set_default_env("DIALOG_GCD_APPLY_CLEAN_COMPARE_BITS", "19");
+    set_default_env("DIALOG_GCD_WIDTH_SLOPE_X1000", "1015");
+    set_default_env("DIALOG_GCD_FOLD_CARRY_TRUNC_W", "18");
+    set_default_env("DIALOG_GCD_FOLD_FREE_FIRST_HIGH_CARRY", "1");
+
+    set_default_env("DIALOG_GCD_ACTIVE_ITERATIONS", "258");
+    set_default_env("DIALOG_GCD_APPLY_BOUNDARY_FREE_OWNED_DURING_REPLAY", "1");
+    set_default_env("DIALOG_GCD_APPLY_BORROW_FUTURE_BOUNDARY_CARRIES", "1");
+    set_default_env("DIALOG_GCD_APPLY_CHUNKED_F_BLOCKS", "20");
+    set_default_env(
+        "DIALOG_GCD_APPLY_CHUNKED_F_CUTS",
+        "17,34,50,66,81,96,110,124,137,150,163,175,187,198,209,219,229,238,247",
+    );
+    set_default_env("DIALOG_GCD_APPLY_CHUNKED_F_AUTO_TOPCLEAN_MAX_BITS", "2");
+    set_default_env("DIALOG_GCD_APPLY_CHUNKED_F_AUTO_TOPCLEAN_TARGET", "1168");
+    set_default_env("DIALOG_GCD_APPLY_CLEAN_COMPARE_BITS", "18");
+    set_default_env("DIALOG_GCD_APPLY_IMPLICIT_HIGH_ZERO", "1");
+    set_default_env("DIALOG_GCD_BINDER_NOTCH_EXTRA", "3");
+    set_default_env("DIALOG_GCD_BINDER_NOTCH_MAP", "11:1,12:1,13:1");
+    set_default_env("DIALOG_GCD_BINDER_NOTCH_STEPS", "8,9,10");
+    set_default_env(
+        "DIALOG_GCD_BODY_CARRY_BAND_TRIMS",
+        "0,3,3,3,3,3,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,3,3,3",
+    );
+    set_default_env("DIALOG_GCD_COMPARE_BITS", "46");
+    set_default_env(
+        "DIALOG_GCD_COMPARE_STEP_BITS",
+        "181:48,194:48,199:48,202:48,207:48,212:48,216:48",
+    );
+    set_default_env(
+        "DIALOG_GCD_FOLD_CARRY_TRUNC_STEP_WINDOWS",
+        "",
+    );
+    set_default_env("DIALOG_GCD_FOLD_CARRY_TRUNC_W", "17");
+    set_default_env("DIALOG_GCD_FOLD_FREED_TAIL", "1");
+    set_default_env("DIALOG_GCD_FOLD_FREED_TAIL_ED", "1");
+    set_default_env("DIALOG_GCD_FOLD_HOST_DERIVED_CONTROLS", "1");
+    set_default_env("DIALOG_GCD_FOLD_HOST_E_TOP_CARRY", "1");
+    set_default_env("DIALOG_GCD_FOLD_MAJ1", "1");
+    set_default_env("DIALOG_GCD_FOLD_MAJ2", "1");
+    set_default_env("DIALOG_GCD_FOLD_PARK_LOW_CARRIES", "15");
+    set_default_env(
+        "DIALOG_GCD_FOLD_PARK_LOW_CARRIES_STEP_MAP",
+        "0:17,3:16,8:16,9:16,10:16,21:17,22:16,24:16,26:16,33:16,34:16,37:17,41:16,42:17,51:16,55:16,65:17,73:16,77:16,81:16,82:16,86:16,87:16,97:16,104:16,109:16,110:16,120:16,129:16,132:17,134:16,141:17,142:16,146:16,157:16,160:16,169:16,170:17,174:16,177:16,191:16,192:16,198:16,205:16,206:16,212:16,215:16,216:16,217:16,224:17,228:16",
+    );
+    set_default_env("DIALOG_GCD_FOLD_STREAM_CONTROLS", "1");
+    set_default_env("DIALOG_FUSE_C_FORM", "1");
+    set_default_env("DIALOG_FUSE_X_RESTORE", "1");
+    set_default_env("DIALOG_GCD_K2", "1");
+    set_default_env("DIALOG_GCD_K5_CLEAN_BLOCK", "1");
+    set_default_env("DIALOG_GCD_K5_FIXED_TAIL_APPLY", "0");
+    set_default_env("DIALOG_GCD_K5_FREE_CLEAN_BLOCK_DURING_SHIFT", "1");
+    set_default_env("DIALOG_GCD_K5_HEAD11_CODEC", "1");
+    set_default_env("DIALOG_GCD_K5_HEAD11_STREAM_PAIR_APPLY", "1");
+    set_default_env("DIALOG_GCD_K5_HEAD11_SPLIT_PAIR_SHIFT_APPLY", "1");
+    set_default_env("DIALOG_GCD_K5_HEAD11_PAIR01_S2_PERMUTE_APPLY", "1");
+    set_default_env(
+        "DIALOG_GCD_K5_HEAD11_PAIR23_S2_BORROW_PAIR01_APPLY",
+        "1",
+    );
+    set_default_env("DIALOG_GCD_K5_PARTIAL_RAW_RELEASE", "8");
+    set_default_env("DIALOG_GCD_K5_RELEASE_SCALE_BITS", "5");
+    set_default_env("DIALOG_GCD_K5_STREAM_PAIR_APPLY", "1");
+    set_default_env("DIALOG_GCD_K5_TAIL3_FIXED_LAST", "0");
+    set_default_env("DIALOG_GCD_K5_TAIL3_TOP32_CODEC", "1");
+    set_default_env("DIALOG_GCD_K5_TAIL3_TOP32_STREAM_APPLY", "1");
+    set_default_env("DIALOG_GCD_K5_TAIL3_TOP32_SPLIT_SLOT_APPLY", "1");
+    set_default_env("DIALOG_GCD_K5_TAIL3_TOP32_FINAL_S2_CONST_APPLY", "1");
+    set_default_env("DIALOG_GCD_ODD_U_LOWBIT_FASTPATH", "1");
+    set_default_env("DIALOG_GCD_PA9024_COMPARE_SCHEDULE", "1");
+    set_default_env("DIALOG_GCD_PA9024_COMPARE_SCHEDULE_MARGIN", "0");
+    set_default_env("DIALOG_GCD_PERPOS_MAJ2", "1");
+    set_default_env("DIALOG_GCD_RAW_IPMUL_CLEAR_P_RESIDUAL", "1");
+    set_default_env("DIALOG_GCD_RAW_TOBITVECTOR_MATERIALIZED_SUB", "0");
+    set_default_env("DIALOG_GCD_RAW_TOBITVECTOR_VARIABLE_WIDTH", "1");
+    set_default_env("DIALOG_GCD_RUNWAY_PARTIAL_BLOCK", "1");
+    set_default_env("DIALOG_GCD_SKIP_ZERO_EDGE_CSHIFT", "1");
+    set_default_env("DIALOG_GCD_SPECIAL_FOLD_BORROW_CARRIES", "1");
+    set_default_env(
+        "DIALOG_GCD_SPECIAL_FOLD_CARRY_TRUNC_STEP_WINDOWS",
+        "10:19,11:19,21:20,63:19,74:19,100:19,107:19,110:19,118:19,135:19,136:19,137:19,188:20,204:19,227:20,241:19",
+    );
+    set_default_env("DIALOG_GCD_SPECIAL_FOLD_PARK_LOW_CARRIES", "16");
+    set_default_env(
+        "DIALOG_GCD_SPECIAL_FOLD_PARK_LOW_CARRIES_STEP_MAP",
+        "",
+    );
+    set_default_env("DIALOG_GCD_SPECIAL_FOLD_RELEASE_SCRATCH", "1");
+    set_default_env(
+        "DIALOG_GCD_SPECIAL_OVERFLOW_CLEAN_STEP_BITS",
+        "1:24,4:21,6:25,7:20,10:22,11:20,19:21,21:21,22:21,23:23,28:21,30:22,32:20,33:24,34:25,48:21,49:22,55:22,62:23,64:20,66:21,71:22,86:20,92:21,113:21,116:21,118:20,119:24,120:21,121:20,127:20,129:22,131:22,142:22,144:21,145:23,147:21,151:23,153:23,154:23,155:20,156:24,159:22,161:24,165:21,166:21,168:21,173:20,175:21,178:21,184:22,185:20,187:23,188:22,190:20,193:21,194:22,196:20,197:21,199:21,203:22,205:22,209:20,210:21,213:20,217:22,221:21,222:23,229:21,236:21,241:21",
+    );
+    set_default_env(
+        "DIALOG_GCD_SPECIAL_UNDERFLOW_CLEAN_STEP_BITS",
+        "3:21,5:21,10:23,11:22,14:22,17:20,27:22,33:20,34:22,38:21,42:22,47:21,50:22,51:21,53:20,54:21,58:21,60:21,65:21,67:23,68:25,73:20,74:20,75:23,77:21,78:20,84:21,89:23,91:22,95:22,98:26,103:21,109:22,110:22,114:22,118:22,127:26,135:20,136:20,137:22,143:21,149:21,152:20,154:26,155:20,156:22,157:20,158:26,166:20,178:20,181:20,186:24,188:25,191:21,194:20,198:20,200:21,201:21,202:23,203:23,204:22,212:25,213:20,214:22,221:20,223:21,228:21,231:23,243:21,246:20",
+    );
+    set_default_env("DIALOG_GCD_TOBITVECTOR_CSWAP_BODY_TRIM", "0");
+    set_default_env("DIALOG_GCD_WIDTH_MARGIN", "10");
+    set_default_env("DIALOG_GCD_WIDTH_SLOPE_X1000", "1017");
+    set_default_env("LUD_EXTRA_FOLD_VENTS", "1");
+    set_default_env("LUD_EXTRA_FOLD_MIN_G", "24");
+    set_default_env("KAL_DOUBLE_CARRY_TRUNC_W", "19");
+    set_default_env("KAL_FOLD_CARRY_TRUNC_W", "18");
+    set_default_env("SQUARE_ROW_MAX_SEG", "141");
+    set_default_env("SQUARE_ROW_WINDOW_CLEAN_COMPARE_BITS", "18");
+    set_default_env(
+        "SQUARE_ROW_WINDOW_CLEAN_ROW_BITS",
+        "2:20,11:20,12:20,13:21,16:22,19:20,20:21,21:20,26:21,29:21,32:21,37:21,44:22,46:20,53:21,56:20,64:20,70:20,75:20,78:20,87:20",
+    );
+    set_default_env(
+        "SQUARE_ROW_WINDOW_CLEAN_SITE_BITS",
+        "1:0:f:19,3:0:r:21,9:0:f:22,10:0:r:21,13:0:r:22,14:0:r:20,15:0:r:19,17:0:r:20,26:0:f:22,36:0:f:20,38:0:f:20,38:0:r:20,39:0:r:19,40:0:r:22,41:0:r:19,42:0:r:20,43:0:r:19,45:0:r:19,47:0:f:22,47:0:r:19,48:0:r:20,50:0:f:22,50:0:r:22,51:0:f:22,54:0:f:19,57:0:r:19,59:0:f:19,60:0:f:19,62:0:f:22,62:0:r:21,63:0:f:20,65:0:f:19,66:0:f:21,66:0:r:21,67:0:f:19,68:0:r:21,71:0:r:20,72:0:f:21,73:0:r:21,74:0:r:19,76:0:r:21,79:0:r:20,81:0:f:20,83:0:r:22,89:0:r:19,90:0:r:21,91:0:f:21,92:0:r:21,95:0:r:20,97:0:r:21,102:0:f:20,103:0:r:19,104:0:r:19,107:0:f:20,109:0:f:21,110:0:f:19,110:0:r:20",
+    );
+    set_default_env("SQUARE_ROW_WINDOW_MEASURED_CARRY_CLEAR", "1");
+
+    set_default_env("SKIP_ALT_SEED_CHECKS", "1");
+    set_default_env("DIALOG_GCD_COMPRESSED_SIDECAR_LOG", "1");
+
+    set_default_env("SQUARE_ROW_WINDOW_CLEAN_COMPARE_BITS", "21");
+    set_default_env("SQUARE_ROW_WINDOW_MEASURED_CARRY_CLEAR", "1");
+    set_default_env("ROUND84_KEEP_QUOTIENT_PRODUCT", "1");
+    set_default_env("DIALOG_GCD_FOLD_CARRY_TRUNC_W", "17");
+    set_default_env("DIALOG_GCD_SKIP_ZERO_EDGE_CSHIFT", "1");
+    set_default_env("DIALOG_GCD_COMPRESSED_BLOCK_LIFECYCLE", "1");
+    set_default_env("DIALOG_GCD_HOST_REVERSE_RAW_BLOCK", "1");
+    set_default_env("DIALOG_GCD_COMPRESSED_LOG_U_HIGH_RUNWAY", "1");
+    set_default_env("DIALOG_GCD_COMPRESSED_LOG_U_HIGH_RUNWAY_BLOCKS", "999");
+    set_default_env("DIALOG_GCD_COMPOSITE_SCRATCH", "1");
+
+    set_default_env("DIALOG_GCD_BORROW_CURRENT_BLOCK", "1");
+
+    set_default_env("DIALOG_GCD_CTRL_BODY_VENTED", "1");
+    set_default_env("DIALOG_GCD_APPLY_REPLAY_SWAP_HOST", "1");
+    set_default_env("SQUARE_SELFHOST_SAFE_LANE_REUSE", "1");
+    set_default_env("SQUARE_SELFHOST_GATE_SUFFIX_CARRIES", "0");
+
+    set_default_env("DIALOG_GCD_PA9024_COMPARE_SCHEDULE", "1");
+
+    set_default_env("DIALOG_GCD_PA9024_COMPARE_SCHEDULE_MARGIN", "0");
+
+    set_default_env("KAL_DOUBLE_CARRY_TRUNC_W", "19");
+
+    set_default_env("KAL_FOLD_CARRY_TRUNC_W", "18");
+    set_default_env("DIALOG_GCD_ROUND763_DEDUP", "1");
+    set_default_env("DIALOG_GCD_ROUND763_COMPRESS_LEVER", "1");
+    set_default_env("DIALOG_GCD_MEASURED_UNDERFLOW_GATE", "1");
+
+    set_default_env("DIALOG_GCD_COMPARE_BITS", "46");
+
+    set_default_env("DIALOG_GCD_APPLY_CLEAN_COMPARE_BITS", "18");
+    set_default_env("DIALOG_GCD_APPLY_BOUNDARY_CONDITIONAL_REPLAY", "1");
+    set_default_env("DIALOG_GCD_SELECTED_BODY_STREAM_SUFFIX_MAP", "3:2,4:3,5:5,6:6,7:7,8:5,9:7,10:5,11:7,12:6,13:7,14:5,15:6,16:3,17:5,18:1,19:3,21:1");
+
+    set_default_env("DIALOG_GCD_REVERSE_BRANCH_CONDITIONAL_REPLAY", "1");
+    set_default_env("DIALOG_GCD_SPECIAL_CLEAN_CONDITIONAL_REPLAY", "1");
+    set_default_env("MOD_FAST_FLAG_CONDITIONAL_REPLAY", "1");
+    set_default_env("DIALOG_GCD_RAW_PA", "1");
+    set_default_env("DIALOG_GCD_K2", "1");
+
+    set_default_env("DIALOG_GCD_APPLY_FUSED_FOLD", "1");
+
+    set_default_env("DIALOG_GCD_K2_PAIR_COMPRESS", "1");
+
+    set_default_env("DIALOG_GCD_ACTIVE_ITERATIONS", "258");
+    set_default_env("DIALOG_GCD_PERPOS_MAJ2", "1");
+    set_default_env("DIALOG_GCD_FUSED_HCLEAR_MEASURED", "1");
+    set_default_env("DIALOG_GCD_FUSED_DCLEAR_MEASURED", "1");
+    set_default_env("DIALOG_GCD_FUSED_HALVE_EDCLEAR_MEASURED", "1");
+    set_default_env("DIALOG_GCD_RAW_IPMUL_TERMINAL_REUSE", "1");
+    set_default_env("DIALOG_GCD_RAW_IPMUL_CLEAR_P_RESIDUAL", "1");
+    set_default_env("DIALOG_GCD_RAW_QUOTIENT_TERMINAL_REUSE", "1");
+    set_default_env("DIALOG_GCD_RAW_APPLY_REVERSE_MATERIALIZED_SPECIAL_SUB", "1");
+    set_default_env("DIALOG_GCD_RAW_APPLY_MATERIALIZED_SPECIAL_ADD", "1");
+    set_default_env("DIALOG_GCD_RAW_APPLY_TRUNCATED_CLEAN", "1");
+
+    set_default_env("DIALOG_GCD_RAW_TOBITVECTOR_MATERIALIZED_SUB", "0");
+    set_default_env("DIALOG_GCD_RAW_TOBITVECTOR_VARIABLE_WIDTH", "1");
+    set_default_env("DIALOG_GCD_RAW_TOBITVECTOR_BORROW_FUTURE_LOG_CARRIES", "1");
+
+    set_default_env("ROUND84_XTAIL_KARATSUBA", "0");
+
+    set_default_env("KARA_SOL_DBL_FAST", "1");
+
+    set_default_env("KARA_FREE_Z1_TOPBIT", "1");
+
+    set_default_env("DIALOG_GCD_WIDTH_MARGIN", "10");
+
+    set_default_env("DIALOG_GCD_MEASURED_APPLY_SUB", "1");
+
+    set_default_env("DIALOG_GCD_HOST_GATED", "1");
+    set_default_env("DIALOG_GCD_APPLY_WINDOW_BLOCKS", "2");
+
+    set_default_env("ROUND84_XTAIL_BORROW_CARRIES", "1");
+
+    set_default_env("DIALOG_GCD_APPLY_CHUNKED_F_BLOCKS", "16");
+    set_default_env("DIALOG_GCD_APPLY_CHUNKED_F_CUSTOM4", "0");
+    set_default_env("DIALOG_GCD_APPLY_CHUNKED_F_CUSTOM5", "0");
+
+    set_default_env("KARA_Z02_LOWQ", "1");
+    set_default_env("KARA_Z2_SELFHOST", "1");
+    set_default_env("KARA_SOL_MOD_VENT", "1");
+
+    set_default_env("DIALOG_GCD_BRANCH_BITS_HOST_COMPARATOR", "1");
+
+    set_default_env("DIALOG_GCD_BODY_HOST_CIN", "1");
+    set_default_env("DIALOG_GCD_LATE_BORROW_UV_HIGH", "1");
+
+    set_default_env("DIALOG_GCD_BODY_CARRY_BAND_TRIMS", "0,3,3,3,3,3,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,3,3,3");
+    set_default_env("DIALOG_GCD_TOBITVECTOR_CSWAP_BODY_TRIM", "0");
+    set_default_env("DIALOG_GCD_BINDER_NOTCH_STEPS", "8,9,10");
+    set_default_env("DIALOG_GCD_BINDER_NOTCH_EXTRA", "3");
+    set_default_env("DIALOG_GCD_BINDER_NOTCH_MAP", "11:1,12:1,13:1");
+    set_default_env(
+        "DIALOG_GCD_SPECIAL_OVERFLOW_CLEAN_STEP_BITS",
+        "113:21,131:21,142:22,187:23,205:22,210:21",
+    );
+    set_default_env(
+        "DIALOG_GCD_SPECIAL_UNDERFLOW_CLEAN_STEP_BITS",
+        "42:22,91:22,118:22,149:21",
+    );
+    set_default_env("DIALOG_GCD_FUSED_OVFCLEAR_MEASURED", "1");
+
+    set_default_env("DIALOG_GCD_APPLY_FINAL_LOWQ", "0");
+
+    set_default_env("R84_LOWQ", "1");
+    set_default_env("R84_LOWQ_CIN_BORROW", "1");
+    set_default_env("R84_QPROD_NAF", "1");
+
+    set_default_env("ROUND84_INPLACE_SOLINAS_FOLD", "1");
+    set_default_env("ROUND84_INPLACE_QUOTIENT_CARRY_TRUNC_W", "21");
+
+    set_default_env("SQUARE_ROW_MAX_SEG", "176");
+    set_default_env("DIALOG_GCD_K5_CLEAN_BLOCK", "1");
+    set_default_env("DIALOG_GCD_FOLD_PARK_LOW_CARRIES", "1");
+    set_default_env("DIALOG_GCD_SPECIAL_FOLD_BORROW_CARRIES", "1");
+    set_default_env("DIALOG_GCD_K2_APPLY_INPLACE_RAW_BLOCK", "1");
+    set_default_env("DIALOG_GCD_FOLD_FREED_TAIL", "1");
+    set_default_env("DIALOG_GCD_BORROW_CURRENT_S2", "1");
+    set_default_env("DIALOG_GCD_BORROW_ZERO_RAW_FUTURE", "1");
+    set_default_env("DIALOG_GCD_FREE_SCRATCH_BEFORE_SHIFT", "1");
+    set_default_env("DIALOG_GCD_APPLY_BOUNDARY_SPLIT", "100");
+    set_default_env("DIALOG_GCD_APPLY_CHUNKED_F_CUT", "50");
+    set_default_env("DIALOG_GCD_APPLY_CHUNKED_F_CUT2", "100");
+    set_default_env("DIALOG_GCD_APPLY_CHUNKED_F_CUT3", "150");
+    set_default_env("DIALOG_GCD_APPLY_CHUNKED_F_CUT4", "190");
+
+    set_default_env("DIALOG_GCD_WIDTH_SLOPE_X1000", "1017");
+
+    set_default_env("DIALOG_REROLL", "4269");
+    set_default_env("DIALOG_POST_SUB_REROLL", "503292");
+
+    set_default_env("DIALOG_GCD_SELECTED_BODY_NOCIN", "1");
+
+    set_default_env("ROUND84_FOLD_FAST_ADD", "0");
+    set_default_env("DIALOG_GCD_FOLD_MAJ2", "1");
+    set_default_env("DIALOG_GCD_FOLD_MAJ1", "1");
+    set_default_env("DIALOG_GCD_APPLY_FINAL_TOPCLEAN", "0");
+    set_default_env("ROUND84_QPROD_VENT_PAD", "1");
+    set_default_env("DIALOG_GCD_FOLD_FREED_TAIL_ED", "1");
+    set_default_env("DIALOG_GCD_APPLY_FINAL_WINDOWED_FAST_BLOCKS", "0");
+
+    set_default_env("DIALOG_GCD_FUSED_BRANCH_BITS", "1");
+
+    set_default_env("DIALOG_GCD_ODD_U_LOWBIT_FASTPATH", "1");
+}
+
+pub fn build_builder() -> B {
+    configure_ecdsafail_submission_route();
+
+    let mut builder = if std::env::var("POINT_ADD_COUNT_ONLY").ok().as_deref() == Some("1") {
+        B::new_count_only()
     } else {
-        mod_double_inplace_fast(b, r, p);
-    }
+        B::new()
+    };
+    let b = &mut builder;
 
-    b.set_phase("kal_bulk_step9_cswap");
-    for j in 0..u.len() { cswap(b, a_f, u[j], v_w[j]); }
-    let rs_width_step9 = if iter_idx + 2 < u.len() { iter_idx + 2 } else { u.len() };
-    for j in 0..rs_width_step9 { cswap(b, a_f, r[j], s[j]); }
-
-    b.x(s[0]);
-    b.cx(s[0], a_f);
-    b.x(s[0]);
-
-    b.x(f1);
-    b.free(f1);
-    b.free(add_f);
-    b.free(b_f);
-    b.free(a_f);
-    b.set_phase(_kal_saved_phase);
-}
-
-fn kaliski_iteration(
-    b: &mut B,
-    p: U256,
-    u: &[QubitId],
-    v_w: &[QubitId],
-    r: &[QubitId],
-    s: &[QubitId],
-    m_i: QubitId,
-    f: QubitId,
-    iter_idx: usize,
-) {
-    let n = u.len();
-    // Iter-local flags (zero at iter start and iter end): alloc fresh here
-    // so they don't live during body (which sees lower peak by -3 qubits).
-    let a_f = b.alloc_qubit();
-    let b_f = b.alloc_qubit();
-    let add_f = b.alloc_qubit();
-
-    let _kal_saved_phase = b.phase;
-    b.set_phase("kal_step0_eqzero");
-    // ─── STEP 0: is_zero = (v_w == 0);  m[i] ^= (f AND is_zero);  f ^= m[i] ───
-    // Truncated OR chain for late iter: v_w's bits [2n-iter..n-1] are 0
-    // (Kaliski invariant), so OR only of low 2n-iter bits suffices.
-    let or_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-    with_eq_zero_fast(b, &v_w[0..or_width], add_f, |b| {
-        b.ccx(f, add_f, m_i);
-    });
-    b.cx(m_i, f);
-
-    b.set_phase("kal_step1");
-    // ─── STEP 1 ───
-    //   a ^= (f=1 AND u[0]=0)
-    //   m[i] ^= (f=1 AND a=0 AND v_w[0]=0)  [= f AND u[0] AND NOT v_w[0]]
-    //   b ^= a; b ^= m[i]
-    //
-    // Shared-intermediate trick: compute z = f AND u[0] once into b_f
-    // (known 0 here), then derive a_f = f XOR z = f AND NOT u[0] via CX,
-    // and update m_i via ccx(z, NOT v_w[0], m_i). Uncompute z, then set
-    // b_f to a_f XOR m_i as before. Saves 1 CCX per iter vs mcx2+mcx3.
-    b.ccx(f, u[0], b_f);                  // b_f = f AND u[0] (z)
-    b.cx(f, a_f);
-    b.cx(b_f, a_f);                       // a_f = f XOR z = f AND NOT u[0]
-    b.x(v_w[0]);
-    b.ccx(b_f, v_w[0], m_i);              // m_i ^= z AND NOT v_w[0]
-    b.x(v_w[0]);
-    // Measurement-uncompute z (= f AND u[0]) from b_f: 0 CCX.
-    {
-        let zm = b.alloc_bit();
-        b.hmr(b_f, zm);
-        b.cz_if(f, u[0], zm);
-    }
-    b.cx(a_f, b_f);
-    b.cx(m_i, b_f);                       // b_f = a_f XOR m_i
-
-    // ─── STEP 2: with l = u > v_w: a ^= (f AND l AND ¬b); m_i ^= same.
-    // Late-iter: u and v_w have bitlen ≤ 2n-iter, so only compare low 2n-iter bits.
-    let cmp_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-    let l_gt = b.alloc_qubit();
-    with_gt(b, &u[0..cmp_width], &v_w[0..cmp_width], l_gt, |b| {
-        b.x(b_f);                          // negate polarity of b_f
-        b.ccx(f, l_gt, add_f);             // add_f = f AND l_gt
-        // Fuse two CCX with same (add_f, b_f) controls: compute once into
-        // a fresh ancilla, fan out via CX, measurement-uncompute. Saves 1 CCX.
-        let t = b.alloc_qubit();
-        b.ccx(add_f, b_f, t);              // t = add_f AND ¬b_f_orig
-        b.cx(t, a_f);                      // a_f ^= t
-        b.cx(t, m_i);                      // m_i ^= t
-        {
-            let tm = b.alloc_bit();
-            b.hmr(t, tm);
-            b.cz_if(add_f, b_f, tm);
-        }
-        b.free(t);
-        // Measurement-uncompute add_f (= f AND l_gt): 0 CCX.
-        {
-            let am = b.alloc_bit();
-            b.hmr(add_f, am);
-            b.cz_if(f, l_gt, am);
-        }
-        b.x(b_f);
-    });
-    b.free(l_gt);
-
-    b.set_phase("kal_step3_cswap");
-    // ─── STEP 3: with control(a): swap(u, v_w); swap(r, s) ───
-    // Late-iter truncation: Kaliski invariant: bitlen(u) + bitlen(v_w) ≤ 2n-iter,
-    // so u[j]=v_w[j]=0 for j >= 2n-iter_idx. Truncate (u,v_w) cswap.
-    // Small-iter truncation: max(r,s) ≤ 2^iter_idx, so r[j]=s[j]=0 for j >= iter_idx+1.
-    let uv_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-    for j in 0..uv_width { cswap(b, a_f, u[j], v_w[j]); }
-    let rs_width_step3 = if iter_idx + 1 < n { iter_idx + 1 } else { n };
-    for j in 0..rs_width_step3 { cswap(b, a_f, r[j], s[j]); }
-
-    b.set_phase("kal_step4");
-    // ─── STEP 4 ───
-    //   add ^= (f=1 AND b=0)
-    //   with control(add): v_w -= u; s += r
-    //
-    // Fused dual controlled sub+add: reuse one tmp register across both ops.
-    // Load tmp = add_f AND u, do sub on v_w, then transform tmp to
-    // add_f AND r in place (without unloading + reloading) by temporarily
-    // XOR'ing r into u and re-applying ccx(add_f, u, tmp), then add tmp to
-    // s and unload. Saves n CCX/iter.
-    mcx2_polar(b, f, true, b_f, false, add_f);
-    {
-        let tmp = b.alloc_qubits(n);
-        // Load tmp = add_f AND u. Late-iter bound: u[i]=0 for i >= 2n-iter.
-        let load_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-        for i in 0..load_width { b.ccx(add_f, u[i], tmp[i]); }
-        // Sub v_w -= tmp. Late-iter: both high bits 0, truncate to load_width.
-        let tmp_sub_slice: Vec<QubitId> = tmp[0..load_width].to_vec();
-        let v_w_sub_slice: Vec<QubitId> = v_w[0..load_width].to_vec();
-        sub_nbit_qq_fast(b, &tmp_sub_slice, &v_w_sub_slice);
-        // Transform tmp from "add_f AND u" to "add_f AND r".
-        // Small-iter: only the low iter+1 bits of r can be nonzero; the
-        // carry slot for s += r is handled by an explicit 0 pad instead of a
-        // useless extra CCX on a known-zero r bit.
-        // Late-iter: full transform (r unbounded but u high bits 0 so CCX at
-        // high bits effectively produces add_f AND r from tmp=0).
-        let transform_width = if iter_idx + 1 < n { iter_idx + 1 } else { n };
-        for i in 0..transform_width { b.cx(r[i], u[i]); }
-        for i in 0..transform_width { b.ccx(add_f, u[i], tmp[i]); }
-        for i in 0..transform_width { b.cx(r[i], u[i]); }
-        // Add s += tmp. Small-iter still needs one extra carry slot above the
-        // live r bits, but that top input bit is known 0.
-        let add_width = if iter_idx + 2 < n { iter_idx + 2 } else { n };
-        let mut tmp_slice: Vec<QubitId> = tmp[0..transform_width].to_vec();
-        let tmp_pad = if add_width > transform_width {
-            let q = b.alloc_qubit();
-            tmp_slice.push(q);
-            Some(q)
-        } else {
-            None
-        };
-        let s_slice: Vec<QubitId> = s[0..add_width].to_vec();
-        add_nbit_qq_fast(b, &tmp_slice, &s_slice);
-        if let Some(q) = tmp_pad {
-            b.free(q);
-        }
-        // Unload: bits < transform_width have tmp = add_f AND r;
-        // bits [transform_width..load_width) have tmp = add_f AND u (transform skipped, load done);
-        // bits >= load_width have tmp = 0 (load skipped).
-        for i in 0..n {
-            let m = b.alloc_bit();
-            b.hmr(tmp[i], m);
-            if i < transform_width {
-                b.cz_if(add_f, r[i], m);
-            } else if i < load_width {
-                b.cz_if(add_f, u[i], m);
-            }
-            // else: tmp[i]=0, no phase correction needed.
-        }
-        b.free_vec(&tmp);
-    }
-
-    b.set_phase("kal_step5");
-    // ─── STEP 5: uncompute add; uncompute b ───
-    // Measurement-uncompute add_f = f AND (NOT b_f): 0 CCX.
-    b.x(b_f);
-    {
-        let sm = b.alloc_bit();
-        b.hmr(add_f, sm);
-        b.cz_if(f, b_f, sm);
-    }
-    b.x(b_f);
-    b.cx(m_i, b_f);
-    b.cx(a_f, b_f);
-
-    b.set_phase("kal_step6_7_8");
-    // ─── STEP 6: v_w := v_w / 2 (shift right by 1). Unconditional swap chain.
-    // Invariant: v_w[0]=0 before this step whether f=1 (STEP 4 made v_w even)
-    // or f=0 (algorithm terminated with v_w=0). Unconditional shift of 0 is 0.
-    // Saves 255 CCX per iter vs cswap-controlled version.
-    let _ = f;
-    for i in 0..(n - 1) { b.swap(v_w[i], v_w[i + 1]); }
-
-    // ─── STEP 7 + 8: r := 2*r mod p ───────────────────────────────────
-    // For iter_idx < R_SMALL_THRESHOLD, r's top bit is guaranteed 0 (since
-    // max(r,s) ≤ 2^iter_idx by induction). mod_double's Solinas correction
-    // is identity; a plain shift suffices. Saves ~255 CCX per small iter.
-    if iter_idx < R_SMALL_THRESHOLD {
-        mod_double_no_corr(b, r);
-    } else {
-        mod_double_inplace_fast(b, r, p);
-    }
-
-    b.set_phase("kal_step9_cswap");
-    // ─── STEP 9: with control(a): swap(u, v_w); swap(r, s) (again) ───
-    // Late-iter (u,v_w) truncation per Kaliski invariant (same as STEP 3).
-    // Small-iter (r,s) truncation: after STEP 4 s ≤ 2^{iter+1}, after STEP 7+8 r ≤ 2^{iter+1}.
-    let uv_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-    for j in 0..uv_width { cswap(b, a_f, u[j], v_w[j]); }
-    let rs_width_step9 = if iter_idx + 2 < n { iter_idx + 2 } else { n };
-    for j in 0..rs_width_step9 { cswap(b, a_f, r[j], s[j]); }
-
-    // ─── STEP 10: uncompute a via `a ^= NOT s[0]` ───
-    // After STEP 9's swap, the invariant (from qrisp) is that
-    //   a == NOT s[0]
-    // Hence `cx(NOT s[0], a)` zeros a.
-    b.x(s[0]);
-    b.cx(s[0], a_f);
-    b.x(s[0]);
-
-    // Free iter-local flags (all at 0 now).
-    b.free(add_f);
-    b.free(b_f);
-    b.free(a_f);
-    b.set_phase(_kal_saved_phase);
-}
-
-/// In-place classical-constant multiplication: v := v * c mod p.
-///
-/// Uses the standard compute-in-fresh-then-uncompute pattern:
-///   1. tmp = 0
-///   2. tmp += v * c                         (shift-and-add, classical c)
-///   3. v -= tmp * c^{-1} = v - v*c*c^{-1} = 0  (classical c^{-1})
-///   4. swap v, tmp
-///   5. free tmp
-fn in_place_mul_const(b: &mut B, v: &[QubitId], c: U256, p: U256) {
-    let n = v.len();
-    let tmp = b.alloc_qubits(n);
-    mul_by_const_acc(b, v, c, &tmp, p, false);       // tmp += v * c
-    let c_inv = classical_modinv(c, p);
-    mul_by_const_acc(b, &tmp, c_inv, v, p, true);    // v -= tmp * c_inv
-    for i in 0..n { b.swap(v[i], tmp[i]); }
-    b.free_vec(&tmp);
-}
-
-/// `acc ±= x * c mod p`. `c` is a classical constant. Does NOT fold acc.
-/// Maintains a doubling copy of x in a temp register; adds it to acc at
-/// positions where c has a bit set.
-fn mul_by_const_acc(
-    b: &mut B,
-    x: &[QubitId],
-    c: U256,
-    acc: &[QubitId],
-    p: U256,
-    subtract: bool,
-) {
-    let n = x.len();
-    if c == U256::ZERO { return; }
-
-    // tmp := x  (via CX copy)
-    let tmp = b.alloc_qubits(n);
-    for i in 0..n { b.cx(x[i], tmp[i]); }
-
-    // Iterate bits of c from LSB to MSB. At step i, tmp holds x * 2^i mod p.
-    // Add tmp to acc if bit i of c is set. Then double tmp for the next step.
-    //
-    // We iterate up through the highest set bit of c, plus any trailing zero
-    // bits (we must double enough times to make uncomputation clean).
-    let mut top = 0usize;
-    for i in 0..256 {
-        if bit(c, i) { top = i; }
-    }
-
-    for i in 0..=top {
-        if bit(c, i) {
-            if subtract {
-                mod_sub_qq_fast(b, acc, &tmp, p);
-            } else {
-                mod_add_qq_fast(b, acc, &tmp, p);
-            }
-        }
-        if i < top {
-            mod_double_inplace_fast(b, &tmp, p);
-        }
-    }
-
-    // At this point tmp = x * 2^top mod p. Halve it back `top` times to
-    // recover x, then uncompute via cx.
-    for _ in 0..top {
-        mod_halve_inplace_fast(b, &tmp, p);
-    }
-    for i in 0..n { b.cx(x[i], tmp[i]); }
-    b.free_vec(&tmp);
-}
-
-/// Persistent state for the Kaliski forward computation. Transients are
-/// allocated inside the iteration body; `emit_inverse` will correctly
-/// reverse them because it skips R ops (the free markers) in the reverse
-/// stream, and our forward guarantees each free lands on a |0⟩ qubit.
-struct KaliskiState {
-    u: Vec<QubitId>,       // n qubits
-    v_w: Vec<QubitId>,     // n qubits
-    r: Vec<QubitId>,       // n qubits
-    s: Vec<QubitId>,       // n qubits
-    m_hist: Vec<QubitId>,  // iters qubits
-    f_flag: QubitId,
-    // a_flag, b_flag, add_flag are iter-local: allocated fresh inside each
-    // kaliski_iteration / _backward and zeroed/freed at iter end. This
-    // saves 3 qubits of state live during body, dropping peak by 3.
-}
-
-fn alloc_kaliski_state(b: &mut B, n: usize, max_iters: usize) -> KaliskiState {
-    KaliskiState {
-        u: b.alloc_qubits(n),
-        v_w: b.alloc_qubits(n),
-        r: b.alloc_qubits(n),
-        s: b.alloc_qubits(n),
-        m_hist: b.alloc_qubits(max_iters),
-        f_flag: b.alloc_qubit(),
-    }
-}
-
-fn free_kaliski_state(b: &mut B, st: KaliskiState) {
-    b.free(st.f_flag);
-    b.free_vec(&st.m_hist);
-    b.free_vec(&st.s);
-    b.free_vec(&st.r);
-    b.free_vec(&st.v_w);
-    b.free_vec(&st.u);
-}
-
-/// Forward-only Kaliski computation. Reads `v_in` (never writes), populates
-/// `st.*` with the algorithm's intermediate state. After this returns:
-///   - `v_in` is unchanged
-///   - `st.r[..n]` holds the negative raw Kaliski coefficient
-///     `-v^{-1} * 2^iters mod p`
-///   - everything else in `st` is populated with deterministic iteration history
-///
-/// The caller is responsible for applying the classical correction factor
-/// `K = 2^{-2n} mod p` and for calling `emit_inverse(kaliski_forward)` to
-/// restore `st.*` to all zero.
-fn kaliski_forward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iters: usize) {
-    let n = v_in.len();
-    debug_assert!(iters <= st.m_hist.len());
-
-    // ─── Init ───
-    // u := p (classical load)
-    for i in 0..n { if bit(p, i) { b.x(st.u[i]); } }
-    // v_w := v_in  (CX-copy; v_in unchanged)
-    for i in 0..n { b.cx(v_in[i], st.v_w[i]); }
-    // s := 1
-    b.x(st.s[0]);
-    // f := 1
-    b.x(st.f_flag);
-
-    // ─── Iterations ───
-    let use_bulk_prefix3 = bulk_prefix_enabled();
-    let bulk_prefix_iters = bulk_prefix_safe_iters();
-    for i in 0..iters {
-        if use_bulk_prefix3 && i < bulk_prefix_iters {
-            kaliski_iteration_bulk_prefix3(
-                b, p, &st.u, &st.v_w, &st.r, &st.s,
-                st.m_hist[i],
-                i,
-            );
-        } else {
-            kaliski_iteration(
-                b, p, &st.u, &st.v_w, &st.r, &st.s,
-                st.m_hist[i],
-                st.f_flag,
-                i,
-            );
-        }
-    }
-
-    // After the loop for nonzero v_in, classical invariants give:
-    //   u = 1, v_w = 0, f = 0, a = b = add = 0
-    //   r = raw coefficient (the NEGATIVE form: r = -v^{-1} * 2^{2n} mod p)
-    //   s = some coefficient
-    // We skip the `x(r); add_nbit_const(r, p+1)` negation (~2n CCX per call,
-    // 4 calls total ≈ 8n Toffoli saved). Callers compensate by using the
-    // negated inv: body multiplications that would normally `mul_add` with
-    // +inv become `mul_sub` with -inv, and vice versa.
-}
-
-/// Like `with_eq_zero` but uses measurement-based uncomputation for the
-/// backward OR chain (0 Toffoli instead of n-1 CCX). NOT safe inside
-/// emit_inverse blocks (uses HMR ops).
-fn with_eq_zero_fast<F: FnOnce(&mut B)>(
-    b: &mut B,
-    v: &[QubitId],
-    flag: QubitId,
-    body: F,
-) {
-    let n = v.len();
-    assert!(n > 0);
-    if n == 1 {
-        b.x(v[0]);
-        b.cx(v[0], flag);
-        body(b);
-        b.cx(v[0], flag);
-        b.x(v[0]);
-        return;
-    }
-    let or_chain: Vec<QubitId> = b.alloc_qubits(n - 1);
-    // Forward OR chain (n-1 CCX)
-    or_step(b, v[0], v[1], or_chain[0]);
-    for i in 1..n - 1 {
-        or_step(b, or_chain[i - 1], v[i + 1], or_chain[i]);
-    }
-    b.x(or_chain[n - 2]);
-    b.cx(or_chain[n - 2], flag);
-    b.x(or_chain[n - 2]);
-    body(b);
-    b.x(or_chain[n - 2]);
-    b.cx(or_chain[n - 2], flag);
-    b.x(or_chain[n - 2]);
-    // Measurement-based uncompute (0 Toffoli)
-    for i in (1..n - 1).rev() {
-        or_step_uncompute(b, or_chain[i - 1], v[i + 1], or_chain[i]);
-    }
-    or_step_uncompute(b, v[0], v[1], or_chain[0]);
-    b.free_vec(&or_chain);
-}
-
-/// Measurement-based uncompute of one or_step: uncomputes
-/// `out = x OR y` using HMR + CZ (0 Toffoli).
-/// Precondition: out = x OR y (was computed by or_step(x, y, out)).
-/// After this: out = 0.
-fn or_step_uncompute(b: &mut B, x: QubitId, y: QubitId, out: QubitId) {
-    // out currently holds NOT((NOT x) AND (NOT y)) = x OR y.
-    // Flip to get the AND value: (NOT x) AND (NOT y).
-    b.x(out);
-    // Now match the AND controls: flip x and y.
-    b.x(x);
-    b.x(y);
-    let m = b.alloc_bit();
-    b.hmr(out, m);        // measure; out → 0
-    b.cz_if(x, y, m);    // phase correction with (NOT x_orig, NOT y_orig) controls
-    b.x(y);
-    b.x(x);
-}
-
-/// Reverse of the specialized `kaliski_iteration_bulk_prefix3` used for the
-/// first few guaranteed-bulk nonterminal iterations.
-fn kaliski_iteration_bulk_prefix3_backward(
-    b: &mut B,
-    u: &[QubitId],
-    v_w: &[QubitId],
-    r: &[QubitId],
-    s: &[QubitId],
-    m_i: QubitId,
-    iter_idx: usize,
-) {
-    let n = u.len();
-    let a_f = b.alloc_qubit();
-    let b_f = b.alloc_qubit();
-    let add_f = b.alloc_qubit();
-
-    let _kal_saved_phase = b.phase;
-
-    // Reverse STEP 10.
-    b.set_phase("bk_bulk_step10");
-    b.x(s[0]);
-    b.cx(s[0], a_f);
-    b.x(s[0]);
-
-    // Reverse STEP 9.
-    b.set_phase("bk_bulk_step9_cswap");
-    let rs_width_step9 = if iter_idx + 2 < n { iter_idx + 2 } else { n };
-    for j in (0..rs_width_step9).rev() { cswap(b, a_f, r[j], s[j]); }
-    for j in (0..n).rev() { cswap(b, a_f, u[j], v_w[j]); }
-
-    // Reverse STEP 8+7 and STEP 6.
-    b.set_phase("bk_bulk_step6_7_8");
-    mod_halve_no_corr(b, r);
-    for i in (0..(n - 1)).rev() { b.swap(v_w[i], v_w[i + 1]); }
-
-    // Reverse STEP 5.
-    b.set_phase("bk_bulk_step5");
-    b.cx(a_f, b_f);
-    b.cx(m_i, b_f);
-    b.x(add_f);
-    b.cx(b_f, add_f);
-
-    // Reverse STEP 4.
-    b.set_phase("bk_bulk_step4");
-    {
-        let tmp = b.alloc_qubits(n);
-        let load_width = if iter_idx + 1 < n { iter_idx + 1 } else { n };
-        for i in 0..load_width { b.ccx(add_f, r[i], tmp[i]); }
-        let sub_width = if iter_idx + 2 < n { iter_idx + 2 } else { n };
-        let tmp_sub_slice: Vec<QubitId> = tmp[0..sub_width].to_vec();
-        let s_slice: Vec<QubitId> = s[0..sub_width].to_vec();
-        sub_nbit_qq_fast(b, &tmp_sub_slice, &s_slice);
-        let transform_width = n;
-        for i in 0..transform_width { b.cx(r[i], u[i]); }
-        for i in 0..transform_width { b.ccx(add_f, u[i], tmp[i]); }
-        for i in 0..transform_width { b.cx(r[i], u[i]); }
-        let tmp_add_slice: Vec<QubitId> = tmp[0..n].to_vec();
-        let v_w_slice: Vec<QubitId> = v_w[0..n].to_vec();
-        add_nbit_qq_fast(b, &tmp_add_slice, &v_w_slice);
-        for i in 0..n {
-            let m = b.alloc_bit();
-            b.hmr(tmp[i], m);
-            b.cz_if(add_f, u[i], m);
-        }
-        b.free_vec(&tmp);
-    }
-    b.cx(b_f, add_f);
-    b.x(add_f);
-
-    // Reverse STEP 3.
-    b.set_phase("bk_bulk_step3_cswap");
-    let rs_width_step3 = if iter_idx + 1 < n { iter_idx + 1 } else { n };
-    for j in (0..rs_width_step3).rev() { cswap(b, a_f, r[j], s[j]); }
-    for j in (0..n).rev() { cswap(b, a_f, u[j], v_w[j]); }
-
-    // Reverse STEP 2.
-    b.set_phase("bk_bulk_step2");
-    let l_gt = b.alloc_qubit();
-    with_gt(b, u, v_w, l_gt, |b| {
-        b.x(b_f);
-        let t = b.alloc_qubit();
-        b.ccx(l_gt, b_f, t);
-        b.cx(t, m_i);
-        b.cx(t, a_f);
-        b.ccx(l_gt, b_f, t);
-        b.free(t);
-        b.x(b_f);
-    });
-    b.free(l_gt);
-
-    // Reverse STEP 1.
-    b.set_phase("bk_bulk_step1");
-    b.cx(m_i, b_f);
-    b.cx(a_f, b_f);
-    b.x(v_w[0]);
-    b.ccx(u[0], v_w[0], m_i);
-    b.x(v_w[0]);
-    b.cx(u[0], a_f);
-    b.x(a_f);
-
-    b.free(add_f);
-    b.free(b_f);
-    b.free(a_f);
-    b.set_phase(_kal_saved_phase);
-}
-
-/// Reverse of a single kaliski_iteration. Uses measurement-based
-/// uncomputation for the OR chain (with_eq_zero) and the step-4 tmp
-/// unload, saving ~511 CCX per iteration vs the gate-reversed version.
-fn kaliski_iteration_backward(
-    b: &mut B,
-    p: U256,
-    u: &[QubitId],
-    v_w: &[QubitId],
-    r: &[QubitId],
-    s: &[QubitId],
-    m_i: QubitId,
-    f: QubitId,
-    iter_idx: usize,
-) {
-    let n = u.len();
-    // Iter-local flags alloc'd fresh (zero at iter start in the backward
-    // direction). They are zeroed and freed at iter end to match forward.
-    let a_f = b.alloc_qubit();
-    let b_f = b.alloc_qubit();
-    let add_f = b.alloc_qubit();
-
-    let _kal_saved_phase = b.phase;
-    b.set_phase("bk_step10");
-    // Reverse STEP 10
-    // Matches forward's gated update.
-    b.x(s[0]);
-    b.ccx(f, s[0], a_f);
-    b.x(s[0]);
-
-    // ── Reverse STEP 9 ─────────────────────────────────────────────────
-    let rs_width_step9 = if iter_idx + 2 < n { iter_idx + 2 } else { n };
-    let uv_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-    b.set_phase("bk_step9_cswap");
-    for j in (0..rs_width_step9).rev() { cswap(b, a_f, r[j], s[j]); }
-    for j in (0..uv_width).rev() { cswap(b, a_f, u[j], v_w[j]); }
-
-    b.set_phase("bk_step6_7_8");
-    // Reverse STEP 8 + 7 ─────────────────────────────────────────────
-    // For iter_idx < R_SMALL_THRESHOLD, forward used mod_double_no_corr —
-    // r is guaranteed even (bit 0 = 0), so a plain shift-right inverts it.
-    if iter_idx < R_SMALL_THRESHOLD {
-        mod_halve_no_corr(b, r);
-    } else {
-        mod_halve_inplace_fast(b, r, p);
-    }
-
-    // ── Reverse STEP 6 (unconditional shift-left) ───────────
-    let _ = f;
-    for i in (0..(n - 1)).rev() { b.swap(v_w[i], v_w[i + 1]); }
-
-    b.set_phase("bk_step5");
-    // Reverse STEP 5 ─────────────────────────────────────────────────
-    b.cx(a_f, b_f);
-    b.cx(m_i, b_f);
-    mcx2_polar(b, f, true, b_f, false, add_f);
-
-    b.set_phase("bk_step4");
-    // Reverse STEP 4 (with measurement uncompute for unload) ─────────
-    {
-        let tmp = b.alloc_qubits(n);
-        // Load tmp = AND(add_f, r). Small-iter: r[i]=0 for i >= iter+1.
-        let load_width = if iter_idx + 1 < n { iter_idx + 1 } else { n };
-        for i in 0..load_width { b.ccx(add_f, r[i], tmp[i]); }
-        // Reversed (F): sub tmp from s. Small-iter width iter+2.
-        let sub_width = if iter_idx + 2 < n { iter_idx + 2 } else { n };
-        let tmp_sub_slice: Vec<QubitId> = tmp[0..sub_width].to_vec();
-        let s_slice: Vec<QubitId> = s[0..sub_width].to_vec();
-        sub_nbit_qq_fast(b, &tmp_sub_slice, &s_slice);
-        // Reversed (E): transform tmp from AND(add_f,r) → AND(add_f,u).
-        // Late-iter: u high bits 0, so transform at those bits: cx(r,u=0)→u=r,
-        //   ccx(add_f, u=r, tmp) flips tmp. tmp goes 0 → add_f AND r. Not what we
-        //   want (need add_f AND u=0). For late iter, truncate transform to uv_width.
-        let transform_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-        for i in 0..transform_width { b.cx(r[i], u[i]); }
-        for i in 0..transform_width { b.ccx(add_f, u[i], tmp[i]); }
-        for i in 0..transform_width { b.cx(r[i], u[i]); }
-        // Reversed (D): add tmp to v_w. Truncated to uv_width (late iter bound).
-        let add_width = transform_width;
-        let tmp_add_slice: Vec<QubitId> = tmp[0..add_width].to_vec();
-        let v_w_slice: Vec<QubitId> = v_w[0..add_width].to_vec();
-        add_nbit_qq_fast(b, &tmp_add_slice, &v_w_slice);
-        // Unload: bits < min(load_width, transform_width) both apply (tmp = add_f AND u after transform).
-        // For bits where transform was applied, tmp = add_f AND u. For bits where transform skipped
-        // (i >= transform_width), tmp stays at whatever load left it (either add_f AND r or 0).
-        for i in 0..n {
-            let m = b.alloc_bit();
-            b.hmr(tmp[i], m);
-            if i < transform_width {
-                // Transform applied: tmp = add_f AND u.
-                b.cz_if(add_f, u[i], m);
-            } else if i < load_width {
-                // Load done but transform skipped: tmp = add_f AND r.
-                b.cz_if(add_f, r[i], m);
-            }
-            // else: tmp = 0, no phase.
-        }
-        b.free_vec(&tmp);
-    }
-    // Reversed (A): measurement-uncompute add_f = f AND (NOT b_f)
-    b.x(b_f);
-    {
-        let sm = b.alloc_bit();
-        b.hmr(add_f, sm);
-        b.cz_if(f, b_f, sm);
-    }
-    b.x(b_f);
-
-    b.set_phase("bk_step3_cswap");
-    // Reverse STEP 3 ─────────────────────────────────────────────────
-    let rs_width_step3 = if iter_idx + 1 < n { iter_idx + 1 } else { n };
-    let uv_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-    for j in (0..rs_width_step3).rev() { cswap(b, a_f, r[j], s[j]); }
-    for j in (0..uv_width).rev() { cswap(b, a_f, u[j], v_w[j]); }
-
-    b.set_phase("bk_step2");
-    // Reverse STEP 2 (with_gt body is self-inverse) ──────────────────
-    let cmp_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-    let l_gt = b.alloc_qubit();
-    with_gt(b, &u[0..cmp_width], &v_w[0..cmp_width], l_gt, |b| {
-        b.x(b_f);
-        b.ccx(f, l_gt, add_f);
-        // Fuse two CCX with same (add_f, b_f) controls into one CCX + two CX
-        // + measurement uncompute. Saves 1 CCX per backward iter.
-        let t = b.alloc_qubit();
-        b.ccx(add_f, b_f, t);
-        b.cx(t, m_i);
-        b.cx(t, a_f);
-        {
-            let tm = b.alloc_bit();
-            b.hmr(t, tm);
-            b.cz_if(add_f, b_f, tm);
-        }
-        b.free(t);
-        // Measurement-uncompute add_f = f AND l_gt: 0 CCX.
-        {
-            let am = b.alloc_bit();
-            b.hmr(add_f, am);
-            b.cz_if(f, l_gt, am);
-        }
-        b.x(b_f);
-    });
-    b.free(l_gt);
-
-    b.set_phase("bk_step1");
-    // Reverse STEP 1 ─────────────────────────────────────────────────
-    b.cx(m_i, b_f);
-    b.cx(a_f, b_f);
-    b.ccx(f, u[0], b_f);
-    b.x(v_w[0]);
-    b.ccx(b_f, v_w[0], m_i);
-    b.x(v_w[0]);
-    b.cx(b_f, a_f);
-    b.cx(f, a_f);
-    // Measurement-uncompute z = f AND u[0] from b_f: 0 CCX.
-    {
-        let zm = b.alloc_bit();
-        b.hmr(b_f, zm);
-        b.cz_if(f, u[0], zm);
-    }
-
-    b.set_phase("bk_step0_eqzero");
-    // Reverse STEP 0 (with measurement uncompute of OR chain) ────────
-    // Truncated for late iter: only low 2n-iter bits of v_w are possibly nonzero.
-    b.cx(m_i, f);
-    {
-        let or_width = if iter_idx < n { n } else { 2 * n - iter_idx };
-        let nv = or_width;
-        if nv == 1 {
-            b.x(v_w[0]);
-            b.cx(v_w[0], add_f);
-            b.ccx(f, add_f, m_i);
-            b.cx(v_w[0], add_f);
-            b.x(v_w[0]);
-        } else {
-            let or_chain: Vec<QubitId> = b.alloc_qubits(nv - 1);
-            or_step(b, v_w[0], v_w[1], or_chain[0]);
-            for i in 1..nv - 1 {
-                or_step(b, or_chain[i - 1], v_w[i + 1], or_chain[i]);
-            }
-            b.x(or_chain[nv - 2]);
-            b.cx(or_chain[nv - 2], add_f);
-            b.x(or_chain[nv - 2]);
-            // Body
-            b.ccx(f, add_f, m_i);
-            // Uncompute flag
-            b.x(or_chain[nv - 2]);
-            b.cx(or_chain[nv - 2], add_f);
-            b.x(or_chain[nv - 2]);
-            // Measurement-based uncompute of OR chain (0 Toffoli)
-            for i in (1..nv - 1).rev() {
-                or_step_uncompute(b, or_chain[i - 1], v_w[i + 1], or_chain[i]);
-            }
-            or_step_uncompute(b, v_w[0], v_w[1], or_chain[0]);
-            b.free_vec(&or_chain);
-        }
-    }
-
-    // Free iter-local flags (all at 0 now after backward steps).
-    b.free(add_f);
-    b.free(b_f);
-    b.free(a_f);
-    b.set_phase(_kal_saved_phase);
-}
-
-/// Explicit backward pass for kaliski_forward. Uses measurement-based
-/// uncomputation to save ~511 CCX per iteration vs emit_inverse.
-fn kaliski_backward(b: &mut B, v_in: &[QubitId], st: &KaliskiState, p: U256, iters: usize) {
-    let n = v_in.len();
-    debug_assert!(iters <= st.m_hist.len());
-
-    let use_bulk_prefix3 = bulk_prefix_enabled();
-    let bulk_prefix_iters = bulk_prefix_safe_iters();
-    // ─── Reverse iterations (in reverse order) ───
-    for i in (0..iters).rev() {
-        if use_bulk_prefix3 && i < bulk_prefix_iters {
-            kaliski_iteration_bulk_prefix3_backward(
-                b, &st.u, &st.v_w, &st.r, &st.s,
-                st.m_hist[i],
-                i,
-            );
-        } else {
-            kaliski_iteration_backward(
-                b, p, &st.u, &st.v_w, &st.r, &st.s,
-                st.m_hist[i],
-                st.f_flag,
-                i,
-            );
-        }
-    }
-
-    // ─── Reverse Init ───
-    b.x(st.f_flag);
-    b.x(st.s[0]);
-    for i in 0..n { b.cx(v_in[i], st.v_w[i]); }
-    for i in 0..n { if bit(p, i) { b.x(st.u[i]); } }
-}
-
-/// Run `body` with `inv` holding `v_in^{-1} mod p`, leaving `v_in`
-/// unchanged. Allocates the kaliski state and `inv` register itself, then
-/// frees them at the end. The body must NOT touch `st` or `v_in`.
-///
-/// Implementation keeps `st` live across the body, so we only run
-/// `kaliski_forward` ONCE (and its emit_inverse once), instead of the
-/// 4-call structure of the previous Bennett-cleaned `kal_compute_into`.
-/// Halves the dominant kaliski cost.
-fn emit_inverse_hmr_safe<F: FnOnce(&mut B)>(b: &mut B, f: F) {
-    let start = b.ops.len();
-    f(b);
-    let end = b.ops.len();
-    let fwd: Vec<_> = b.ops[start..end].to_vec();
-    b.ops.truncate(start);
-    for op in fwd.into_iter().rev() {
-        match op.kind {
-            OperationType::X
-            | OperationType::Z
-            | OperationType::CX
-            | OperationType::CZ
-            | OperationType::CCX
-            | OperationType::CCZ
-            | OperationType::Swap => b.ops.push(op),
-            OperationType::R
-            | OperationType::Hmr
-            | OperationType::Register
-            | OperationType::AppendToRegister
-            | OperationType::DebugPrint => {}
-            _ => panic!(
-                "emit_inverse_hmr_safe: non-invertible op kind {:?} inside forward block",
-                op.kind
-            ),
-        }
-    }
-}
-
-fn with_kal_inv_raw<F: FnOnce(&mut B, &[QubitId])>(
-    b: &mut B,
-    v_in: &[QubitId],
-    p: U256,
-    iters: usize,
-    body: F,
-) {
-    let n = v_in.len();
-    let mut st = alloc_kaliski_state(b, n, iters);
-
-    // Forward Kaliski. st.r[..n] holds raw = -v_in^{-1} * 2^iters mod p.
-    kaliski_forward(b, v_in, &st, p, iters);
-
-    // Kaliski invariant at end of forward (for nonzero v_in):
-    //   u = 1, v_w = 0, f = 0, s = some, r = negative scaled inverse.
-    // Free registers whose post-forward state is classically known:
-    //   v_w = 0 (free directly)
-    //   f_flag = 0 (free directly)
-    //   u = 1: X bit 0 to zero, then free
-    b.free_vec(&st.v_w);
-    b.free(st.f_flag);
-    b.x(st.u[0]);
-    b.free_vec(&st.u);
-
-    let r_low: Vec<QubitId> = st.r[..n].to_vec();
-    body(b, &r_low);
-
-    // Re-alloc at |0> for the backward pass; restore u[0] = 1.
-    st.u = b.alloc_qubits(n);
-    b.x(st.u[0]);
-    st.f_flag = b.alloc_qubit();
-    st.v_w = b.alloc_qubits(n);
-
-    // Experimental mode: use the exact reversed forward block shape, but skip
-    // HMR/R in the reverse replay. This is heavier than the explicit backward,
-    // but it keeps the specialized prefix and its matching global reverse in a
-    // single contract. The hope is to eliminate the residual phase mismatch.
-    if std::env::var("KAL_BULK3_GENERALIZED_REVERSE").is_ok() {
-        emit_inverse_hmr_safe(b, |b| kaliski_forward(b, v_in, &st, p, iters));
-    } else {
-        // Explicit backward pass (uses measurement-based uncompute, saves
-        // ~511 CCX per iteration vs the emit_inverse version).
-        kaliski_backward(b, v_in, &st, p, iters);
-    }
-
-    free_kaliski_state(b, st);
-}
-
-fn with_kal_inv<F: FnOnce(&mut B, &[QubitId])>(
-    b: &mut B,
-    v_in: &[QubitId],
-    p: U256,
-    iters: usize,
-    body: F,
-) {
-    with_kal_inv_raw(b, v_in, p, iters, |b, inv_raw| {
-        // Kaliski's raw output carries a 2^(2n-1) factor. Apply the
-        // correction in place when callers need the exact inverse.
-        for _ in 0..iters { mod_halve_inplace_fast(b, inv_raw, p); }
-        body(b, inv_raw);
-        for _ in 0..iters { mod_double_inplace_fast(b, inv_raw, p); }
-    });
-}
-
-fn kaliski_inv_inplace(b: &mut B, v_in: &[QubitId], p: U256) {
-    let n = v_in.len();
-    let iters = 2 * n - 114;
-
-    // Bennett compute-copy-uncompute pattern. Each call of
-    // `kaliski_inv_inplace` maps v_in ↔ v_in^{-1} (involution), with
-    // internal scratch fully zeroed by function end.
-    let st = alloc_kaliski_state(b, n, iters);
-    let output = b.alloc_qubits(n);
-
-    // ─── Phase 1: compute inverse of v_in into output ───
-    kaliski_forward(b, v_in, &st, p, iters);
-    // st.r[..n] now holds raw inverse (in mod 2p, low n bits).
-    // Apply classical correction: st.r[..n] *= K mod p, where K = 2^{-2n} mod p.
-    let two_2n = pow_mod_2_k(p, 2 * n);
-    let k_const = classical_modinv(two_2n, p);
-    in_place_mul_const(b, &st.r[..n], k_const, p);
-    // Copy exact inverse into output.
-    for i in 0..n { b.cx(st.r[i], output[i]); }
-    // Undo the correction: st.r[..n] *= K^{-1} mod p.
-    in_place_mul_const(b, &st.r[..n], two_2n, p);
-    // Now st is back to its post-kaliski_forward state. Reverse the forward.
-    emit_inverse(b, |b| kaliski_forward(b, v_in, &st, p, iters));
-    // st is all 0 again. v_in unchanged. output = v_in^{-1}.
-
-    // Swap v_in and output.
-    for i in 0..n { b.swap(v_in[i], output[i]); }
-    // v_in = inverse, output = v_orig.
-
-    // ─── Phase 2: zero output via a second Bennett pass ───
-    // Compute inverse of current v_in (which is v_orig^{-1}), = v_orig,
-    // and XOR it into output. Since output currently = v_orig, the XOR
-    // zeroes output.
-    kaliski_forward(b, v_in, &st, p, iters);
-    in_place_mul_const(b, &st.r[..n], k_const, p);
-    for i in 0..n { b.cx(st.r[i], output[i]); }   // output ^= v_orig = 0
-    in_place_mul_const(b, &st.r[..n], two_2n, p);
-    emit_inverse(b, |b| kaliski_forward(b, v_in, &st, p, iters));
-    // st all 0, output all 0 (hopefully), v_in = inverse.
-
-    b.free_vec(&output);
-    free_kaliski_state(b, st);
-}
-
-/// Classical: compute `2^k mod p`.
-fn pow_mod_2_k(p: U256, k: usize) -> U256 {
-    let mut r = U256::from(1);
-    let two = U256::from(2);
-    for _ in 0..k {
-        r = mulmod(r, two, p);
-    }
-    r
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Top-level point addition
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub fn build() -> Vec<Op> {
-    // The gate-efficient contest-ABI Qarton adaptation is the active candidate.
-    // Set LEGACY_POINT_ADD only for local comparison with the parent.
-    if std::env::var_os("LEGACY_POINT_ADD").is_none() {
-        return qarton_contest_gate_eff_port::build_contest_gate_eff_port();
-    }
-    let b = &mut B::new();
-    // Register 0: target_x (quantum)
     let tx = b.alloc_qubits(N);
     b.declare_qubit_register(&tx);
-    // Register 1: target_y (quantum)
+
     let ty = b.alloc_qubits(N);
     b.declare_qubit_register(&ty);
-    // Register 2: offset_x (classical bits)
+
     let ox = b.alloc_bits(N);
     b.declare_bit_register(&ox);
-    // Register 3: offset_y (classical bits)
+
     let oy = b.alloc_bits(N);
     b.declare_bit_register(&oy);
 
-    // Generated from the reviewed clean-point-add field/register derivation.
-    // The generated module records the canonical specification hash; operation
-    // stream equivalence remains an explicit build gate.
-    generated_point_add::emit_point_add(b, &tx, &ty, &ox, &oy);
+    if let Some(k) = std::env::var("DIALOG_REROLL")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&k| k > 0)
+    {
+        b.set_phase("dialog_reroll");
+        for _ in 0..k {
+            b.x(tx[0]);
+            b.x(tx[0]);
+        }
+    }
 
-    if std::env::var("TRACE_PEAK").is_ok() {
-        eprintln!("DEBUG peak_qubits={} at phase='{}' ops_idx={} total_ops={}", b.peak_qubits, b.peak_phase, b.peak_ops_idx, b.ops.len());
+    let p = SECP256K1_P;
+
+    mod_sub_qb(b, &tx, &ox, p);
+    mod_sub_qb(b, &ty, &oy, p);
+    if let Some(k) = std::env::var("DIALOG_POST_SUB_REROLL")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&k| k > 0)
+    {
+        b.set_phase("dialog_post_sub_reroll");
+        for _ in 0..k {
+            b.x(tx[1]);
+            b.x(tx[1]);
+        }
+    }
+
+    emit_dialog_gcd_raw_pa(b, &tx, &ty, &ox, &oy, p);
+
+    if !b.count_only && std::env::var("SKIP_ALT_SEED_CHECKS").ok().as_deref() != Some("1") {
+        run_alt_seed_checks(&b.ops);
+    }
+
+    if !b.count_only && std::env::var("TRACE_PEAK").is_ok() {
+        eprintln!(
+            "DEBUG peak_qubits={} at phase='{}' ops_idx={} total_ops={}",
+            b.peak_qubits,
+            b.peak_phase,
+            b.peak_ops_idx,
+            b.ops.len()
+        );
         let pk = b.peak_qubits;
-        let mut uniq: std::collections::BTreeMap<&'static str, (u32, usize)> = std::collections::BTreeMap::new();
+        let mut uniq: std::collections::BTreeMap<&'static str, (u32, usize)> =
+            std::collections::BTreeMap::new();
         for (a, ph, op) in &b.peak_log {
             if *a + 5 >= pk {
                 let entry = uniq.entry(ph).or_insert((*a, *op));
-                if *a > entry.0 { *entry = (*a, *op); }
+                if *a > entry.0 {
+                    *entry = (*a, *op);
+                }
             }
         }
         for (ph, (a, op)) in uniq.iter() {
@@ -4203,20 +1586,28 @@ pub fn build() -> Vec<Op> {
         }
     }
 
-    if std::env::var("TRACE_PHASES").is_ok() {
-        // Attribute emitted ops to the active phase at each op index.
-        // phase_transitions is sorted by ops_idx (monotonically appended).
-        // For each op, binary-find the phase region it falls in.
+    if !b.count_only && std::env::var("DUMP_PHASE_BOUNDS").is_ok() {
+        for (op_idx, phase) in &b.phase_transitions {
+            eprintln!("PHASE_BOUND op_idx={op_idx} phase={phase}");
+        }
+    }
+
+    if !b.count_only && std::env::var("TRACE_PHASES").is_ok() {
+
         let trans = &b.phase_transitions;
         let n_ops = b.ops.len();
-        // Per-phase aggregates.
+
         let mut agg: std::collections::BTreeMap<&'static str, (u64, u64, u64)> =
             std::collections::BTreeMap::new();
-        // Also per-call counters: each contiguous (phase, region) gets its own bucket for ordered printout.
+
         let mut regions: Vec<(&'static str, usize, u64, u64, u64)> = Vec::new();
         for i in 0..trans.len() {
             let start = trans[i].0;
-            let end = if i + 1 < trans.len() { trans[i + 1].0 } else { n_ops };
+            let end = if i + 1 < trans.len() {
+                trans[i + 1].0
+            } else {
+                n_ops
+            };
             let phase = trans[i].1;
             let mut tof: u64 = 0;
             let mut cli: u64 = 0;
@@ -4240,22 +1631,3550 @@ pub fn build() -> Vec<Op> {
         }
         let total_tof: u64 = agg.values().map(|v| v.0).sum();
         eprintln!("=== per-phase emitted Toffoli (classical view; executed-shot stats are in harness) ===");
-        eprintln!("{:<40} {:>12} {:>12} {:>6}", "phase", "ccx", "cliff", "%tof");
+        eprintln!(
+            "{:<40} {:>12} {:>12} {:>6}",
+            "phase", "ccx", "cliff", "%tof"
+        );
         let mut v: Vec<_> = agg.iter().collect();
         v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
         for (ph, (t, c, _o)) in v {
-            let pct = if total_tof > 0 { (*t as f64) * 100.0 / (total_tof as f64) } else { 0.0 };
+            let pct = if total_tof > 0 {
+                (*t as f64) * 100.0 / (total_tof as f64)
+            } else {
+                0.0
+            };
             eprintln!("{:<40} {:>12} {:>12} {:>5.1}%", ph, t, c, pct);
         }
         eprintln!("total_ccx_emitted={} total_ops={}", total_tof, n_ops);
         if std::env::var("TRACE_PHASES_VERBOSE").is_ok() {
             eprintln!("--- per-region (ordered) ---");
             for (ph, start, tof, cli, _o) in &regions {
-                if *tof == 0 && *cli == 0 { continue; }
+                if *tof == 0 && *cli == 0 {
+                    continue;
+                }
                 eprintln!("@{:<10} {:<40} ccx={} cli={}", start, ph, tof, cli);
             }
         }
     }
 
-    generated_epoch_fanout::apply_epoch_fanout(b.ops.clone())
+    if std::env::var("TRACE_PHASE_ACTIVE").is_ok() {
+        b.close_phase_active_region();
+        eprintln!("=== per-phase active qubit maxima ===");
+        eprintln!("{:<48} {:>12}", "phase", "active_q");
+        let mut v: Vec<_> = b.phase_active_max.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let top_n = std::env::var("TRACE_PHASE_ACTIVE_TOP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        let mut printed = 0usize;
+        for (phase, active) in v {
+            if top_n.is_some_and(|limit| printed >= limit) {
+                break;
+            }
+            eprintln!("{:<48} {:>12}", phase, active);
+            printed += 1;
+        }
+        if std::env::var("TRACE_PHASE_ACTIVE_REGIONS").is_ok() {
+            eprintln!("--- per-region active qubit maxima (ordered) ---");
+            for (end, phase, active) in &b.phase_active_regions {
+                eprintln!("@{:<10} {:<48} active_q={}", end, phase, active);
+            }
+        }
+    }
+
+    if let Some(nonce) = std::env::var("DIALOG_TAIL_NONCE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        const NONCE_BITS: u32 = 48;
+        b.set_phase("dialog_tail_nonce");
+        for i in 0..NONCE_BITS {
+            let q = if (nonce >> i) & 1 == 1 { tx[1] } else { tx[0] };
+            b.x(q);
+            b.x(q);
+        }
+    }
+
+    builder
+}
+
+/// M-60 (C2b): remove the census-identified dead CCX gates (dead_t10 set) from the
+/// post-fanout op stream. Every dropped index MUST be a CCX in this build (self-check);
+/// if a build ever shifts so an index no longer points at a CCX we abort loudly rather
+/// than emit a corrupt circuit. This is the source-side port of the grinder's post-build
+/// filter, now inside `build()` so it survives an `src/point_add`-only submission.
+/// Bit-exact: the removed gates never fire for any valid curve-point input.
+/// Deep-strip: remove CCX gates verified never-firing over 1e8 inputs.
+/// Applied as the FINAL pass because the index list was derived from the final
+/// emitted stream.
+fn apply_d2_deep_strip(ops: Vec<Op>) -> Vec<Op> {
+    use std::collections::HashSet;
+    let drop: HashSet<usize> = d2_deep_strip::D2_DEEP_STRIP.iter().copied().collect();
+    ops.into_iter().enumerate().filter(|(i, _)| !drop.contains(i)).map(|(_, o)| o).collect()
+}
+
+/// Identity-keyed deep strip. Instead of positional indices (which any op-stream edit
+/// invalidates), each census-dead CCX/CCZ is keyed by its operand tuple
+/// (kind, q_control2, q_control1, q_target, c_condition) plus the k-th-occurrence ordinal
+/// of that tuple in stream order. Derived once from a 1e8 fire-census; re-applies to any
+/// edited stream that does not relabel the dead region, with no re-census.
+///
+/// Two keyed transforms share the single ordinal pass:
+///   DEAD_KEYS      -- the gate never fires on any reachable input; delete it.
+///   DOWNGRADE_KEYS -- the gate fires, but one control is redundant *as a value*:
+///                     either it is 1 on every shot the classical condition admits, or
+///                     the two controls are always equal. Either way CCX(c2,c1,t)
+///                     reduces exactly to CX(surviving,t) and CCZ to CZ, which the
+///                     cost model does not charge for. Zero qubits moved.
+/// Neither transform touches branch selection, `step()` consumption or call counts:
+/// this runs on the finished `Vec<Op>`, after every emission decision has been made.
+fn apply_deep_strip_identity(ops: Vec<Op>) -> Vec<Op> {
+    use std::collections::HashMap;
+    type Tup = (u8, u64, u64, u64, u64);
+
+    // Pass 1: how many times does each operand tuple occur in THIS stream?
+    // The ordinal in a key is only meaningful if that occupancy still matches
+    // the stream the census was taken on. If an unrelated edit adds or removes
+    // a gate with the same operands, every later ordinal for that tuple slides
+    // and the key silently names a different, live gate -- which deletes or
+    // downgrades a load-bearing Toffoli and corrupts the circuit. Measured
+    // consequence when this happened for real: 7535/9024 classical mismatches.
+    // So the census-time occupancy travels with every key as a tripwire, and a
+    // key whose tuple has moved is DISCARDED rather than applied.
+    let mut occ: HashMap<Tup, u32> = HashMap::new();
+    for op in &ops {
+        let kb = op.kind as u8;
+        if kb == 13 || kb == 14 {
+            *occ.entry((kb, op.q_control2.0, op.q_control1.0, op.q_target.0, op.c_condition.0))
+                .or_insert(0) += 1;
+        }
+    }
+    let mut stale = 0usize;
+    let mut dead: HashMap<(Tup, u32), ()> = HashMap::new();
+    for &(k, c2, c1, t, cc, o, tot) in deep_strip_keys::DEAD_KEYS {
+        let tup = (k, c2, c1, t, cc);
+        if occ.get(&tup).copied() == Some(tot) {
+            dead.insert(((tup), o), ());
+        } else {
+            stale += 1;
+        }
+    }
+    let mut down: HashMap<(Tup, u32), u8> = HashMap::new();
+    for &(k, c2, c1, t, cc, o, tot, act) in deep_strip_keys::DOWNGRADE_KEYS {
+        let tup = (k, c2, c1, t, cc);
+        if occ.get(&tup).copied() == Some(tot) {
+            down.insert(((tup), o), act);
+        } else {
+            stale += 1;
+        }
+    }
+    if stale > 0 {
+        eprintln!(
+            "  [deep-strip-identity] WARNING: {} keys discarded -- their operand tuple's \
+             occupancy changed since the census, so their ordinals no longer address the \
+             censused gate. Re-run the census against this op stream to recover them.",
+            stale
+        );
+    }
+    if dead.is_empty() && down.is_empty() {
+        return ops;
+    }
+
+    // Pass 2: apply, assigning ordinals in the same stream order the census used.
+    let mut ord: HashMap<Tup, u32> = HashMap::new();
+    let mut out = Vec::with_capacity(ops.len());
+    let mut removed = 0usize;
+    let mut downgraded = 0usize;
+    for op in ops {
+        let kb = op.kind as u8; // CCX=13, CCZ=14 in the serialized stream
+        if kb == 13 || kb == 14 {
+            let tup = (kb, op.q_control2.0, op.q_control1.0, op.q_target.0, op.c_condition.0);
+            let o = ord.entry(tup).or_insert(0);
+            let key = (tup, *o);
+            *o += 1;
+            if dead.contains_key(&key) {
+                removed += 1;
+                continue;
+            }
+            if let Some(&act) = down.get(&key) {
+                let mut nop = op;
+                nop.kind = if kb == 13 { OperationType::CX } else { OperationType::CZ };
+                // act==1: q_control1 is the redundant one, q_control2 survives.
+                // act==2: q_control2 is redundant (implied by q_control1).
+                if act == 1 {
+                    nop.q_control1 = op.q_control2;
+                }
+                nop.q_control2 = crate::circuit::NO_QUBIT;
+                nop.validate();
+                downgraded += 1;
+                out.push(nop);
+                continue;
+            }
+        }
+        out.push(op);
+    }
+    eprintln!(
+        "[deep-strip-identity] removed {} / {} dead; downgraded {} / {} to CX/CZ; {} stale keys skipped",
+        removed,
+        deep_strip_keys::DEAD_KEYS.len(),
+        downgraded,
+        deep_strip_keys::DOWNGRADE_KEYS.len(),
+        stale
+    );
+    out
+}
+
+
+/// Exact affine bridges (see call site). Bridge 1: the seven-gate source and three-gate
+/// replacement both apply q897 ^= q734 ^ q735 ^ (q511 & q898) and restore every other wire
+/// (exhaustive 32-state check in note 6bb669e). Bridge 2: with a=513,b=565,d=512,t=566 and
+/// the unchanged enclosing condition C, the intervening Clifford block has net action
+/// b ^= C*d while d is restored, so the equal endpoint CCX pair reduces to CCX(a,d -> t)
+/// after the retained block. Both windows must occur exactly once (outside the tail).
+fn apply_exact_affine_bridges(mut ops: Vec<Op>) -> Vec<Op> {
+    // Shape matcher: a pattern is a list of (kind, c2-var, c1-var, t-var) with wire
+    // VARIABLES (small ints); all distinct variables must bind to distinct wires.
+    // NOVAR = operand must be NO_QUBIT. The exactness proofs of both bridges hold for
+    // any distinct wires (bridge 1: 32-state truth table on 5 wires; bridge 2: net
+    // Clifford action b ^= C*d with d restored under the shared condition), so matching
+    // by shape makes the rewrite ITERS-/allocation-independent while the unique-witness
+    // asserts keep it fail-closed.
+    const NOVAR: i32 = -1;
+    fn match_shape(ops: &[Op], at: usize, pat: &[(OperationType, i32, i32, i32)], nvars: usize) -> Option<Vec<u64>> {
+        let mut bind: Vec<Option<u64>> = vec![None; nvars];
+        for (k, (kind, v2, v1, vt)) in pat.iter().enumerate() {
+            let op = &ops[at + k];
+            if op.kind != *kind || op.c_condition.0 != u64::MAX && false { return None; }
+            if op.kind != *kind { return None; }
+            for (var, val) in [(*v2, op.q_control2.0), (*v1, op.q_control1.0), (*vt, op.q_target.0)] {
+                if var == NOVAR { if val != u64::MAX { return None; } continue; }
+                match bind[var as usize] {
+                    None => { if val == u64::MAX { return None; } bind[var as usize] = Some(val); }
+                    Some(b) => { if b != val { return None; } }
+                }
+            }
+        }
+        let vals: Vec<u64> = bind.iter().map(|b| b.unwrap()).collect();
+        // all-distinct
+        for i in 0..vals.len() { for j in 0..i { if vals[i] == vals[j] { return None; } } }
+        // same condition context: no Push/Pop inside and identical c_condition on all ops
+        let cc = ops[at].c_condition.0;
+        for k in 0..pat.len() { if ops[at + k].c_condition.0 != cc { return None; } }
+        Some(vals)
+    }
+    let find_unique = |ops: &[Op], pat: &[(OperationType, i32, i32, i32)], nvars: usize, name: &str| -> (usize, Vec<u64>) {
+        let mut hits: Vec<(usize, Vec<u64>)> = Vec::new();
+        let limit = ops.len() - 96 - pat.len();
+        for at in 0..=limit {
+            if ops[at].kind != pat[0].0 { continue; }
+            if let Some(b) = match_shape(ops, at, pat, nvars) { hits.push((at, b)); }
+        }
+        assert_eq!(hits.len(), 1, "exact affine bridge occurrence drift ({name}): {} matches", hits.len());
+        hits.pop().unwrap()
+    };
+    use OperationType::{CCX, CX};
+    let cxop = |control: u64, target: u64, cc: u64| { let mut op = Op::empty(); op.kind = CX; op.q_control1 = QubitId(control); op.q_target = QubitId(target); op.c_condition = BitId(cc); op };
+    let ccxop = |a: u64, b: u64, target: u64, cc: u64| { let mut op = Op::empty(); op.kind = CCX; op.q_control2 = QubitId(a); op.q_control1 = QubitId(b); op.q_target = QubitId(target); op.c_condition = BitId(cc); op };
+
+    // Bridge 1 (7 -> 3): vars A=0 B=1 T=2 X=3 Y=4
+    let p1: [(OperationType, i32, i32, i32); 7] = [
+        (CCX, 0, 1, 2), (CX, NOVAR, 2, 3), (CX, NOVAR, 2, 4), (CX, NOVAR, 2, 3), (CX, NOVAR, 4, 3), (CX, NOVAR, 2, 4), (CX, NOVAR, 2, 4),
+    ];
+    // (last element placeholder fixed below: the 7th op is the closing CCX)
+    let mut p1 = p1; p1[6] = (CCX, 0, 1, 2);
+    let (i1, b1) = find_unique(&ops, &p1, 5, "bridge1");
+    let cc1 = ops[i1].c_condition.0;
+    let (a, b, t, x, y) = (b1[0], b1[1], b1[2], b1[3], b1[4]);
+    ops.splice(i1..i1 + 7, [cxop(y, x, cc1), cxop(t, x, cc1), ccxop(a, b, x, cc1)]);
+
+    // Bridge 2 (control-delta): CCX(A,B->T); CX(C->B); {CX(C->z)}*; CX(C->D); CX(D->B); {CX(C->z')}*; CX(C->D); CCX(A,B->T)
+    // with z, z' distinct from {A,B,T,C,D}, all under one condition context. Net Clifford action is
+    // b ^= d0 with d restored and a,t untouched, so the pair reduces to CCX(A,D->T) after the block.
+    let mut hits2: Vec<(usize, usize, u64, u64, u64, u64, u64)> = Vec::new(); // (start, len, A,B,T,C,D)
+    let limit2 = ops.len() - 96;
+    for i in 0..limit2 {
+        let o0 = &ops[i];
+        if o0.kind != CCX { continue; }
+        let (a, b, t, cc) = (o0.q_control2.0, o0.q_control1.0, o0.q_target.0, o0.c_condition.0);
+        let o1 = &ops[i + 1];
+        if o1.kind != CX || o1.q_target.0 != b || o1.c_condition.0 != cc { continue; }
+        let c = o1.q_control1.0;
+        if c == a || c == t || c == b { continue; }
+        let mut j = i + 2; let mut d: Option<u64> = None; let mut ok = false; let mut phase = 0;
+        while j < limit2 && j < i + 48 {
+            let o = &ops[j];
+            if o.c_condition.0 != cc { break; }
+            if phase == 0 {
+                if o.kind == CX && o.q_control1.0 == c && ![a, b, t, c].contains(&o.q_target.0) {
+                    // either a fan-out z or the CX(C->D): decide by lookahead: next op CX(D->B)?
+                    let n = &ops[j + 1];
+                    if n.kind == CX && n.q_control1.0 == o.q_target.0 && n.q_target.0 == b && n.c_condition.0 == cc {
+                        d = Some(o.q_target.0); j += 2; phase = 1; continue;
+                    }
+                    j += 1; continue;
+                }
+                break;
+            } else {
+                let dd = d.unwrap();
+                if o.kind == CX && o.q_control1.0 == c && o.q_target.0 == dd {
+                    let n = &ops[j + 1];
+                    if n.kind == CCX && n.q_control2.0 == a && n.q_control1.0 == b && n.q_target.0 == t && n.c_condition.0 == cc { ok = true; j += 2; break; }
+                    break;
+                }
+                if o.kind == CX && o.q_control1.0 == c && ![a, b, t, c, dd].contains(&o.q_target.0) { j += 1; continue; }
+                break;
+            }
+        }
+        if ok { hits2.push((i, j - i, a, b, t, c, d.unwrap())); }
+    }
+    assert!(hits2.len() <= 1, "exact affine bridge occurrence drift (bridge2): {} matches", hits2.len());
+    if hits2.is_empty() {
+        // The bridge-2 site lived in the ITERS=261 tail divsteps; at ITERS=259 it does not exist.
+        eprintln!("[affine-bridges] bridge1 at {} (7->3) wires A={} B={} T={} X={} Y={}; bridge2: no window (0 matches, skipped)", i1, a, b, t, x, y);
+        return ops;
+    }
+    let (i2, len2, a2, b2v, t2, c2v, d2) = hits2[0];
+    let cc2 = ops[i2].c_condition.0;
+    let mut middle: Vec<Op> = ops[i2 + 1..i2 + len2 - 1].to_vec();
+    middle.push(ccxop(a2, d2, t2, cc2));
+    ops.splice(i2..i2 + len2, middle);
+    let b2 = [a2, b2v, t2, c2v, d2];
+    eprintln!("[affine-bridges] bridge1 at {} (7->3) wires A={} B={} T={} X={} Y={}; bridge2 at {} (len {} -> {}) wires A={} B={} T={} C={} D={}", i1, a, b, t, x, y, i2, len2, len2 - 1, b2[0], b2[1], b2[2], b2[3], b2[4]);
+    ops
+}
+
+/// Rewrite the 96-op identity tail to encode the ground nonce. Only q_target
+/// changes (X;X pairs stay identities), so circuit function is untouched; the
+/// Fiat-Shamir seed is what moves.
+fn apply_tail_nonce(mut ops: Vec<Op>, nonce: u64) -> Vec<Op> {
+    let n = ops.len();
+    assert!(n >= 96, "op stream too short for nonce tail");
+    let start = n - 96;
+    for i in 0..96 {
+        assert!(ops[start + i].kind == OperationType::X, "tail op {} is not an X", start + i);
+    }
+    for b in 0..48 {
+        let t = if (nonce >> b) & 1 == 1 { QubitId(1) } else { QubitId(0) };
+        ops[start + 2 * b].q_target = t;
+        ops[start + 2 * b + 1].q_target = t;
+    }
+    ops
+}
+
+/// Apply the pinned source-rebound action mask for the q1150 inverse-cswap
+/// route.  The mask is part of the editable source tree, and every action is
+/// checked against the exact parent stream before it is accepted.  This keeps
+/// the optimization fail-closed: any upstream ordering, gate-kind, or operation
+/// count drift aborts the build instead of silently producing a different
+/// circuit.
+fn apply_q1150_inverse_cswap_action_mask(ops: Vec<Op>) -> Vec<Op> {
+    const EXPECTED_PARENT_OPS: usize = 9_031_804;
+    const EXPECTED_OUTPUT_OPS: usize = 9_018_685;
+    const EXPECTED_ACTIONS: usize = 16_850;
+    const MASK: &str = include_str!("route_042_action_mask.tsv");
+
+    assert_eq!(
+        ops.len(),
+        EXPECTED_PARENT_OPS,
+        "q1150 action-mask parent operation-count drift"
+    );
+
+    let mut actions = MASK.lines().enumerate().map(|(line_number, line)| {
+        let (index, action) = line
+            .split_once('\t')
+            .unwrap_or_else(|| panic!("q1150 action-mask line {} is malformed", line_number + 1));
+        let index = index
+            .parse::<usize>()
+            .unwrap_or_else(|_| panic!("q1150 action-mask line {} has a bad index", line_number + 1));
+        assert!(
+            matches!(action, "delete" | "drop_q1" | "drop_q2"),
+            "q1150 action-mask line {} has an unknown action",
+            line_number + 1
+        );
+        (index, action)
+    });
+    let mut next = actions.next();
+    let mut action_count = 0usize;
+    let mut output = Vec::with_capacity(EXPECTED_OUTPUT_OPS);
+
+    for (index, mut op) in ops.into_iter().enumerate() {
+        let Some((action_index, action)) = next else {
+            output.push(op);
+            continue;
+        };
+        assert!(
+            action_index >= index,
+            "q1150 action-mask indices are not strictly increasing"
+        );
+        if action_index != index {
+            output.push(op);
+            continue;
+        }
+
+        action_count += 1;
+        match action {
+            "delete" => {}
+            "drop_q2" => {
+                op.kind = match op.kind {
+                    OperationType::CCX => OperationType::CX,
+                    OperationType::CCZ => OperationType::CZ,
+                    other => panic!(
+                        "q1150 drop_q2 at operation {index} targets {other:?}, expected CCX/CCZ"
+                    ),
+                };
+                op.q_control2 = crate::circuit::NO_QUBIT;
+                op.validate();
+                output.push(op);
+            }
+            "drop_q1" => {
+                op.kind = match op.kind {
+                    OperationType::CCX => OperationType::CX,
+                    OperationType::CCZ => OperationType::CZ,
+                    other => panic!(
+                        "q1150 drop_q1 at operation {index} targets {other:?}, expected CCX/CCZ"
+                    ),
+                };
+                op.q_control1 = op.q_control2;
+                op.q_control2 = crate::circuit::NO_QUBIT;
+                op.validate();
+                output.push(op);
+            }
+            _ => unreachable!(),
+        }
+        next = actions.next();
+    }
+
+    assert!(next.is_none(), "q1150 action-mask contains an out-of-range index");
+    assert_eq!(action_count, EXPECTED_ACTIONS, "q1150 action-count drift");
+    assert_eq!(
+        output.len(),
+        EXPECTED_OUTPUT_OPS,
+        "q1150 action-mask output operation-count drift"
+    );
+    eprintln!(
+        "[q1150-source-rebound] applied {} pinned actions: {} -> {} ops",
+        action_count,
+        EXPECTED_PARENT_OPS,
+        output.len()
+    );
+    output
+}
+
+fn apply_m60_dead_t10(ops: Vec<Op>) -> Vec<Op> {
+    use std::collections::HashSet;
+    if std::env::var("M60_DISABLE").ok().as_deref() == Some("1") {
+        eprintln!("  [M-60] disabled -> emitting C1 (unfiltered)");
+        return ops;
+    }
+    let drop: HashSet<usize> = m60_dead_t10::M60_DEAD_T10.iter().copied().collect();
+    for &i in &drop {
+        let is_ccx = ops.get(i).map(|o| o.kind == OperationType::CCX).unwrap_or(false);
+        assert!(
+            is_ccx,
+            "[M-60] dead-set index {i} is not a CCX in this build (found {:?}); skip-set \
+             misaligned with this nonce/config -- aborting to avoid a corrupt circuit",
+            ops.get(i).map(|o| o.kind)
+        );
+    }
+    let n_before = ops.len();
+    let kept: Vec<Op> = ops
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, op)| if drop.contains(&i) { None } else { Some(op) })
+        .collect();
+    eprintln!(
+        "  [M-60] removed {} dead CCX (self-checked) -> {} ops (C2b circuit)",
+        n_before - kept.len(),
+        kept.len()
+    );
+    kept
+}
+
+/// W018 / W044: delegate to the straddle-aware net-restore CCZ self-inverse matcher
+/// (`constprop::ccz_straddle_cancel`), which runs on the FINAL post-`apply_m60_dead_t10`
+/// stream so the dead_t10 absolute-index skip-set stays valid. Bit-exact in value AND
+/// phase by construction (a proven CCZ.U.CCZ = U identity when U net-restores the triple).
+/// Toggle off for the A/B differential with `TLM_CCZ_SELF_INVERSE_CANCEL=0`.
+fn ccz_self_inverse_cancel(ops: Vec<Op>) -> Vec<Op> {
+    if std::env::var("TLM_CCZ_SELF_INVERSE_CANCEL").ok().as_deref() == Some("0") {
+        return ops;
+    }
+    trailmix_ludicrous::constprop::ccz_straddle_cancel(ops)
+}
+
+// Retained-but-unused conservative (no-straddle) prototype, superseded by the
+// straddle-aware matcher above. Kept for reference; not on any code path.
+#[allow(dead_code, unreachable_code, unused)]
+fn ccz_self_inverse_cancel_conservative(ops: Vec<Op>) -> Vec<Op> {
+    const NEVER: usize = usize::MAX;
+
+    // Size the write-timeline tables from the max qubit / condition-bit id referenced.
+    let mut max_q: u64 = 0;
+    let mut max_b: u64 = 0;
+    for op in &ops {
+        for q in [op.q_control1.0, op.q_control2.0, op.q_target.0] {
+            if q != u64::MAX && q > max_q {
+                max_q = q;
+            }
+        }
+        for b in [op.c_condition.0, op.c_target.0] {
+            if b != u64::MAX && b > max_b {
+                max_b = b;
+            }
+        }
+    }
+    let num_q = max_q as usize + 1;
+    let num_b = max_b as usize + 1;
+
+    let mut wlast_q = vec![NEVER; num_q]; // last basis-changing WRITE index per qubit
+    let mut wlast_b = vec![NEVER; num_b]; // last WRITE index per condition bit
+
+    let mut cond_epoch: u64 = 0;
+    let mut cond_stack: Vec<u64> = Vec::new();
+
+    struct PendCcz {
+        idx: usize,
+        cb: u64,
+        epoch: u64,
+    }
+    let mut pending: std::collections::HashMap<(u64, u64, u64), PendCcz> =
+        std::collections::HashMap::new();
+    let mut killed = vec![false; ops.len()];
+    // Diagnostics: how many CCZ repeat a triple at all (upper bound on any matcher's
+    // pairable population), and how many same-triple candidates the clean-support
+    // predicate rejected (a large gap here would mean a straddle matcher could help).
+    let mut seen_triples: std::collections::HashSet<(u64, u64, u64)> =
+        std::collections::HashSet::new();
+    let mut repeat_triple_ccz: usize = 0;
+    let mut rejected_not_clean: usize = 0;
+    let mut total_ccz: usize = 0;
+
+    let touched_after = |s: usize, p: usize| s != NEVER && s > p;
+    let set_w = |tbl: &mut Vec<usize>, id: u64, i: usize| {
+        if (id as usize) < tbl.len() {
+            tbl[id as usize] = i;
+        }
+    };
+
+    for (i, op) in ops.iter().enumerate() {
+        match op.kind {
+            OperationType::PushCondition => {
+                cond_epoch += 1;
+                cond_stack.push(op.c_condition.0);
+            }
+            OperationType::PopCondition => {
+                cond_epoch += 1;
+                cond_stack.pop();
+            }
+            OperationType::CCZ => {
+                let mut tri = [op.q_control1.0, op.q_control2.0, op.q_target.0];
+                tri.sort_unstable();
+                // Skip malformed/degenerate triples (a real CCZ has 3 distinct live qubits).
+                if tri[2] != u64::MAX && tri[0] != tri[1] && tri[1] != tri[2] {
+                    let key = (tri[0], tri[1], tri[2]);
+                    let cb = op.c_condition.0;
+                    total_ccz += 1;
+                    if !seen_triples.insert(key) {
+                        repeat_triple_ccz += 1;
+                    }
+                    let mut cancelled = false;
+                    let mut matched_pending = false;
+                    if let Some(p) = pending.get(&key) {
+                        matched_pending = true;
+                        let same_cond = p.cb == cb && p.epoch == cond_epoch;
+                        let qs_clean = !touched_after(wlast_q[tri[0] as usize], p.idx)
+                            && !touched_after(wlast_q[tri[1] as usize], p.idx)
+                            && !touched_after(wlast_q[tri[2] as usize], p.idx);
+                        let cond_clean =
+                            cb == u64::MAX || !touched_after(wlast_b[cb as usize], p.idx);
+                        let stack_clean = cond_stack.iter().all(|&sb| {
+                            sb == u64::MAX || !touched_after(wlast_b[sb as usize], p.idx)
+                        });
+                        if same_cond && qs_clean && cond_clean && stack_clean {
+                            killed[p.idx] = true;
+                            killed[i] = true;
+                            cancelled = true;
+                        }
+                    }
+                    if matched_pending && !cancelled {
+                        rejected_not_clean += 1;
+                    }
+                    if cancelled {
+                        pending.remove(&key);
+                    } else {
+                        pending.insert(
+                            key,
+                            PendCcz {
+                                idx: i,
+                                cb,
+                                epoch: cond_epoch,
+                            },
+                        );
+                    }
+                }
+                // CCZ is diagonal: it writes nothing, so no wlast update.
+            }
+            OperationType::CCX
+            | OperationType::CX
+            | OperationType::X
+            | OperationType::R => {
+                set_w(&mut wlast_q, op.q_target.0, i);
+            }
+            OperationType::Swap => {
+                set_w(&mut wlast_q, op.q_control1.0, i);
+                set_w(&mut wlast_q, op.q_target.0, i);
+            }
+            OperationType::Hmr => {
+                set_w(&mut wlast_q, op.q_target.0, i);
+                set_w(&mut wlast_b, op.c_target.0, i);
+            }
+            OperationType::BitInvert
+            | OperationType::BitStore0
+            | OperationType::BitStore1 => {
+                set_w(&mut wlast_b, op.c_target.0, i);
+            }
+            OperationType::CZ
+            | OperationType::Z
+            | OperationType::Neg
+            | OperationType::Register
+            | OperationType::AppendToRegister
+            | OperationType::DebugPrint => {}
+        }
+    }
+
+    let n_before = ops.len();
+    let kept: Vec<Op> = ops
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, op)| if killed[i] { None } else { Some(op) })
+        .collect();
+    let removed = n_before - kept.len();
+    eprintln!(
+        "  [W018 CCZ] cancelled {} CCZ ({} self-inverse pairs) -> {} ops",
+        removed,
+        removed / 2,
+        kept.len()
+    );
+    eprintln!(
+        "  [W018 CCZ] diag: total_ccz={} repeat_triple_ccz={} rejected_not_clean={}",
+        total_ccz, repeat_triple_ccz, rejected_not_clean
+    );
+    kept
+}
+
+pub fn build() -> Vec<Op> {
+    let count_only = std::env::var("POINT_ADD_COUNT_ONLY").ok().as_deref() == Some("1");
+    let mut circuit = if count_only { B::new_count_only() } else { B::new() };
+    circuit.set_phase("native265_inputs");
+    let mut tx = circuit.alloc_qubits(256);
+    circuit.declare_qubit_register(&tx);
+    let mut ty = circuit.alloc_qubits(256);
+    circuit.declare_qubit_register(&ty);
+    let ox = circuit.alloc_bits(256);
+    circuit.declare_bit_register(&ox);
+    let oy = circuit.alloc_bits(256);
+    circuit.declare_bit_register(&oy);
+    circuit.set_phase("native265_lazy_store");
+    let mut store = frontier_native265_encoded_block_store::FrontierNative265EncodedBlockStore::new_lazy();
+    circuit.set_phase("native265_candidate");
+    frontier_native265_candidate::emit_frontier_native265_candidate(
+        &mut circuit, &mut tx, &mut ty, &ox, &oy, &mut store,
+    );
+    store.assert_all_parked();
+    if count_only {
+        let toffoli = circuit.counted_kind_ops[OperationType::CCX as usize]
+            + circuit.counted_kind_ops[OperationType::CCZ as usize];
+        eprintln!(
+            "NATIVE265_EPOCH_COUNT ops={} toffoli={} peak={} peak_phase={} active_end={} bits={}",
+            circuit.counted_ops, toffoli, circuit.peak_qubits, circuit.peak_phase,
+            circuit.active_qubits, circuit.next_bit,
+        );
+        Vec::new()
+    } else {
+        circuit.take_ops()
+    }
+}
+
+pub fn square_window_selftest() -> Result<(), String> {
+    use sha3::digest::{ExtendableOutput, Update};
+    const SHOTS: usize = 64;
+    let nbits = std::env::var("SQUARE_WINDOW_SELFTEST_NBITS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(24);
+    assert!(nbits > 0);
+    let packed_value_check = 2 * nbits < 64;
+    let wide_value_check = nbits <= 256;
+    let mask = if packed_value_check { (1u64 << nbits) - 1 } else { u64::MAX };
+    let out_mask = if packed_value_check { (1u64 << (2 * nbits)) - 1 } else { u64::MAX };
+    let xs: Vec<u64> = (0..SHOTS as u64)
+        .map(|s| {
+            let r = s
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(0xA076_1D64_78BD_642F);
+            let r = (r ^ (r >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            r & mask
+        })
+        .collect();
+    let x_masks: Vec<u64> = (0..nbits)
+        .map(|k| {
+            if packed_value_check {
+                xs.iter()
+                    .enumerate()
+                    .fold(0u64, |acc, (shot, &xv)| acc | (((xv >> k) & 1) << shot))
+            } else {
+                let z = (k as u64)
+                    .wrapping_mul(0xD6E8_FD9D_50B5_8A51)
+                    .wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            }
+        })
+        .collect();
+
+    let build_one = |roundtrip: bool| -> (Vec<Op>, Vec<QubitId>, Vec<QubitId>, usize, usize) {
+        let mut b = B::new();
+        let x = b.alloc_qubits(nbits);
+        let tmp = b.alloc_qubits(2 * nbits);
+        schoolbook_square_symmetric_lowq_selfhosted(&mut b, &x, &tmp);
+        if roundtrip {
+            schoolbook_square_symmetric_lowq_selfhosted_inverse(&mut b, &x, &tmp);
+        }
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+        (b.ops, x, tmp, nq, nb)
+    };
+
+    let run = |ops: &[Op],
+               x: &[QubitId],
+               tmp: &[QubitId],
+               nq: usize,
+               nb: usize|
+     -> (Vec<u64>, Vec<u64>, u64) {
+        let mut seed = sha3::Shake128::default();
+        seed.update(b"square-window-selftest");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(nq, nb, &mut xof);
+        sim.clear_for_shot();
+        for k in 0..nbits {
+            *sim.qubit_mut(x[k]) = x_masks[k];
+        }
+        sim.apply_iter(ops.iter());
+        let out_x_masks: Vec<u64> = x.iter().map(|&q| sim.qubit(q)).collect();
+        let out_tmp_masks: Vec<u64> = tmp.iter().map(|&q| sim.qubit(q)).collect();
+        (out_x_masks, out_tmp_masks, sim.phase)
+    };
+
+    let (ops_fwd, x_fwd, tmp_fwd, nq_fwd, nb_fwd) = build_one(false);
+    let (out_x_masks, out_tmp_masks, phase) = run(&ops_fwd, &x_fwd, &tmp_fwd, nq_fwd, nb_fwd);
+    if phase != 0 {
+        return Err(format!("forward phase garbage 0x{phase:x}"));
+    }
+    for (k, (&got, &want)) in out_x_masks.iter().zip(x_masks.iter()).enumerate() {
+        if got != want {
+            return Err(format!("forward x bit {k} changed"));
+        }
+    }
+    if packed_value_check {
+        for shot in 0..SHOTS {
+            let got = out_tmp_masks
+                .iter()
+                .take(2 * nbits)
+                .enumerate()
+                .fold(0u64, |acc, (k, &bits)| acc | (((bits >> shot) & 1) << k));
+            let want = xs[shot].wrapping_mul(xs[shot]) & out_mask;
+            if got != want {
+                return Err(format!(
+                    "forward value mismatch shot {shot}: tmp got 0x{got:x} want 0x{want:x}"
+                ));
+            }
+        }
+    } else if wide_value_check {
+        let in_limbs = (nbits + 63) / 64;
+        let out_limbs = (2 * nbits + 63) / 64;
+        for shot in 0..SHOTS {
+            let mut x_limbs = vec![0u64; in_limbs];
+            for k in 0..nbits {
+                if (x_masks[k] >> shot) & 1 != 0 {
+                    x_limbs[k / 64] |= 1u64 << (k % 64);
+                }
+            }
+            let mut product = vec![0u64; out_limbs];
+            for i in 0..in_limbs {
+                let mut carry = 0u128;
+                for j in 0..in_limbs {
+                    let idx = i + j;
+                    if idx >= out_limbs {
+                        break;
+                    }
+                    let cur = product[idx] as u128
+                        + (x_limbs[i] as u128) * (x_limbs[j] as u128)
+                        + carry;
+                    product[idx] = cur as u64;
+                    carry = cur >> 64;
+                }
+                let mut idx = i + in_limbs;
+                while carry != 0 && idx < out_limbs {
+                    let cur = product[idx] as u128 + carry;
+                    product[idx] = cur as u64;
+                    carry = cur >> 64;
+                    idx += 1;
+                }
+            }
+            for k in 0..(2 * nbits) {
+                let got = (out_tmp_masks[k] >> shot) & 1;
+                let want = (product[k / 64] >> (k % 64)) & 1;
+                if got != want {
+                    return Err(format!("forward value mismatch shot {shot} bit {k}"));
+                }
+            }
+        }
+    }
+
+    let (ops_rt, x_rt, tmp_rt, nq_rt, nb_rt) = build_one(true);
+    let (out_x_masks, out_tmp_masks, phase) = run(&ops_rt, &x_rt, &tmp_rt, nq_rt, nb_rt);
+    if phase != 0 {
+        return Err(format!("roundtrip phase garbage 0x{phase:x}"));
+    }
+    for (k, (&got, &want)) in out_x_masks.iter().zip(x_masks.iter()).enumerate() {
+        if got != want {
+            return Err(format!("roundtrip x bit {k} changed"));
+        }
+    }
+    for (k, &got) in out_tmp_masks.iter().enumerate() {
+        if got != 0 {
+            return Err(format!("roundtrip tmp bit {k} dirty mask 0x{got:x}"));
+        }
+    }
+    Ok(())
+}
+
+pub fn fold_freed_tail_selftest() -> Result<(), String> {
+    use sha3::digest::{ExtendableOutput, Update};
+    let hi_delta = 33usize;
+    let hi_c = 32usize;
+    let nbits = 64usize;
+    for &windowed in &[true, false] {
+        let last = if windowed {
+            hi_delta + 19
+        } else {
+            nbits - 2
+        };
+        for ed in 0u64..4 {
+            let e_val = ed & 1;
+            let d_val = (ed >> 1) & 1;
+            for &is_add in &[true, false] {
+
+                let build_one = |freed: bool| -> (Vec<Op>, Vec<QubitId>, usize, usize) {
+                    let mut b = B::new();
+                    let y = b.alloc_qubits(nbits);
+                    let ovf1 = b.alloc_qubit();
+                    let ovf2 = b.alloc_qubit();
+                    let s2 = b.alloc_qubit();
+                    let e = b.alloc_qubit();
+                    let d = b.alloc_qubit();
+                    let h = b.alloc_qubit();
+                    let xed = b.alloc_qubit();
+                    let eord = b.alloc_qubit();
+                    let n10 = b.alloc_qubit();
+
+                    b.x(s2);
+                    if d_val == 1 {
+                        b.x(ovf1);
+                    }
+                    if e_val == 1 {
+                        b.x(ovf2);
+                    }
+                    b.ccx(ovf1, s2, d);
+                    b.cx(ovf1, e);
+                    b.cx(d, e);
+                    b.cx(ovf2, e);
+                    b.ccx(e, d, h);
+                    b.cx(e, xed);
+                    b.cx(d, xed);
+                    b.cx(xed, eord);
+                    b.cx(h, eord);
+                    b.cx(d, n10);
+                    b.cx(h, n10);
+                    if freed {
+                        fold_ripple_freed_tail_ed(
+                            &mut b,
+                            &y,
+                            e,
+                            d,
+                            h,
+                            xed,
+                            eord,
+                            n10,
+                            Some((ovf1, ovf2, s2)),
+                            None,
+                            last,
+                            is_add,
+                        );
+                    } else {
+                        let controls =
+                            secp_fold_controls(e, d, h, xed, eord, n10, hi_delta, hi_c);
+                        if is_add {
+                            cadd_per_position_controls_trunc(&mut b, &y, &controls, last);
+                        } else {
+                            csub_per_position_controls_trunc(&mut b, &y, &controls, last);
+                        }
+                    }
+
+                    b.cx(h, n10);
+                    b.cx(d, n10);
+                    b.cx(h, eord);
+                    b.cx(xed, eord);
+                    b.cx(d, xed);
+                    b.cx(e, xed);
+                    b.ccx(e, d, h);
+                    b.cx(ovf2, e);
+                    b.cx(d, e);
+                    b.cx(ovf1, e);
+                    b.ccx(ovf1, s2, d);
+                    if e_val == 1 {
+                        b.x(ovf2);
+                    }
+                    if d_val == 1 {
+                        b.x(ovf1);
+                    }
+                    b.x(s2);
+                    let nq = b.next_qubit as usize;
+                    let nb = b.next_bit as usize;
+                    (b.ops, y, nq, nb)
+                };
+                let (ops_base, y_b, nq_b, nb_b) = build_one(false);
+                let (ops_freed, y_f, nq_f, nb_f) = build_one(true);
+
+                let mask: u64 = if nbits >= 64 { u64::MAX } else { (1u64 << nbits) - 1 };
+                let ys: Vec<u64> = (0..64u64)
+                    .map(|s| {
+                        let r = s
+                            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                            .wrapping_add(0xD1B5_4A32_D192_ED03);
+                        let r = (r ^ (r >> 31)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                        let r = r ^ (r >> 27);
+                        let base = r & mask;
+
+                        if s % 4 == 0 {
+                            base | (mask & !((1u64 << (hi_delta + 1)) - 1))
+                        } else if s % 4 == 1 {
+                            base & ((1u64 << (hi_delta + 1)) - 1)
+                        } else {
+                            base
+                        }
+                    })
+                    .collect();
+
+                let run = |ops: &[Op], y: &[QubitId], nq: usize, nb: usize| -> (Vec<u64>, bool, u64) {
+                    let mut s2 = sha3::Shake128::default();
+                    s2.update(b"fold-sim");
+                    let mut xof2 = s2.finalize_xof();
+                    let mut sim = Simulator::new(nq, nb, &mut xof2);
+                    sim.clear_for_shot();
+                    for (shot, &yv) in ys.iter().enumerate() {
+                        for k in 0..nbits {
+                            if (yv >> k) & 1 != 0 {
+                                *sim.qubit_mut(y[k]) |= 1u64 << shot;
+                            }
+                        }
+                    }
+                    sim.apply_iter(ops.iter());
+                    let outs: Vec<u64> = (0..64)
+                        .map(|shot| {
+                            let mut v = 0u64;
+                            for k in 0..nbits {
+                                v |= ((sim.qubit(y[k]) >> shot) & 1) << k;
+                            }
+                            v
+                        })
+                        .collect();
+                    let anc_clean =
+                        (nbits..nq).all(|q| sim.qubit(QubitId(q as u64)) == 0);
+                    (outs, anc_clean, sim.phase)
+                };
+                let (out_b, clean_b, phase_b) = run(&ops_base, &y_b, nq_b, nb_b);
+                let (out_f, clean_f, phase_f) = run(&ops_freed, &y_f, nq_f, nb_f);
+
+                if !clean_b {
+                    return Err(format!("baseline left ancilla dirty (ed={ed} add={is_add} win={windowed})"));
+                }
+                if !clean_f {
+                    return Err(format!("freed-tail left ancilla dirty (ed={ed} add={is_add} win={windowed})"));
+                }
+                if phase_f != 0 {
+                    return Err(format!("freed-tail left phase garbage 0x{phase_f:x} (ed={ed} add={is_add} win={windowed})"));
+                }
+                let _ = phase_b;
+                for shot in 0..64 {
+                    if out_b[shot] != out_f[shot] {
+                        return Err(format!(
+                            "value mismatch shot {shot}: base 0x{:x} freed 0x{:x} (ed={ed} add={is_add} win={windowed}, y_in=0x{:x})",
+                            out_b[shot], out_f[shot], ys[shot]
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn special_fold_park_selftest() -> Result<(), String> {
+    use sha3::digest::{ExtendableOutput, Update};
+
+    let c = U256::MAX
+        .wrapping_sub(SECP256K1_P)
+        .wrapping_add(U256::from(1u64));
+    let nbits = 64usize;
+    let window = 20usize;
+
+    for ctrl_value in 0u64..=1 {
+        for &is_add in &[true, false] {
+            let build_one = |parked: bool| {
+                let mut b = B::new();
+                let acc = b.alloc_qubits(nbits);
+                let ctrl = b.alloc_qubit();
+                let scratch = b.alloc_qubits(5);
+                if ctrl_value != 0 {
+                    b.x(ctrl);
+                }
+                if parked {
+                    if is_add {
+                        cadd_nbit_const_direct_trunc_fast_releasing_scratch(
+                            &mut b, &acc, c, ctrl, window, &scratch,
+                        );
+                    } else {
+                        csub_nbit_const_direct_trunc_fast_releasing_scratch(
+                            &mut b, &acc, c, ctrl, window, &scratch,
+                        );
+                    }
+                } else if is_add {
+                    cadd_nbit_const_direct_trunc_fast_borrowed_carries(
+                        &mut b, &acc, c, ctrl, window, &scratch,
+                    );
+                } else {
+                    csub_nbit_const_direct_trunc_fast_borrowed_carries(
+                        &mut b, &acc, c, ctrl, window, &scratch,
+                    );
+                }
+                if ctrl_value != 0 {
+                    b.x(ctrl);
+                }
+                (b.ops, acc, b.next_qubit as usize, b.next_bit as usize)
+            };
+
+            let (base_ops, base_acc, base_nq, base_nb) = build_one(false);
+            let (parked_ops, parked_acc, parked_nq, parked_nb) = build_one(true);
+            let inputs: Vec<u64> = (0..64u64)
+                .map(|shot| {
+                    let mixed = shot
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add(0xD1B5_4A32_D192_ED03);
+                    match shot % 4 {
+                        0 => mixed | (!0u64 << 33),
+                        1 => mixed & ((1u64 << 34) - 1),
+                        _ => mixed ^ (mixed >> 29),
+                    }
+                })
+                .collect();
+
+            let run = |ops: &[Op], acc: &[QubitId], nq: usize, nb: usize| {
+                let mut seed = Shake256::default();
+                seed.update(b"special-fold-park-selftest");
+                seed.update(&[ctrl_value as u8, is_add as u8]);
+                let mut xof = seed.finalize_xof();
+                let mut sim = Simulator::new(nq, nb, &mut xof);
+                sim.clear_for_shot();
+                for (shot, &input) in inputs.iter().enumerate() {
+                    for bit_index in 0..nbits {
+                        if (input >> bit_index) & 1 != 0 {
+                            *sim.qubit_mut(acc[bit_index]) |= 1u64 << shot;
+                        }
+                    }
+                }
+                sim.apply_iter(ops.iter());
+                let outputs: Vec<u64> = (0..64)
+                    .map(|shot| {
+                        let mut value = 0u64;
+                        for bit_index in 0..nbits {
+                            value |= ((sim.qubit(acc[bit_index]) >> shot) & 1) << bit_index;
+                        }
+                        value
+                    })
+                    .collect();
+                let clean = (nbits..nq).all(|q| sim.qubit(QubitId(q as u64)) == 0);
+                (outputs, clean, sim.phase)
+            };
+
+            let (base_out, base_clean, base_phase) =
+                run(&base_ops, &base_acc, base_nq, base_nb);
+            let (parked_out, parked_clean, parked_phase) =
+                run(&parked_ops, &parked_acc, parked_nq, parked_nb);
+            if !base_clean || base_phase != 0 {
+                return Err(format!(
+                    "baseline dirty: ctrl={ctrl_value} add={is_add} clean={base_clean} phase=0x{base_phase:x}"
+                ));
+            }
+            if !parked_clean || parked_phase != 0 {
+                return Err(format!(
+                    "parked dirty: ctrl={ctrl_value} add={is_add} clean={parked_clean} phase=0x{parked_phase:x}"
+                ));
+            }
+            if base_out != parked_out {
+                let shot = base_out
+                    .iter()
+                    .zip(&parked_out)
+                    .position(|(base, parked)| base != parked)
+                    .unwrap_or(0);
+                return Err(format!(
+                    "value mismatch shot {shot}: base=0x{:x} parked=0x{:x} input=0x{:x} ctrl={ctrl_value} add={is_add}",
+                    base_out[shot], parked_out[shot], inputs[shot]
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod direct_const_tests {
+    use super::*;
+    use sha3::{
+        digest::{ExtendableOutput, Update, XofReader},
+        Shake128,
+    };
+
+    fn set_reg<R: XofReader>(sim: &mut Simulator<'_, R>, qs: &[QubitId], val: u64, shot: usize) {
+        for (i, &q) in qs.iter().enumerate() {
+            if ((val >> i) & 1) != 0 {
+                *sim.qubit_mut(q) |= 1u64 << shot;
+            } else {
+                *sim.qubit_mut(q) &= !(1u64 << shot);
+            }
+        }
+    }
+
+    fn get_reg<R: XofReader>(sim: &Simulator<'_, R>, qs: &[QubitId], shot: usize) -> u64 {
+        let mut out = 0u64;
+        for (i, &q) in qs.iter().enumerate() {
+            out |= ((sim.qubit(q) >> shot) & 1) << i;
+        }
+        out
+    }
+
+    #[test]
+    fn one_inv_dx3_blocker_is_fail_closed_on_cleanup_invariant() {
+        assert!(ONE_INV_DX3_AFFINE_PA_BLOCKER.contains("Rx-Qx"));
+        assert!(ONE_INV_DX3_AFFINE_PA_BLOCKER.contains("second inversion"));
+        assert!(ONE_INV_DX3_AFFINE_PA_BLOCKER.contains("dirty reset"));
+    }
+
+    #[test]
+    fn dialog_gcd_selected_body_nocin_matches_cin_reference() {
+        if let Err(e) = dialog_gcd_selected_body_nocin_selftest() {
+            panic!("no-c_in selected body selftest failed: {e}");
+        }
+    }
+
+    #[test]
+    fn aliased_gate_wrappers_are_not_silent_noops() {
+        let mut b = B::new();
+        let q0 = b.alloc_qubit();
+        let q1 = b.alloc_qubit();
+        b.cz(q0, q0);
+        b.ccz(q0, q0, q1);
+        b.ccz(q0, q1, q0);
+        b.ccz(q0, q0, q0);
+        b.ccx(q0, q0, q1);
+        let kinds = b.ops.iter().map(|op| op.kind).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                OperationType::Z,
+                OperationType::CZ,
+                OperationType::CZ,
+                OperationType::Z,
+                OperationType::CX,
+            ]
+        );
+        assert!(std::panic::catch_unwind(|| {
+            let mut b = B::new();
+            let q = b.alloc_qubit();
+            b.cx(q, q);
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            let mut b = B::new();
+            let q0 = b.alloc_qubit();
+            let q1 = b.alloc_qubit();
+            b.ccx(q0, q1, q0);
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn dx3_witness_is_not_an_output_cleanup_coordinate() {
+        let p = SECP256K1_P;
+        let beta = U256::from_str_radix(
+            "7AE96A2B657C07106E64479EAC3434E99CF0497512F58995C1396C28719501EE",
+            16,
+        )
+        .unwrap();
+        let dx = U256::from(0x1234_5678_9abc_def0u64);
+        let beta_dx = beta.mul_mod(dx, p);
+        assert_ne!(dx, beta_dx);
+        assert_eq!(beta.mul_mod(beta, p).mul_mod(beta, p), U256::from(1u64));
+        assert_eq!(
+            dx.mul_mod(dx, p).mul_mod(dx, p),
+            beta_dx.mul_mod(beta_dx, p).mul_mod(beta_dx, p)
+        );
+    }
+
+    fn assert_borrowed_carry_adder_basis(is_sub: bool) {
+        const N: usize = 5;
+        const MOD: u64 = 1 << N;
+        let mut b = B::new();
+        let a = b.alloc_qubits(N);
+        let acc = b.alloc_qubits(N);
+        let carries = b.alloc_qubits(N - 1);
+        if is_sub {
+            sub_nbit_qq_fast_borrowed_carries(&mut b, &a, &acc, &carries);
+        } else {
+            add_nbit_qq_fast_borrowed_carries(&mut b, &a, &acc, &carries);
+        }
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+
+        for batch in 0..16usize {
+            let mut seed = Shake128::default();
+            seed.update(if is_sub {
+                b"borrowed-sub-small"
+            } else {
+                b"borrowed-add-small"
+            });
+            let mut xof = seed.finalize_xof();
+            let mut sim = Simulator::new(nq, nb, &mut xof);
+            for shot in 0..64usize {
+                let case = batch * 64 + shot;
+                let x = (case as u64) & (MOD - 1);
+                let y = ((case as u64) >> N) & (MOD - 1);
+                set_reg(&mut sim, &acc, x, shot);
+                set_reg(&mut sim, &a, y, shot);
+            }
+            sim.apply(&b.ops);
+            assert_eq!(
+                sim.global_phase(),
+                0,
+                "borrowed carry adder left phase garbage"
+            );
+            for shot in 0..64usize {
+                let case = batch * 64 + shot;
+                let x = (case as u64) & (MOD - 1);
+                let y = ((case as u64) >> N) & (MOD - 1);
+                let expect = if is_sub {
+                    x.wrapping_sub(y) & (MOD - 1)
+                } else {
+                    x.wrapping_add(y) & (MOD - 1)
+                };
+                assert_eq!(get_reg(&sim, &acc, shot), expect, "case {case}");
+                assert_eq!(get_reg(&sim, &a, shot), y, "a changed in case {case}");
+                assert_eq!(
+                    get_reg(&sim, &carries, shot),
+                    0,
+                    "borrowed carries not clean in case {case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_carry_add_small_basis_is_clean() {
+        assert_borrowed_carry_adder_basis(false);
+    }
+
+    #[test]
+    fn borrowed_carry_sub_small_basis_is_clean() {
+        assert_borrowed_carry_adder_basis(true);
+    }
+
+    fn sub_mod_p(a: U256, b: U256, p: U256) -> U256 {
+        if a >= b {
+            a - b
+        } else {
+            p - (b - a)
+        }
+    }
+
+    #[test]
+    fn direct_controlled_const_sub_small_basis_is_phase_clean() {
+        const N: usize = 8;
+        let c = U256::from(0b1011_0111u64);
+        let mut b = B::new();
+        let acc = b.alloc_qubits(N);
+        let ctrl = b.alloc_qubit();
+        csub_nbit_const_direct_fast(&mut b, &acc, c, ctrl);
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+
+        let mut seed = Shake128::default();
+        seed.update(b"direct-csub-small");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(nq, nb, &mut xof);
+        for shot in 0..64usize {
+            let x = ((shot * 37 + 11) & 0xff) as u64;
+            let ctrl_v = (shot & 1) as u64;
+            set_reg(&mut sim, &acc, x, shot);
+            if ctrl_v != 0 {
+                *sim.qubit_mut(ctrl) |= 1u64 << shot;
+            }
+        }
+        sim.apply(&b.ops);
+        assert_eq!(sim.global_phase(), 0, "direct csub left phase garbage");
+        for shot in 0..64usize {
+            let x = ((shot * 37 + 11) & 0xff) as u64;
+            let ctrl_v = (shot & 1) as u64;
+            let expect = x.wrapping_sub(ctrl_v * 0b1011_0111) & 0xff;
+            assert_eq!(get_reg(&sim, &acc, shot), expect, "shot {shot}");
+            assert_eq!((sim.qubit(ctrl) >> shot) & 1, ctrl_v, "ctrl shot {shot}");
+        }
+    }
+
+    #[test]
+    fn direct_controlled_const_add_small_basis_is_phase_clean() {
+        const N: usize = 8;
+        let c = U256::from(0b1011_0111u64);
+        let mut b = B::new();
+        let acc = b.alloc_qubits(N);
+        let ctrl = b.alloc_qubit();
+        cadd_nbit_const_direct_fast(&mut b, &acc, c, ctrl);
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+
+        let mut seed = Shake128::default();
+        seed.update(b"direct-cadd-small");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(nq, nb, &mut xof);
+        for shot in 0..64usize {
+            let x = ((shot * 37 + 11) & 0xff) as u64;
+            let ctrl_v = (shot & 1) as u64;
+            set_reg(&mut sim, &acc, x, shot);
+            if ctrl_v != 0 {
+                *sim.qubit_mut(ctrl) |= 1u64 << shot;
+            }
+        }
+        sim.apply(&b.ops);
+        assert_eq!(sim.global_phase(), 0, "direct cadd left phase garbage");
+        for shot in 0..64usize {
+            let x = ((shot * 37 + 11) & 0xff) as u64;
+            let ctrl_v = (shot & 1) as u64;
+            let expect = x.wrapping_add(ctrl_v * 0b1011_0111) & 0xff;
+            assert_eq!(get_reg(&sim, &acc, shot), expect, "shot {shot}");
+            assert_eq!((sim.qubit(ctrl) >> shot) & 1, ctrl_v, "ctrl shot {shot}");
+        }
+    }
+
+    #[test]
+    fn round84_fused_square_xtail_component_matches_relation() {
+        let ops = build_round84_fused_square_xtail_component();
+        let (num_qubits, num_bits, _num_registers, regs) = analyze_ops(ops.iter().copied());
+        assert_eq!(regs.len(), 4);
+        let p = SECP256K1_P;
+        let cases: Vec<(U256, U256, U256)> = (0..32u64)
+            .map(|i| {
+                let tx = U256::from_limbs([
+                    0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i + 1),
+                    0xd1b5_4a32_d192_ed03u64.wrapping_mul(i + 3),
+                    0x94d0_49bb_1331_11ebu64.wrapping_mul(i + 5),
+                    0x2545_f491_4f6c_dd1du64.wrapping_mul(i + 7),
+                ]) % p;
+                let lam = U256::from_limbs([
+                    0xbf58_476d_1ce4_e5b9u64.wrapping_mul(i + 11),
+                    0x94d0_49bb_1331_11ebu64.wrapping_mul(i + 13),
+                    0xdbe6_d5d5_fe4c_ce2fu64.wrapping_mul(i + 17),
+                    0xa409_3822_299f_31d0u64.wrapping_mul(i + 19),
+                ]) % p;
+                let ox = U256::from_limbs([
+                    0x632b_e59b_d9b4_e019u64.wrapping_mul(i + 23),
+                    0x8515_7af5_4f1d_2d2du64.wrapping_mul(i + 29),
+                    0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i + 31),
+                    0xbf58_476d_1ce4_e5b9u64.wrapping_mul(i + 37),
+                ]) % p;
+                (tx, lam, ox)
+            })
+            .collect();
+
+        let mut seed = Shake128::default();
+        seed.update(b"round84-xtail-component");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        for (shot, (tx, lam, ox)) in cases.iter().enumerate() {
+            sim.set_register(&regs[0], *tx, shot);
+            sim.set_register(&regs[1], *lam, shot);
+            sim.set_register(&regs[2], *ox, shot);
+            sim.set_register(&regs[3], U256::ZERO, shot);
+        }
+
+        sim.apply(&ops);
+        for (shot, (tx, lam, ox)) in cases.iter().enumerate() {
+            let expected = sub_mod_p(
+                sub_mod_p(lam.mul_mod(*lam, p), *tx, p),
+                ox.add_mod(*ox, p),
+                p,
+            );
+            assert_eq!(
+                sim.get_register(&regs[0], shot),
+                expected,
+                "x-tail shot {shot}"
+            );
+            assert_eq!(sim.get_register(&regs[1], shot), *lam, "lambda shot {shot}");
+            assert_eq!(
+                sim.get_register(&regs[2], shot),
+                *ox,
+                "offset-x shot {shot}"
+            );
+        }
+        let live_mask = (1u64 << cases.len()) - 1;
+        assert_eq!(sim.global_phase() & live_mask, 0, "x-tail phase garbage");
+        for reg in &regs {
+            for item in reg {
+                if let QubitOrBit::Qubit(q) = *item {
+                    *sim.qubit_mut(q) = 0;
+                }
+            }
+        }
+        for q in 0..num_qubits {
+            assert_eq!(
+                sim.qubit(QubitId(q)) & live_mask,
+                0,
+                "x-tail ancilla garbage q{q}"
+            );
+        }
+    }
+
+    #[test]
+    fn round190_selector_fused_source_live_residual_is_exact_on_small_widths() {
+        for width in [2usize, 3, 4] {
+            let ops = build_round190_selector_fused_source_live_residual_width(width);
+            let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+            assert_eq!(num_registers, 3, "width {width} register count");
+            assert_eq!(regs.len(), 3, "width {width} regs");
+            assert_eq!(num_bits as usize, width, "width {width} hmr bits");
+            assert_eq!(num_qubits as usize, 4 * width + 3, "width {width} qubits");
+            for (idx, reg) in regs.iter().enumerate() {
+                assert_eq!(reg.len(), width, "width {width} reg {idx}");
+                assert!(reg.iter().all(|item| matches!(item, QubitOrBit::Qubit(_))));
+            }
+            let toffoli_ops = ops
+                .iter()
+                .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+                .count();
+            assert_eq!(toffoli_ops, 3 * width, "width {width} toffoli");
+            let pred_reg: Vec<QubitId> = regs[0]
+                .iter()
+                .map(|item| match item {
+                    QubitOrBit::Qubit(q) => *q,
+                    _ => unreachable!(),
+                })
+                .collect();
+            let add_reg: Vec<QubitId> = regs[1]
+                .iter()
+                .map(|item| match item {
+                    QubitOrBit::Qubit(q) => *q,
+                    _ => unreachable!(),
+                })
+                .collect();
+            let target_reg: Vec<QubitId> = regs[2]
+                .iter()
+                .map(|item| match item {
+                    QubitOrBit::Qubit(q) => *q,
+                    _ => unreachable!(),
+                })
+                .collect();
+
+            let modulus = 1u64 << width;
+            let states = modulus * modulus * modulus;
+            let mut seed = Shake128::default();
+            seed.update(b"round190-selector-fused-source-live-residual");
+            seed.update(&[width as u8]);
+            let mut xof = seed.finalize_xof();
+            for batch_start in (0..states).step_by(64) {
+                let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+                let batch_end = (batch_start + 64).min(states);
+                for case in batch_start..batch_end {
+                    let shot = (case - batch_start) as usize;
+                    let predecessor = case & (modulus - 1);
+                    let addend = (case >> width) & (modulus - 1);
+                    let target = (case >> (2 * width)) & (modulus - 1);
+                    set_reg(&mut sim, &pred_reg, predecessor, shot);
+                    set_reg(&mut sim, &add_reg, addend, shot);
+                    set_reg(&mut sim, &target_reg, target, shot);
+                }
+
+                sim.apply(&ops);
+                let live_mask = if batch_end - batch_start == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << (batch_end - batch_start)) - 1
+                };
+                assert_eq!(
+                    sim.global_phase() & live_mask,
+                    0,
+                    "width {width} selector-fused residual phase garbage"
+                );
+                for case in batch_start..batch_end {
+                    let shot = (case - batch_start) as usize;
+                    let predecessor = case & (modulus - 1);
+                    let addend = (case >> width) & (modulus - 1);
+                    let target = (case >> (2 * width)) & (modulus - 1);
+                    let low = predecessor & 0b11;
+                    let expected = if low == 0 {
+                        target
+                    } else if ((predecessor >> 1) & 1) != 0 {
+                        target.wrapping_sub(addend) & (modulus - 1)
+                    } else {
+                        target.wrapping_add(addend) & (modulus - 1)
+                    };
+                    assert_eq!(
+                        get_reg(&sim, &pred_reg, shot),
+                        predecessor,
+                        "width {width} predecessor changed case {case}"
+                    );
+                    assert_eq!(
+                        get_reg(&sim, &add_reg, shot),
+                        addend,
+                        "width {width} addend changed case {case}"
+                    );
+                    assert_eq!(
+                        get_reg(&sim, &target_reg, shot),
+                        expected,
+                        "width {width} target mismatch case {case}"
+                    );
+                }
+                for reg in [&pred_reg, &add_reg, &target_reg] {
+                    for &q in reg {
+                        *sim.qubit_mut(q) = 0;
+                    }
+                }
+                for q in 0..num_qubits {
+                    assert_eq!(
+                        sim.qubit(QubitId(q)) & live_mask,
+                        0,
+                        "width {width} scratch garbage q{q}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round190_external_active_signed_digit_is_select0_safe_on_small_widths() {
+        for width in [2usize, 3, 4] {
+            let ops = build_round190_external_active_signed_digit_width(width);
+            let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+            assert_eq!(num_registers, 4, "width {width} register count");
+            assert_eq!(regs.len(), 4, "width {width} regs");
+            assert_eq!(num_bits as usize, width, "width {width} hmr bits");
+            assert_eq!(num_qubits as usize, 3 * width + 4, "width {width} qubits");
+            assert_eq!(regs[0].len(), 1, "width {width} active width");
+            assert_eq!(regs[1].len(), 1, "width {width} sign width");
+            assert_eq!(regs[2].len(), width, "width {width} addend width");
+            assert_eq!(regs[3].len(), width, "width {width} target width");
+            for (idx, reg) in regs.iter().enumerate() {
+                assert!(
+                    reg.iter().all(|item| matches!(item, QubitOrBit::Qubit(_))),
+                    "width {width} reg {idx} must be qubits"
+                );
+            }
+            let toffoli_ops = ops
+                .iter()
+                .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+                .count();
+            assert_eq!(toffoli_ops, 3 * width - 2, "width {width} toffoli");
+
+            let active_q = match regs[0][0] {
+                QubitOrBit::Qubit(q) => q,
+                _ => unreachable!(),
+            };
+            let sign_q = match regs[1][0] {
+                QubitOrBit::Qubit(q) => q,
+                _ => unreachable!(),
+            };
+            let add_reg: Vec<QubitId> = regs[2]
+                .iter()
+                .map(|item| match item {
+                    QubitOrBit::Qubit(q) => *q,
+                    _ => unreachable!(),
+                })
+                .collect();
+            let target_reg: Vec<QubitId> = regs[3]
+                .iter()
+                .map(|item| match item {
+                    QubitOrBit::Qubit(q) => *q,
+                    _ => unreachable!(),
+                })
+                .collect();
+
+            let modulus = 1u64 << width;
+            let states = 4 * modulus * modulus;
+            let mut seed = Shake128::default();
+            seed.update(b"round190-external-active-signed-digit");
+            seed.update(&[width as u8]);
+            let mut xof = seed.finalize_xof();
+            for batch_start in (0..states).step_by(64) {
+                let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+                let batch_end = (batch_start + 64).min(states);
+                for case in batch_start..batch_end {
+                    let shot = (case - batch_start) as usize;
+                    let active = case & 1;
+                    let sign = (case >> 1) & 1;
+                    let addend = (case >> 2) & (modulus - 1);
+                    let target = (case >> (2 + width)) & (modulus - 1);
+                    *sim.qubit_mut(active_q) |= active << shot;
+                    *sim.qubit_mut(sign_q) |= sign << shot;
+                    set_reg(&mut sim, &add_reg, addend, shot);
+                    set_reg(&mut sim, &target_reg, target, shot);
+                }
+
+                sim.apply(&ops);
+                let live_mask = if batch_end - batch_start == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << (batch_end - batch_start)) - 1
+                };
+                assert_eq!(
+                    sim.global_phase() & live_mask,
+                    0,
+                    "width {width} external-active phase garbage"
+                );
+                for case in batch_start..batch_end {
+                    let shot = (case - batch_start) as usize;
+                    let active = case & 1;
+                    let sign = (case >> 1) & 1;
+                    let addend = (case >> 2) & (modulus - 1);
+                    let target = (case >> (2 + width)) & (modulus - 1);
+                    let expected = if active == 0 {
+                        target
+                    } else if sign != 0 {
+                        target.wrapping_sub(addend) & (modulus - 1)
+                    } else {
+                        target.wrapping_add(addend) & (modulus - 1)
+                    };
+                    assert_eq!(
+                        (sim.qubit(active_q) >> shot) & 1,
+                        active,
+                        "width {width} active changed case {case}"
+                    );
+                    assert_eq!(
+                        (sim.qubit(sign_q) >> shot) & 1,
+                        sign,
+                        "width {width} sign changed case {case}"
+                    );
+                    assert_eq!(
+                        get_reg(&sim, &add_reg, shot),
+                        addend,
+                        "width {width} addend changed case {case}"
+                    );
+                    assert_eq!(
+                        get_reg(&sim, &target_reg, shot),
+                        expected,
+                        "width {width} target mismatch case {case}"
+                    );
+                }
+                *sim.qubit_mut(active_q) = 0;
+                *sim.qubit_mut(sign_q) = 0;
+                for reg in [&add_reg, &target_reg] {
+                    for &q in reg {
+                        *sim.qubit_mut(q) = 0;
+                    }
+                }
+                for q in 0..num_qubits {
+                    assert_eq!(
+                        sim.qubit(QubitId(q)) & live_mask,
+                        0,
+                        "width {width} external-active scratch garbage q{q}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round190_shared_active_external_digits_reuse_selector_safely_on_small_widths() {
+        for (width, digits) in [(2usize, 3usize), (3, 2)] {
+            let ops = build_round190_shared_active_external_signed_digits_width(width, digits);
+            let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+            assert_eq!(
+                num_registers as usize,
+                1 + 2 * digits,
+                "width {width} digits {digits} register count"
+            );
+            assert_eq!(
+                regs.len(),
+                1 + 2 * digits,
+                "width {width} digits {digits} regs"
+            );
+            assert_eq!(
+                num_bits as usize,
+                width * digits,
+                "width {width} digits {digits} hmr bits"
+            );
+            assert_eq!(
+                num_qubits as usize,
+                (2 * digits + 2) * width + 3,
+                "width {width} digits {digits} qubits"
+            );
+            for (idx, reg) in regs.iter().enumerate() {
+                assert_eq!(reg.len(), width, "width {width} digits {digits} reg {idx}");
+                assert!(
+                    reg.iter().all(|item| matches!(item, QubitOrBit::Qubit(_))),
+                    "width {width} digits {digits} reg {idx} must be qubits"
+                );
+            }
+            let toffoli_ops = ops
+                .iter()
+                .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+                .count();
+            assert_eq!(
+                toffoli_ops,
+                2 + digits * (3 * width - 2),
+                "width {width} digits {digits} toffoli"
+            );
+
+            let qregs: Vec<Vec<QubitId>> = regs
+                .iter()
+                .map(|reg| {
+                    reg.iter()
+                        .map(|item| match item {
+                            QubitOrBit::Qubit(q) => *q,
+                            _ => unreachable!(),
+                        })
+                        .collect()
+                })
+                .collect();
+
+            let modulus = 1u64 << width;
+            let mut states = modulus;
+            for _ in 0..digits {
+                states *= modulus * modulus;
+            }
+            let mut seed = Shake128::default();
+            seed.update(b"round190-shared-active-external-digits");
+            seed.update(&[width as u8, digits as u8]);
+            let mut xof = seed.finalize_xof();
+            for batch_start in (0..states).step_by(64) {
+                let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+                let batch_end = (batch_start + 64).min(states);
+                for case in batch_start..batch_end {
+                    let shot = (case - batch_start) as usize;
+                    let mut cursor = case;
+                    let predecessor = cursor & (modulus - 1);
+                    cursor >>= width;
+                    set_reg(&mut sim, &qregs[0], predecessor, shot);
+                    for digit in 0..digits {
+                        let addend = cursor & (modulus - 1);
+                        cursor >>= width;
+                        let target = cursor & (modulus - 1);
+                        cursor >>= width;
+                        set_reg(&mut sim, &qregs[1 + 2 * digit], addend, shot);
+                        set_reg(&mut sim, &qregs[2 + 2 * digit], target, shot);
+                    }
+                }
+
+                sim.apply(&ops);
+                let live_mask = if batch_end - batch_start == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << (batch_end - batch_start)) - 1
+                };
+                assert_eq!(
+                    sim.global_phase() & live_mask,
+                    0,
+                    "width {width} digits {digits} shared-active phase garbage"
+                );
+                for case in batch_start..batch_end {
+                    let shot = (case - batch_start) as usize;
+                    let mut cursor = case;
+                    let predecessor = cursor & (modulus - 1);
+                    cursor >>= width;
+                    assert_eq!(
+                        get_reg(&sim, &qregs[0], shot),
+                        predecessor,
+                        "width {width} digits {digits} predecessor changed case {case}"
+                    );
+                    let active = (predecessor & 0b11) != 0;
+                    let sign = ((predecessor >> 1) & 1) != 0;
+                    for digit in 0..digits {
+                        let addend = cursor & (modulus - 1);
+                        cursor >>= width;
+                        let target = cursor & (modulus - 1);
+                        cursor >>= width;
+                        let expected = if !active {
+                            target
+                        } else if sign {
+                            target.wrapping_sub(addend) & (modulus - 1)
+                        } else {
+                            target.wrapping_add(addend) & (modulus - 1)
+                        };
+                        assert_eq!(
+                            get_reg(&sim, &qregs[1 + 2 * digit], shot),
+                            addend,
+                            "width {width} digits {digits} addend {digit} changed case {case}"
+                        );
+                        assert_eq!(
+                            get_reg(&sim, &qregs[2 + 2 * digit], shot),
+                            expected,
+                            "width {width} digits {digits} target {digit} mismatch case {case}"
+                        );
+                    }
+                }
+                for reg in &qregs {
+                    for &q in reg {
+                        *sim.qubit_mut(q) = 0;
+                    }
+                }
+                for q in 0..num_qubits {
+                    assert_eq!(
+                        sim.qubit(QubitId(q)) & live_mask,
+                        0,
+                        "width {width} digits {digits} shared-active scratch garbage q{q}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round190_two_slot_router_is_exact_only_under_exactly_one_active_invariant() {
+        for width in [2usize, 3] {
+            let ops = build_round190_two_slot_exactly_one_active_router_width(width);
+            let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+            assert_eq!(num_registers, 6, "width {width} register count");
+            assert_eq!(regs.len(), 6, "width {width} regs");
+            assert_eq!(num_bits as usize, width - 1, "width {width} hmr bits");
+            assert_eq!(num_qubits as usize, 7 * width + 2, "width {width} qubits");
+            for (idx, reg) in regs.iter().enumerate() {
+                assert_eq!(reg.len(), width, "width {width} reg {idx}");
+                assert!(reg.iter().all(|item| matches!(item, QubitOrBit::Qubit(_))));
+            }
+            let toffoli_ops = ops
+                .iter()
+                .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+                .count();
+            assert_eq!(toffoli_ops, 7 * width + 1, "width {width} toffoli");
+
+            let qregs: Vec<Vec<QubitId>> = regs
+                .iter()
+                .map(|reg| {
+                    reg.iter()
+                        .map(|item| match item {
+                            QubitOrBit::Qubit(q) => *q,
+                            _ => unreachable!(),
+                        })
+                        .collect()
+                })
+                .collect();
+            let modulus = 1u64 << width;
+            let active_predecessors: Vec<u64> =
+                (0..modulus).filter(|pred| (pred & 0b11) != 0).collect();
+            let inactive_predecessors: Vec<u64> =
+                (0..modulus).filter(|pred| (pred & 0b11) == 0).collect();
+
+            let mut cases = Vec::new();
+            if width == 2 {
+                for active_slot in 0..2usize {
+                    for &active_pred in &active_predecessors {
+                        for &inactive_pred in &inactive_predecessors {
+                            for add0 in 0..modulus {
+                                for target0 in 0..modulus {
+                                    for add1 in 0..modulus {
+                                        for target1 in 0..modulus {
+                                            let (pred0, pred1) = if active_slot == 0 {
+                                                (active_pred, inactive_pred)
+                                            } else {
+                                                (inactive_pred, active_pred)
+                                            };
+                                            cases.push((
+                                                active_slot,
+                                                pred0,
+                                                add0,
+                                                target0,
+                                                pred1,
+                                                add1,
+                                                target1,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for i in 0..512u64 {
+                    let active_slot = (i & 1) as usize;
+                    let active_pred =
+                        active_predecessors[((i / 2) as usize) % active_predecessors.len()];
+                    let inactive_pred =
+                        inactive_predecessors[((i / 14) as usize) % inactive_predecessors.len()];
+                    let add0 = (3 * i + 1) & (modulus - 1);
+                    let target0 = (5 * i + 2) & (modulus - 1);
+                    let add1 = (7 * i + 3) & (modulus - 1);
+                    let target1 = (11 * i + 4) & (modulus - 1);
+                    let (pred0, pred1) = if active_slot == 0 {
+                        (active_pred, inactive_pred)
+                    } else {
+                        (inactive_pred, active_pred)
+                    };
+                    cases.push((active_slot, pred0, add0, target0, pred1, add1, target1));
+                }
+            }
+
+            let mut seed = Shake128::default();
+            seed.update(b"round190-two-slot-router");
+            seed.update(&[width as u8]);
+            let mut xof = seed.finalize_xof();
+            for batch_start in (0..cases.len()).step_by(64) {
+                let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+                let batch_end = (batch_start + 64).min(cases.len());
+                for (shot, case) in cases[batch_start..batch_end].iter().enumerate() {
+                    let &(_, pred0, add0, target0, pred1, add1, target1) = case;
+                    set_reg(&mut sim, &qregs[0], pred0, shot);
+                    set_reg(&mut sim, &qregs[1], add0, shot);
+                    set_reg(&mut sim, &qregs[2], target0, shot);
+                    set_reg(&mut sim, &qregs[3], pred1, shot);
+                    set_reg(&mut sim, &qregs[4], add1, shot);
+                    set_reg(&mut sim, &qregs[5], target1, shot);
+                }
+
+                sim.apply(&ops);
+                let live_mask = if batch_end - batch_start == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << (batch_end - batch_start)) - 1
+                };
+                assert_eq!(
+                    sim.global_phase() & live_mask,
+                    0,
+                    "width {width} two-slot router phase garbage"
+                );
+                for (shot, case) in cases[batch_start..batch_end].iter().enumerate() {
+                    let &(active_slot, pred0, add0, target0, pred1, add1, target1) = case;
+                    let sign = if active_slot == 0 {
+                        (pred0 >> 1) & 1
+                    } else {
+                        (pred1 >> 1) & 1
+                    };
+                    let expected0 = if active_slot == 0 {
+                        if sign != 0 {
+                            target0.wrapping_sub(add0) & (modulus - 1)
+                        } else {
+                            target0.wrapping_add(add0) & (modulus - 1)
+                        }
+                    } else {
+                        target0
+                    };
+                    let expected1 = if active_slot == 1 {
+                        if sign != 0 {
+                            target1.wrapping_sub(add1) & (modulus - 1)
+                        } else {
+                            target1.wrapping_add(add1) & (modulus - 1)
+                        }
+                    } else {
+                        target1
+                    };
+                    assert_eq!(get_reg(&sim, &qregs[0], shot), pred0, "pred0 case {case:?}");
+                    assert_eq!(get_reg(&sim, &qregs[1], shot), add0, "add0 case {case:?}");
+                    assert_eq!(
+                        get_reg(&sim, &qregs[2], shot),
+                        expected0,
+                        "target0 case {case:?}"
+                    );
+                    assert_eq!(get_reg(&sim, &qregs[3], shot), pred1, "pred1 case {case:?}");
+                    assert_eq!(get_reg(&sim, &qregs[4], shot), add1, "add1 case {case:?}");
+                    assert_eq!(
+                        get_reg(&sim, &qregs[5], shot),
+                        expected1,
+                        "target1 case {case:?}"
+                    );
+                }
+                for reg in &qregs {
+                    for &q in reg {
+                        *sim.qubit_mut(q) = 0;
+                    }
+                }
+                for q in 0..num_qubits {
+                    assert_eq!(
+                        sim.qubit(QubitId(q)) & live_mask,
+                        0,
+                        "width {width} two-slot router scratch garbage q{q}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round190_active_source_live_signed_digit_hmr_is_exact_on_active_rows() {
+        for width in [2usize, 3, 4] {
+            let ops = build_round190_active_source_live_signed_digit_hmr_width(width);
+            let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+            assert_eq!(num_registers, 3, "width {width} register count");
+            assert_eq!(regs.len(), 3, "width {width} regs");
+            assert_eq!(num_bits as usize, width - 1, "width {width} hmr bits");
+            assert_eq!(num_qubits as usize, 4 * width + 1, "width {width} qubits");
+            for (idx, reg) in regs.iter().enumerate() {
+                assert_eq!(reg.len(), width, "width {width} reg {idx}");
+                assert!(reg.iter().all(|item| matches!(item, QubitOrBit::Qubit(_))));
+            }
+            let toffoli_ops = ops
+                .iter()
+                .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+                .count();
+            assert_eq!(toffoli_ops, width - 1, "width {width} toffoli");
+            let pred_reg: Vec<QubitId> = regs[0]
+                .iter()
+                .map(|item| match item {
+                    QubitOrBit::Qubit(q) => *q,
+                    _ => unreachable!(),
+                })
+                .collect();
+            let add_reg: Vec<QubitId> = regs[1]
+                .iter()
+                .map(|item| match item {
+                    QubitOrBit::Qubit(q) => *q,
+                    _ => unreachable!(),
+                })
+                .collect();
+            let target_reg: Vec<QubitId> = regs[2]
+                .iter()
+                .map(|item| match item {
+                    QubitOrBit::Qubit(q) => *q,
+                    _ => unreachable!(),
+                })
+                .collect();
+
+            let modulus = 1u64 << width;
+            let active_predecessors: Vec<u64> =
+                (0..modulus).filter(|pred| (pred & 0b11) != 0).collect();
+            let states = active_predecessors.len() as u64 * modulus * modulus;
+            let mut seed = Shake128::default();
+            seed.update(b"round190-active-source-live-signed-digit-hmr");
+            seed.update(&[width as u8]);
+            let mut xof = seed.finalize_xof();
+            for batch_start in (0..states).step_by(64) {
+                let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+                let batch_end = (batch_start + 64).min(states);
+                for case in batch_start..batch_end {
+                    let shot = (case - batch_start) as usize;
+                    let pred_idx = (case % active_predecessors.len() as u64) as usize;
+                    let addend = (case / active_predecessors.len() as u64) & (modulus - 1);
+                    let target =
+                        (case / (active_predecessors.len() as u64 * modulus)) & (modulus - 1);
+                    let predecessor = active_predecessors[pred_idx];
+                    set_reg(&mut sim, &pred_reg, predecessor, shot);
+                    set_reg(&mut sim, &add_reg, addend, shot);
+                    set_reg(&mut sim, &target_reg, target, shot);
+                }
+
+                sim.apply(&ops);
+                let live_mask = if batch_end - batch_start == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << (batch_end - batch_start)) - 1
+                };
+                assert_eq!(
+                    sim.global_phase() & live_mask,
+                    0,
+                    "width {width} active HMR signed digit phase garbage"
+                );
+                for case in batch_start..batch_end {
+                    let shot = (case - batch_start) as usize;
+                    let pred_idx = (case % active_predecessors.len() as u64) as usize;
+                    let addend = (case / active_predecessors.len() as u64) & (modulus - 1);
+                    let target =
+                        (case / (active_predecessors.len() as u64 * modulus)) & (modulus - 1);
+                    let predecessor = active_predecessors[pred_idx];
+                    let expected = if ((predecessor >> 1) & 1) != 0 {
+                        target.wrapping_sub(addend) & (modulus - 1)
+                    } else {
+                        target.wrapping_add(addend) & (modulus - 1)
+                    };
+                    assert_eq!(
+                        get_reg(&sim, &pred_reg, shot),
+                        predecessor,
+                        "width {width} predecessor changed case {case}"
+                    );
+                    assert_eq!(
+                        get_reg(&sim, &add_reg, shot),
+                        addend,
+                        "width {width} addend changed case {case}"
+                    );
+                    assert_eq!(
+                        get_reg(&sim, &target_reg, shot),
+                        expected,
+                        "width {width} target mismatch case {case}"
+                    );
+                }
+                for reg in [&pred_reg, &add_reg, &target_reg] {
+                    for &q in reg {
+                        *sim.qubit_mut(q) = 0;
+                    }
+                }
+                for q in 0..num_qubits {
+                    assert_eq!(
+                        sim.qubit(QubitId(q)) & live_mask,
+                        0,
+                        "width {width} active HMR scratch garbage q{q}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round190_active_hmr_digit_is_not_select0_safe() {
+        const WIDTH: usize = 3;
+        let ops = build_round190_active_source_live_signed_digit_hmr_width(WIDTH);
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        assert_eq!(num_registers, 3);
+        assert_eq!(regs.len(), 3);
+        let pred_reg: Vec<QubitId> = regs[0]
+            .iter()
+            .map(|item| match item {
+                QubitOrBit::Qubit(q) => *q,
+                _ => unreachable!(),
+            })
+            .collect();
+        let add_reg: Vec<QubitId> = regs[1]
+            .iter()
+            .map(|item| match item {
+                QubitOrBit::Qubit(q) => *q,
+                _ => unreachable!(),
+            })
+            .collect();
+        let target_reg: Vec<QubitId> = regs[2]
+            .iter()
+            .map(|item| match item {
+                QubitOrBit::Qubit(q) => *q,
+                _ => unreachable!(),
+            })
+            .collect();
+
+        let mut seed = Shake128::default();
+        seed.update(b"round190-active-hmr-not-select0-safe");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        let inactive_predecessor = 0u64;
+        let addend = 3u64;
+        let target = 4u64;
+        set_reg(&mut sim, &pred_reg, inactive_predecessor, 0);
+        set_reg(&mut sim, &add_reg, addend, 0);
+        set_reg(&mut sim, &target_reg, target, 0);
+
+        sim.apply(&ops);
+        let got_target = get_reg(&sim, &target_reg, 0);
+        println!("METRIC round190_active_hmr_inactive_predecessor={inactive_predecessor}");
+        println!("METRIC round190_active_hmr_inactive_addend={addend}");
+        println!("METRIC round190_active_hmr_inactive_target_before={target}");
+        println!("METRIC round190_active_hmr_inactive_target_after={got_target}");
+        assert_eq!(get_reg(&sim, &pred_reg, 0), inactive_predecessor);
+        assert_eq!(get_reg(&sim, &add_reg, 0), addend);
+        assert_ne!(
+            got_target, target,
+            "active-HMR digit cannot be used as the select0-safe production residual"
+        );
+    }
+
+    fn qubit_reg(reg: &[QubitOrBit]) -> Vec<QubitId> {
+        reg.iter()
+            .map(|item| match item {
+                QubitOrBit::Qubit(q) => *q,
+                _ => panic!("expected qubit register"),
+            })
+            .collect()
+    }
+
+    fn round556_expected(
+        width: usize,
+        q_bits: usize,
+        rem: u64,
+        rem_divisor: u64,
+        coeff_seed: u64,
+        coeff_divisor: u64,
+        sigma: u64,
+        q_increment: u64,
+    ) -> Option<(u64, u64)> {
+        let modulus = 1u64 << width;
+        let mask = modulus - 1;
+        if rem_divisor == 0 || coeff_divisor == 0 {
+            return None;
+        }
+        if (rem_divisor << (q_bits - 1)) >= modulus {
+            return None;
+        }
+        if (coeff_divisor << (q_bits - 1)) >= modulus {
+            return None;
+        }
+        let quotient = rem / rem_divisor;
+        if quotient >= (1u64 << q_bits) {
+            return None;
+        }
+        if coeff_seed >= coeff_divisor {
+            return None;
+        }
+        let coeff_restored = coeff_seed + (quotient + q_increment) * coeff_divisor;
+        if coeff_restored >= modulus {
+            return None;
+        }
+        let coeff = coeff_restored.wrapping_sub((sigma & 1) * coeff_divisor) & mask;
+        Some((rem % rem_divisor, coeff))
+    }
+
+    #[test]
+    fn round556_shifted_source_row_component_has_material_free_bound() {
+        const WIDTH: usize = 258;
+        const QBITS: usize = 26;
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_round556_shifted_source_row_component_phase_resources(WIDTH, QBITS);
+        let (num_qubits, _num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+        let old_materialized_formula = (6 * QBITS + 4) * WIDTH - (2 * QBITS + 2);
+        let shifted_source_q = 6 * WIDTH + QBITS + 5;
+
+        assert_eq!(num_registers, 5);
+        assert_eq!(regs[0].len(), WIDTH);
+        assert_eq!(regs[1].len(), WIDTH);
+        assert_eq!(regs[2].len(), WIDTH);
+        assert_eq!(regs[3].len(), WIDTH);
+        assert_eq!(regs[4].len(), 4 + QBITS);
+        assert_eq!(num_qubits as usize, shifted_source_q);
+        assert_eq!(peak_qubits as usize, shifted_source_q);
+        assert!(toffoli_ops <= old_materialized_formula);
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "round556_shifted_source_remainder_digits"));
+        assert_eq!(peak_phase, "round556_shifted_source_remainder_digits");
+    }
+
+    #[test]
+    fn round556_shifted_source_row_component_matches_round120_relation() {
+        const WIDTH: usize = 5;
+        const QBITS: usize = 3;
+        let ops = build_round556_shifted_source_row_component(WIDTH, QBITS);
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        assert_eq!(num_registers, 5);
+        let rem_reg = qubit_reg(&regs[0]);
+        let rem_divisor_reg = qubit_reg(&regs[1]);
+        let coeff_reg = qubit_reg(&regs[2]);
+        let coeff_divisor_reg = qubit_reg(&regs[3]);
+        let meta_reg = qubit_reg(&regs[4]);
+
+        let mut public = vec![false; num_qubits as usize];
+        for reg in [
+            &rem_reg,
+            &rem_divisor_reg,
+            &coeff_reg,
+            &coeff_divisor_reg,
+            &meta_reg,
+        ] {
+            for &q in reg {
+                public[q.0 as usize] = true;
+            }
+        }
+
+        let mut cases = Vec::new();
+        let modulus = 1u64 << WIDTH;
+        for rem_divisor in 1..modulus {
+            for coeff_divisor in 1..modulus {
+                for rem in 0..modulus {
+                    for coeff_seed in 0..coeff_divisor {
+                        for sigma in 0..=1u64 {
+                            for q_increment in 0..=1u64 {
+                                if let Some(expected) = round556_expected(
+                                    WIDTH,
+                                    QBITS,
+                                    rem,
+                                    rem_divisor,
+                                    coeff_seed,
+                                    coeff_divisor,
+                                    sigma,
+                                    q_increment,
+                                ) {
+                                    cases.push((
+                                        rem,
+                                        rem_divisor,
+                                        coeff_seed,
+                                        coeff_divisor,
+                                        sigma,
+                                        q_increment,
+                                        expected,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!cases.is_empty());
+
+        let mut seed = Shake128::default();
+        seed.update(b"round556-shifted-source-row-relation");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut xof);
+        for (batch, chunk) in cases.chunks(64).enumerate() {
+            sim.clear_for_shot();
+            for (shot, case) in chunk.iter().enumerate() {
+                let (rem, rem_divisor, coeff_seed, coeff_divisor, sigma, q_increment, _) = *case;
+                set_reg(&mut sim, &rem_reg, rem, shot);
+                set_reg(&mut sim, &rem_divisor_reg, rem_divisor, shot);
+                set_reg(&mut sim, &coeff_reg, coeff_seed, shot);
+                set_reg(&mut sim, &coeff_divisor_reg, coeff_divisor, shot);
+                set_reg(&mut sim, &meta_reg, sigma | (q_increment << 1), shot);
+            }
+            sim.apply(&ops);
+            let live = if chunk.len() == 64 {
+                u64::MAX
+            } else {
+                (1u64 << chunk.len()) - 1
+            };
+            assert_eq!(sim.global_phase() & live, 0, "phase dirty in batch {batch}");
+            for q in 0..num_qubits {
+                if !public[q as usize] {
+                    assert_eq!(
+                        sim.qubit(QubitId(q as u32)) & live,
+                        0,
+                        "scratch q{q} dirty in batch {batch}"
+                    );
+                }
+            }
+            for (shot, case) in chunk.iter().enumerate() {
+                let (
+                    _rem,
+                    rem_divisor,
+                    _coeff_seed,
+                    coeff_divisor,
+                    sigma,
+                    q_increment,
+                    (expected_rem, expected_coeff),
+                ) = *case;
+                assert_eq!(
+                    get_reg(&sim, &rem_reg, shot),
+                    expected_rem,
+                    "batch {batch} shot {shot}"
+                );
+                assert_eq!(
+                    get_reg(&sim, &rem_divisor_reg, shot),
+                    rem_divisor,
+                    "batch {batch} shot {shot}"
+                );
+                assert_eq!(
+                    get_reg(&sim, &coeff_reg, shot),
+                    expected_coeff,
+                    "batch {batch} shot {shot}"
+                );
+                assert_eq!(
+                    get_reg(&sim, &coeff_divisor_reg, shot),
+                    coeff_divisor,
+                    "batch {batch} shot {shot}"
+                );
+                assert_eq!(
+                    get_reg(&sim, &meta_reg, shot),
+                    sigma | (q_increment << 1),
+                    "batch {batch} shot {shot}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_centered_shifted_source_qbit_row_fit_bench_has_sidecar_bound() {
+        const Q_BITS: usize = DIRECT_CENTERED_LOW_BRANCH_META_BITS;
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_shifted_source_qbit_row_fit_bench_phase_resources(Q_BITS);
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+
+        assert_eq!(num_registers, 4);
+        assert_eq!(regs.len(), 4);
+        assert!(num_bits as usize >= 2 * N);
+        for (idx, reg) in regs.iter().enumerate() {
+            assert_eq!(reg.len(), N, "register {idx} width");
+        }
+        let sidecar_q = 2 * N + DIRECT_CENTERED_BRANCH_SIDECAR_COMPONENT_SCRATCH_BITS;
+        assert_eq!(num_qubits as usize, sidecar_q);
+        assert_eq!(peak_qubits as usize, sidecar_q);
+        assert_eq!(
+            toffoli_ops,
+            Q_BITS * (6 * N - 2) - 2 * Q_BITS * (Q_BITS - 1)
+        );
+        assert_eq!(
+            peak_phase,
+            "direct_centered_shifted_source_qbit_alloc_envelope"
+        );
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_shifted_source_qbit_remainder_digits"));
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_shifted_source_qbit_coeff_digits"));
+    }
+
+    #[test]
+    fn direct_centered_shifted_source_qbit_row_toy_is_exact_and_phase_clean() {
+        const WIDTH: usize = 5;
+        const QBITS: usize = 3;
+        let mut b = B::new();
+        let rem = b.alloc_qubits(WIDTH);
+        let rem_divisor = b.alloc_qubits(WIDTH);
+        let coeff = b.alloc_qubits(WIDTH);
+        let coeff_divisor = b.alloc_qubits(WIDTH);
+        let qbits = b.alloc_qubits(QBITS);
+        let gated = b.alloc_qubits(WIDTH);
+        let lt_tmp = b.alloc_qubit();
+        let sign_one = b.alloc_qubit();
+        let nonnegative = b.alloc_qubit();
+        let carries = b.alloc_qubits(WIDTH - 1);
+        emit_direct_centered_shifted_source_qbit_row(
+            &mut b,
+            &rem,
+            &rem_divisor,
+            &coeff,
+            &coeff_divisor,
+            &qbits,
+            &gated,
+            lt_tmp,
+            sign_one,
+            nonnegative,
+            &carries,
+        );
+
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+        let mut public = vec![false; nq];
+        for reg in [&rem, &rem_divisor, &coeff, &coeff_divisor] {
+            for &q in reg {
+                public[q.0 as usize] = true;
+            }
+        }
+
+        let modulus = 1u64 << WIDTH;
+        let mut cases = Vec::new();
+        for rem_divisor_value in 1..modulus {
+            for coeff_divisor_value in 1..modulus {
+                for rem_value in 0..modulus {
+                    for coeff_seed in 0..coeff_divisor_value {
+                        if let Some(expected) = round556_expected(
+                            WIDTH,
+                            QBITS,
+                            rem_value,
+                            rem_divisor_value,
+                            coeff_seed,
+                            coeff_divisor_value,
+                            0,
+                            0,
+                        ) {
+                            cases.push((
+                                rem_value,
+                                rem_divisor_value,
+                                coeff_seed,
+                                coeff_divisor_value,
+                                expected,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!cases.is_empty());
+
+        let mut seed = Shake128::default();
+        seed.update(b"direct-centered-shifted-source-qbit-row-toy");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(nq, nb, &mut xof);
+        for (batch, chunk) in cases.chunks(64).enumerate() {
+            sim.clear_for_shot();
+            for (shot, case) in chunk.iter().enumerate() {
+                let (rem_value, rem_divisor_value, coeff_seed, coeff_divisor_value, _) = *case;
+                set_reg(&mut sim, &rem, rem_value, shot);
+                set_reg(&mut sim, &rem_divisor, rem_divisor_value, shot);
+                set_reg(&mut sim, &coeff, coeff_seed, shot);
+                set_reg(&mut sim, &coeff_divisor, coeff_divisor_value, shot);
+            }
+            sim.apply(&b.ops);
+            let live = if chunk.len() == 64 {
+                u64::MAX
+            } else {
+                (1u64 << chunk.len()) - 1
+            };
+            assert_eq!(sim.global_phase() & live, 0, "phase dirty in batch {batch}");
+            for q in 0..nq {
+                if !public[q] {
+                    assert_eq!(
+                        sim.qubit(QubitId(q as u32)) & live,
+                        0,
+                        "scratch q{q} dirty in batch {batch}"
+                    );
+                }
+            }
+            for (shot, case) in chunk.iter().enumerate() {
+                let (
+                    _rem_value,
+                    rem_divisor_value,
+                    _coeff_seed,
+                    coeff_divisor_value,
+                    (expected_rem, expected_coeff),
+                ) = *case;
+                assert_eq!(get_reg(&sim, &rem, shot), expected_rem);
+                assert_eq!(get_reg(&sim, &rem_divisor, shot), rem_divisor_value);
+                assert_eq!(get_reg(&sim, &coeff, shot), expected_coeff);
+                assert_eq!(get_reg(&sim, &coeff_divisor, shot), coeff_divisor_value);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_centered_branch_sidecar_component_has_relaxed_google_abi_shape() {
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_branch_sidecar_bench_phase_resources();
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+
+        assert_eq!(regs.len(), 4);
+        assert_eq!(num_registers, 4);
+        assert_eq!(num_bits as usize, 2 * N);
+        for (idx, reg) in regs.iter().enumerate() {
+            assert_eq!(reg.len(), N, "register {idx} width");
+        }
+        for item in &regs[0] {
+            assert!(matches!(item, QubitOrBit::Qubit(_)), "r0 must be qubits");
+        }
+        for item in &regs[1] {
+            assert!(matches!(item, QubitOrBit::Qubit(_)), "r1 must be qubits");
+        }
+        for item in &regs[2] {
+            assert!(matches!(item, QubitOrBit::Bit(_)), "r2 must be bits");
+        }
+        for item in &regs[3] {
+            assert!(matches!(item, QubitOrBit::Bit(_)), "r3 must be bits");
+        }
+
+        let scratch = num_qubits as usize - 2 * N;
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+        assert_eq!(
+            scratch,
+            DIRECT_CENTERED_BRANCH_SIDECAR_COMPONENT_SCRATCH_BITS
+        );
+        assert!(scratch <= DIRECT_CENTERED_RELAXED_SCRATCH_BUDGET);
+        assert!(num_qubits as usize <= DIRECT_CENTERED_RELAXED_Q_TARGET);
+        assert!(toffoli_ops < DIRECT_CENTERED_RELAXED_T_TARGET);
+        assert_eq!(toffoli_ops, 936);
+        assert_eq!(peak_qubits as usize, num_qubits as usize);
+        assert_eq!(peak_phase, "direct_centered_sidecar_google_abi");
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_sidecar_emit_branch_history"));
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_sidecar_clear_branch_history"));
+    }
+
+    #[test]
+    fn direct_centered_branch_digit_clean_toy_is_exact() {
+        const W: usize = 5;
+        let mut b = B::new();
+        let coeff_acc = b.alloc_qubits(W);
+        let coeff_v = b.alloc_qubits(W);
+        let branch = b.alloc_qubit();
+        let sign = b.alloc_qubit();
+        let gated = b.alloc_qubits(W);
+        let carry = b.alloc_qubit();
+        emit_direct_centered_branch_digit_update_clean(
+            &mut b, &coeff_acc, &coeff_v, branch, sign, &gated, carry,
+        );
+
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+        let modulus = 1u64 << W;
+        let mut cases = Vec::new();
+        for acc in 0..modulus {
+            for source in 0..modulus {
+                for branch_value in 0..=1u64 {
+                    for sign_value in 0..=1u64 {
+                        let expected = if branch_value == 0 {
+                            acc
+                        } else if sign_value != 0 {
+                            (acc + source) & (modulus - 1)
+                        } else {
+                            acc.wrapping_sub(source) & (modulus - 1)
+                        };
+                        cases.push((acc, source, branch_value, sign_value, expected));
+                    }
+                }
+            }
+        }
+
+        let mut seed = Shake128::default();
+        seed.update(b"direct-centered-branch-digit-clean-toy");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(nq, nb, &mut xof);
+        for (batch, chunk) in cases.chunks(64).enumerate() {
+            sim.clear_for_shot();
+            for (shot, &(acc, source, branch_value, sign_value, _expected)) in
+                chunk.iter().enumerate()
+            {
+                set_reg(&mut sim, &coeff_acc, acc, shot);
+                set_reg(&mut sim, &coeff_v, source, shot);
+                if branch_value != 0 {
+                    *sim.qubit_mut(branch) |= 1u64 << shot;
+                }
+                if sign_value != 0 {
+                    *sim.qubit_mut(sign) |= 1u64 << shot;
+                }
+            }
+            sim.apply(&b.ops);
+            let live = if chunk.len() == 64 {
+                u64::MAX
+            } else {
+                (1u64 << chunk.len()) - 1
+            };
+            assert_eq!(sim.global_phase() & live, 0, "phase dirty in batch {batch}");
+            assert_eq!(sim.qubit(carry) & live, 0, "carry dirty in batch {batch}");
+            for (shot, &(acc, source, branch_value, sign_value, expected)) in
+                chunk.iter().enumerate()
+            {
+                assert_eq!(
+                    get_reg(&sim, &gated, shot),
+                    0,
+                    "gated dirty in batch {batch} shot {shot}"
+                );
+                assert_eq!(
+                    get_reg(&sim, &coeff_acc, shot),
+                    expected,
+                    "batch {batch} shot {shot}"
+                );
+                assert_eq!(
+                    get_reg(&sim, &coeff_v, shot),
+                    source,
+                    "batch {batch} shot {shot}"
+                );
+                assert_eq!(
+                    (sim.qubit(branch) >> shot) & 1,
+                    branch_value,
+                    "batch {batch} shot {shot}"
+                );
+                assert_eq!(
+                    (sim.qubit(sign) >> shot) & 1,
+                    sign_value,
+                    "batch {batch} shot {shot}"
+                );
+                let _ = acc;
+            }
+        }
+    }
+
+    #[test]
+    fn direct_centered_branch_replay_then_fast_finalizer_toy_is_exact() {
+        const W: usize = 4;
+        const HISTORY: usize = 3;
+        let mut b = B::new();
+        let coeff_acc = b.alloc_qubits(W);
+        let coeff_v = b.alloc_qubits(W);
+        let pred_a = b.alloc_qubits(HISTORY);
+        let pred_b = b.alloc_qubits(HISTORY);
+        let branch = b.alloc_qubits(HISTORY);
+        let sign = b.alloc_qubit();
+        let gated = b.alloc_qubits(W);
+        let digit_carry = b.alloc_qubit();
+        let nonnegative = b.alloc_qubit();
+        let extra_carry = b.alloc_qubit();
+
+        for i in 0..HISTORY {
+            b.ccx(pred_a[i], pred_b[i], branch[i]);
+        }
+        for &branch_bit in &branch {
+            emit_direct_centered_branch_digit_update_clean(
+                &mut b,
+                &coeff_acc,
+                &coeff_v,
+                branch_bit,
+                sign,
+                &gated,
+                digit_carry,
+            );
+        }
+        for i in (1..HISTORY).rev() {
+            b.ccx(pred_a[i], pred_b[i], branch[i]);
+        }
+        let carries = [branch[1], branch[2], extra_carry];
+        emit_direct_centered_branch_retained_finalizer_fast(
+            &mut b,
+            &coeff_acc,
+            &coeff_v,
+            branch[0],
+            &gated,
+            nonnegative,
+            &carries,
+        );
+        b.ccx(pred_a[0], pred_b[0], branch[0]);
+
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+        let modulus = 1u64 << W;
+        let mask = modulus - 1;
+        let mut cases = Vec::new();
+        for acc in 0..modulus {
+            for source in 0..modulus {
+                for pred_a_value in 0..(1u64 << HISTORY) {
+                    for pred_b_value in 0..(1u64 << HISTORY) {
+                        for sign_value in 0..=1u64 {
+                            let mut expected = acc;
+                            for i in 0..HISTORY {
+                                let branch_value =
+                                    ((pred_a_value >> i) & 1) & ((pred_b_value >> i) & 1);
+                                if branch_value != 0 {
+                                    expected = if sign_value != 0 {
+                                        expected.wrapping_add(source) & mask
+                                    } else {
+                                        expected.wrapping_sub(source) & mask
+                                    };
+                                }
+                            }
+                            if (pred_a_value & 1) != 0 && (pred_b_value & 1) != 0 {
+                                expected = expected.wrapping_sub(source) & mask;
+                            }
+                            cases.push((
+                                acc,
+                                source,
+                                pred_a_value,
+                                pred_b_value,
+                                sign_value,
+                                expected,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut seed = Shake128::default();
+        seed.update(b"direct-centered-branch-replay-fast-finalizer-toy");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(nq, nb, &mut xof);
+        for (batch, chunk) in cases.chunks(64).enumerate() {
+            sim.clear_for_shot();
+            for (shot, &(acc, source, pred_a_value, pred_b_value, sign_value, _expected)) in
+                chunk.iter().enumerate()
+            {
+                set_reg(&mut sim, &coeff_acc, acc, shot);
+                set_reg(&mut sim, &coeff_v, source, shot);
+                set_reg(&mut sim, &pred_a, pred_a_value, shot);
+                set_reg(&mut sim, &pred_b, pred_b_value, shot);
+                if sign_value != 0 {
+                    *sim.qubit_mut(sign) |= 1u64 << shot;
+                }
+            }
+            sim.apply(&b.ops);
+            let live = if chunk.len() == 64 {
+                u64::MAX
+            } else {
+                (1u64 << chunk.len()) - 1
+            };
+            assert_eq!(sim.global_phase() & live, 0, "phase dirty in batch {batch}");
+            assert_eq!(sim.qubit(digit_carry) & live, 0, "digit carry dirty");
+            assert_eq!(sim.qubit(nonnegative) & live, 0, "nonnegative dirty");
+            assert_eq!(sim.qubit(extra_carry) & live, 0, "extra carry dirty");
+            for &branch_bit in &branch {
+                assert_eq!(sim.qubit(branch_bit) & live, 0, "branch history dirty");
+            }
+            for (shot, &(acc, source, pred_a_value, pred_b_value, sign_value, expected)) in
+                chunk.iter().enumerate()
+            {
+                assert_eq!(
+                    get_reg(&sim, &coeff_acc, shot),
+                    expected,
+                    "batch {batch} shot {shot}"
+                );
+                assert_eq!(get_reg(&sim, &gated, shot), 0);
+                assert_eq!(get_reg(&sim, &coeff_v, shot), source);
+                assert_eq!(get_reg(&sim, &pred_a, shot), pred_a_value);
+                assert_eq!(get_reg(&sim, &pred_b, shot), pred_b_value);
+                assert_eq!((sim.qubit(sign) >> shot) & 1, sign_value);
+                let _ = acc;
+            }
+        }
+    }
+
+    #[test]
+    fn direct_centered_low_path_branch_predicate_toy_is_exact() {
+        const W: usize = 4;
+        let mut b = B::new();
+        let low_path = b.alloc_qubits(W);
+        let divisor = b.alloc_qubits(W);
+        let branch = b.alloc_qubit();
+        let shifted = b.alloc_qubits(W + 1);
+        let divisor_high = b.alloc_qubit();
+        let cmp_cin = b.alloc_qubit();
+        emit_direct_centered_low_path_branch_toggle(
+            &mut b,
+            &low_path,
+            &divisor,
+            branch,
+            &shifted,
+            divisor_high,
+            cmp_cin,
+        );
+
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+        let mut cases = Vec::new();
+        for low_value in 0..(1u64 << W) {
+            for divisor_value in 0..(1u64 << W) {
+                for initial_branch in 0..=1u64 {
+                    let predicate = if 2 * low_value >= divisor_value { 1 } else { 0 };
+                    cases.push((
+                        low_value,
+                        divisor_value,
+                        initial_branch,
+                        initial_branch ^ predicate,
+                    ));
+                }
+            }
+        }
+
+        let mut seed = Shake128::default();
+        seed.update(b"direct-centered-low-path-branch-predicate-toy");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(nq, nb, &mut xof);
+        for (batch, chunk) in cases.chunks(64).enumerate() {
+            sim.clear_for_shot();
+            for (shot, &(low_value, divisor_value, initial_branch, _expected_branch)) in
+                chunk.iter().enumerate()
+            {
+                set_reg(&mut sim, &low_path, low_value, shot);
+                set_reg(&mut sim, &divisor, divisor_value, shot);
+                if initial_branch != 0 {
+                    *sim.qubit_mut(branch) |= 1u64 << shot;
+                }
+            }
+            sim.apply(&b.ops);
+            let live = if chunk.len() == 64 {
+                u64::MAX
+            } else {
+                (1u64 << chunk.len()) - 1
+            };
+            assert_eq!(sim.global_phase() & live, 0, "phase dirty in batch {batch}");
+            for &wire in &shifted {
+                assert_eq!(sim.qubit(wire) & live, 0, "shifted scratch dirty");
+            }
+            assert_eq!(
+                sim.qubit(divisor_high) & live,
+                0,
+                "divisor-high scratch dirty"
+            );
+            assert_eq!(sim.qubit(cmp_cin) & live, 0, "cmp-cin scratch dirty");
+            for (shot, &(low_value, divisor_value, _initial_branch, expected_branch)) in
+                chunk.iter().enumerate()
+            {
+                assert_eq!(get_reg(&sim, &low_path, shot), low_value);
+                assert_eq!(get_reg(&sim, &divisor, shot), divisor_value);
+                assert_eq!(
+                    (sim.qubit(branch) >> shot) & 1,
+                    expected_branch,
+                    "batch {batch} shot {shot}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_centered_branch_predicate_step_fit_stays_inside_round714_envelope() {
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_branch_predicate_step_fit_bench_phase_resources();
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+
+        assert_eq!(regs.len(), 4);
+        assert_eq!(num_registers, 4);
+        assert_eq!(num_bits as usize, 3 * N);
+        let scratch = num_qubits as usize - 2 * N;
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+        assert_eq!(
+            scratch,
+            DIRECT_CENTERED_BRANCH_SIDECAR_COMPONENT_SCRATCH_BITS
+        );
+        assert!(scratch <= DIRECT_CENTERED_RELAXED_SCRATCH_BUDGET);
+        assert!(num_qubits as usize <= DIRECT_CENTERED_RELAXED_Q_TARGET);
+        assert!(toffoli_ops < 2_000);
+        assert_eq!(peak_qubits as usize, num_qubits as usize);
+        assert_eq!(
+            peak_phase,
+            "direct_centered_branch_predicate_step_alloc_envelope"
+        );
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_predicate_compare"));
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_digit_clean_addsub"));
+    }
+
+    #[test]
+    fn direct_centered_binary_trie_qrom_toy_is_exact_and_phase_clean() {
+        const ADDRESS_BITS: usize = 3;
+        const TARGET_BITS: usize = 5;
+        const ROWS: usize = 6;
+
+        let table_words: Vec<u64> = (0..ROWS)
+            .map(|row| ((row as u64).wrapping_mul(0b10101) ^ 0b10010) & ((1u64 << TARGET_BITS) - 1))
+            .collect();
+
+        let mut b = B::new();
+        let address = b.alloc_qubits(ADDRESS_BITS);
+        let target = b.alloc_qubits(TARGET_BITS);
+        emit_direct_centered_binary_trie_qrom_xor_table(
+            &mut b,
+            &address,
+            &target,
+            ROWS,
+            &table_words,
+        );
+
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+        let mut public = vec![false; nq];
+        for &q in address.iter().chain(target.iter()) {
+            public[q.0 as usize] = true;
+        }
+
+        let mut cases = Vec::new();
+        for addr in 0..(1u64 << ADDRESS_BITS) {
+            for before in 0..(1u64 << TARGET_BITS) {
+                let loaded = if (addr as usize) < ROWS {
+                    table_words[addr as usize]
+                } else {
+                    0
+                };
+                cases.push((addr, before, before ^ loaded));
+            }
+        }
+
+        let mut seed = Shake128::default();
+        seed.update(b"direct-centered-binary-trie-qrom-toy");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(nq, nb, &mut xof);
+        for (batch, chunk) in cases.chunks(64).enumerate() {
+            sim.clear_for_shot();
+            for (shot, &(addr, before, _expected)) in chunk.iter().enumerate() {
+                set_reg(&mut sim, &address, addr, shot);
+                set_reg(&mut sim, &target, before, shot);
+            }
+            sim.apply(&b.ops);
+            let live = if chunk.len() == 64 {
+                u64::MAX
+            } else {
+                (1u64 << chunk.len()) - 1
+            };
+            assert_eq!(sim.global_phase() & live, 0, "phase dirty in batch {batch}");
+            for q in 0..nq {
+                if !public[q] {
+                    assert_eq!(
+                        sim.qubit(QubitId(q as u32)) & live,
+                        0,
+                        "scratch q{q} dirty in batch {batch}"
+                    );
+                }
+            }
+            for (shot, &(addr, _before, expected)) in chunk.iter().enumerate() {
+                assert_eq!(get_reg(&sim, &address, shot), addr);
+                assert_eq!(get_reg(&sim, &target, shot), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_centered_binary_trie_qrom_roundtrip_toy_is_exact_and_phase_clean() {
+        const ADDRESS_BITS: usize = 3;
+        const TARGET_BITS: usize = 9;
+        const ROWS: usize = 6;
+
+        let table_words = direct_centered_binary_trie_qrom_table_words(ROWS, TARGET_BITS);
+
+        let mut b = B::new();
+        let address = b.alloc_qubits(ADDRESS_BITS);
+        let target = b.alloc_qubits(TARGET_BITS);
+        emit_direct_centered_binary_trie_qrom_xor_table(
+            &mut b,
+            &address,
+            &target,
+            ROWS,
+            &table_words,
+        );
+        emit_direct_centered_binary_trie_qrom_xor_table(
+            &mut b,
+            &address,
+            &target,
+            ROWS,
+            &table_words,
+        );
+
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+        let mut public = vec![false; nq];
+        for &q in address.iter().chain(target.iter()) {
+            public[q.0 as usize] = true;
+        }
+
+        let mut cases = Vec::new();
+        for addr in 0..(1u64 << ADDRESS_BITS) {
+            for before in 0..(1u64 << TARGET_BITS) {
+                cases.push((addr, before));
+            }
+        }
+
+        let mut seed = Shake128::default();
+        seed.update(b"direct-centered-binary-trie-qrom-roundtrip-toy");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(nq, nb, &mut xof);
+        for (batch, chunk) in cases.chunks(64).enumerate() {
+            sim.clear_for_shot();
+            for (shot, &(addr, before)) in chunk.iter().enumerate() {
+                set_reg(&mut sim, &address, addr, shot);
+                set_reg(&mut sim, &target, before, shot);
+            }
+            sim.apply(&b.ops);
+            let live = if chunk.len() == 64 {
+                u64::MAX
+            } else {
+                (1u64 << chunk.len()) - 1
+            };
+            assert_eq!(sim.global_phase() & live, 0, "phase dirty in batch {batch}");
+            for q in 0..nq {
+                if !public[q] {
+                    assert_eq!(
+                        sim.qubit(QubitId(q as u32)) & live,
+                        0,
+                        "scratch q{q} dirty in batch {batch}"
+                    );
+                }
+            }
+            for (shot, &(addr, before)) in chunk.iter().enumerate() {
+                assert_eq!(get_reg(&sim, &address, shot), addr);
+                assert_eq!(get_reg(&sim, &target, shot), before);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_centered_binary_trie_qrom_hits_round728_row_multiplier_budget() {
+        const ROWS: usize = 4_934;
+        const ADDRESS_BITS: usize = 13;
+        const TARGET_BITS: usize = 16;
+
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_binary_trie_qrom_bench_phase_resources(
+                ROWS,
+                ADDRESS_BITS,
+                TARGET_BITS,
+            );
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+        let expected_nodes = direct_centered_binary_trie_qrom_node_count(ROWS, ADDRESS_BITS);
+
+        assert_eq!(regs.len(), 4);
+        assert_eq!(num_registers, 4);
+        assert_eq!(num_bits as usize, 2 * N + expected_nodes);
+        assert_eq!(toffoli_ops, expected_nodes);
+        assert!(toffoli_ops <= 2 * ROWS + ADDRESS_BITS);
+        assert!(toffoli_ops <= 6 * ROWS);
+        assert_eq!(num_qubits as usize, 2 * N + ADDRESS_BITS + 1);
+        assert_eq!(peak_qubits as usize, num_qubits as usize);
+        assert_eq!(peak_phase, "direct_centered_binary_trie_qrom_unary_walk");
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_binary_trie_qrom_unary_walk"));
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_binary_trie_qrom_clear_root"));
+    }
+
+    #[test]
+    fn direct_centered_binary_trie_qrom_roundtrip_fits_round730_wide_payload_budget() {
+        const ROWS: usize = 4_934;
+        const ADDRESS_BITS: usize = 13;
+        const TARGET_BITS: usize = 84;
+
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_binary_trie_qrom_roundtrip_bench_phase_resources(
+                ROWS,
+                ADDRESS_BITS,
+                TARGET_BITS,
+            );
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+        let expected_nodes = direct_centered_binary_trie_qrom_node_count(ROWS, ADDRESS_BITS);
+
+        assert_eq!(regs.len(), 4);
+        assert_eq!(num_registers, 4);
+        assert_eq!(num_bits as usize, 2 * N + 2 * expected_nodes);
+        assert_eq!(toffoli_ops, 2 * expected_nodes);
+        assert_eq!(toffoli_ops, 19_746);
+        assert!(toffoli_ops <= 4 * ROWS + 2 * ADDRESS_BITS);
+        assert_eq!(num_qubits as usize, 2 * N + ADDRESS_BITS + 1);
+        assert_eq!(peak_qubits as usize, num_qubits as usize);
+        assert_eq!(
+            peak_phase,
+            "direct_centered_binary_trie_qrom_roundtrip_load_walk"
+        );
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_binary_trie_qrom_roundtrip_load_walk"));
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_binary_trie_qrom_roundtrip_clear_walk"));
+    }
+
+    #[test]
+    fn direct_centered_inline_predicate_finalizer_delta_fits_google_fast_width_if_replay_deleted() {
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_inline_predicate_finalizer_delta_fit_bench_phase_resources();
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+
+        assert_eq!(regs.len(), 4);
+        assert_eq!(num_registers, 4);
+        assert_eq!(num_bits as usize, 3 * N - 1);
+        let scratch = num_qubits as usize - 2 * N;
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+        assert_eq!(
+            scratch,
+            DIRECT_CENTERED_BRANCH_SIDECAR_COMPONENT_SCRATCH_BITS
+                + DIRECT_CENTERED_EXPLICIT_BRANCH_HISTORY_BITS
+        );
+        assert_eq!(num_qubits as usize, 1_425);
+        assert!(toffoli_ops < 122_000);
+        assert_eq!(peak_qubits as usize, num_qubits as usize);
+        assert_eq!(
+            peak_phase,
+            "direct_centered_inline_predicate_delta_alloc_dual_history_envelope"
+        );
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_predicate_compare"));
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_retained_fast_finalizer_subtract"));
+        assert!(!phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_digit_clean_addsub"));
+    }
+
+    #[test]
+    fn direct_centered_branch_retained_finalizer_toy_is_exact() {
+        const W: usize = 5;
+        let mut b = B::new();
+        let remainder = b.alloc_qubits(W);
+        let divisor = b.alloc_qubits(W);
+        let branch = b.alloc_qubit();
+        let gated = b.alloc_qubits(W);
+        let carry = b.alloc_qubit();
+        emit_direct_centered_branch_retained_finalizer(
+            &mut b, &remainder, &divisor, branch, &gated, carry,
+        );
+
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+        let modulus = 1u64 << W;
+        let mut cases = 0usize;
+        for divisor_value in 1..(1u64 << (W - 1)) {
+            for final_remainder in 0..divisor_value {
+                for branch_value in 0..=1u64 {
+                    let prefinal = final_remainder + branch_value * divisor_value;
+                    if prefinal >= modulus {
+                        continue;
+                    }
+                    cases += 1;
+                    let mut seed = Shake128::default();
+                    seed.update(&(cases as u64).to_le_bytes());
+                    let mut xof = seed.finalize_xof();
+                    let mut sim = Simulator::new(nq, nb, &mut xof);
+                    set_reg(&mut sim, &remainder, prefinal, 0);
+                    set_reg(&mut sim, &divisor, divisor_value, 0);
+                    if branch_value != 0 {
+                        *sim.qubit_mut(branch) |= 1;
+                    }
+                    sim.apply(&b.ops);
+                    assert_eq!(get_reg(&sim, &remainder, 0), final_remainder);
+                    assert_eq!(get_reg(&sim, &divisor, 0), divisor_value);
+                    assert_eq!((sim.qubit(branch) & 1), branch_value);
+                    assert_eq!(sim.qubit(carry) & 1, 0);
+                    assert_eq!(get_reg(&sim, &gated, 0), 0);
+                }
+            }
+        }
+        assert_eq!(cases, 240);
+    }
+
+    #[test]
+    fn direct_centered_branch_retained_fast_finalizer_toy_is_exact() {
+        const W: usize = 5;
+        let mut b = B::new();
+        let remainder = b.alloc_qubits(W);
+        let divisor = b.alloc_qubits(W);
+        let branch = b.alloc_qubit();
+        let gated = b.alloc_qubits(W);
+        let nonnegative = b.alloc_qubit();
+        let carries = b.alloc_qubits(W - 1);
+        emit_direct_centered_branch_retained_finalizer_fast(
+            &mut b,
+            &remainder,
+            &divisor,
+            branch,
+            &gated,
+            nonnegative,
+            &carries,
+        );
+
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+        let modulus = 1u64 << W;
+        let mut cases = 0usize;
+        for divisor_value in 1..(1u64 << (W - 1)) {
+            for final_remainder in 0..divisor_value {
+                for branch_value in 0..=1u64 {
+                    let prefinal = final_remainder + branch_value * divisor_value;
+                    if prefinal >= modulus {
+                        continue;
+                    }
+                    cases += 1;
+                    let mut seed = Shake128::default();
+                    seed.update(&(0xFA57_0000u64 + cases as u64).to_le_bytes());
+                    let mut xof = seed.finalize_xof();
+                    let mut sim = Simulator::new(nq, nb, &mut xof);
+                    set_reg(&mut sim, &remainder, prefinal, 0);
+                    set_reg(&mut sim, &divisor, divisor_value, 0);
+                    if branch_value != 0 {
+                        *sim.qubit_mut(branch) |= 1;
+                    }
+                    sim.apply(&b.ops);
+                    assert_eq!(get_reg(&sim, &remainder, 0), final_remainder);
+                    assert_eq!(get_reg(&sim, &divisor, 0), divisor_value);
+                    assert_eq!(sim.qubit(branch) & 1, branch_value);
+                    assert_eq!(sim.qubit(nonnegative) & 1, 0);
+                    assert_eq!(get_reg(&sim, &gated, 0), 0);
+                    assert_eq!(get_reg(&sim, &carries, 0), 0);
+                    assert_eq!(sim.global_phase() & 1, 0);
+                }
+            }
+        }
+        assert_eq!(cases, 240);
+    }
+
+    #[test]
+    fn direct_centered_branch_retained_finalizer_component_has_expected_shape() {
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_branch_retained_finalizer_bench_phase_resources();
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+
+        assert_eq!(regs.len(), 4);
+        assert_eq!(num_registers, 4);
+        assert_eq!(num_bits as usize, 2 * N);
+        assert_eq!(num_qubits as usize, 2 * N + N + 2);
+        assert_eq!(peak_qubits as usize, num_qubits as usize);
+        assert_eq!(toffoli_ops, 4 * N - 2);
+        assert_eq!(
+            peak_phase,
+            "direct_centered_branch_retained_finalizer_google_abi"
+        );
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_retained_finalizer_subtract"));
+    }
+
+    #[test]
+    fn direct_centered_branch_digit_clean_fit_stays_inside_round714_envelope() {
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_branch_digit_clean_fit_bench_phase_resources();
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+
+        assert_eq!(regs.len(), 4);
+        assert_eq!(num_registers, 4);
+        assert_eq!(num_bits as usize, 3 * N);
+        assert_eq!(
+            num_qubits as usize,
+            2 * N + DIRECT_CENTERED_BRANCH_SIDECAR_COMPONENT_SCRATCH_BITS
+        );
+        assert_eq!(peak_qubits as usize, num_qubits as usize);
+        assert_eq!(toffoli_ops, 3 * N - 2);
+        assert_eq!(
+            peak_phase,
+            "direct_centered_branch_digit_clean_alloc_envelope"
+        );
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_digit_clean_addsub"));
+    }
+
+    #[test]
+    fn direct_centered_remainder_abs_swap_transition_toy_is_exact() {
+        const W: usize = 4;
+        let mut b = B::new();
+        let low_path = b.alloc_qubits(W);
+        let divisor = b.alloc_qubits(W);
+        let branch = b.alloc_qubit();
+        let gated = b.alloc_qubits(W);
+        let carries = b.alloc_qubits(W - 1);
+        emit_direct_centered_remainder_abs_swap_transition(
+            &mut b, &low_path, &divisor, branch, &gated, &carries,
+        );
+
+        let nq = b.next_qubit as usize;
+        let nb = b.next_bit as usize;
+        let mut cases = Vec::new();
+        for divisor_value in 1..(1u64 << W) {
+            for low_value in 0..divisor_value {
+                let branch_value = u64::from(2 * low_value >= divisor_value);
+                let next_divisor = if branch_value == 0 {
+                    low_value
+                } else {
+                    divisor_value - low_value
+                };
+                cases.push((low_value, divisor_value, branch_value, next_divisor));
+            }
+        }
+
+        let mut seed = Shake128::default();
+        seed.update(b"direct-centered-remainder-abs-swap-transition-toy");
+        let mut xof = seed.finalize_xof();
+        let mut sim = Simulator::new(nq, nb, &mut xof);
+        for (batch, chunk) in cases.chunks(64).enumerate() {
+            sim.clear_for_shot();
+            for (shot, &(low_value, divisor_value, branch_value, _next_divisor)) in
+                chunk.iter().enumerate()
+            {
+                set_reg(&mut sim, &low_path, low_value, shot);
+                set_reg(&mut sim, &divisor, divisor_value, shot);
+                if branch_value != 0 {
+                    *sim.qubit_mut(branch) |= 1u64 << shot;
+                }
+            }
+            sim.apply(&b.ops);
+            let live = if chunk.len() == 64 {
+                u64::MAX
+            } else {
+                (1u64 << chunk.len()) - 1
+            };
+            assert_eq!(sim.global_phase() & live, 0, "phase dirty in batch {batch}");
+            for &wire in &gated {
+                assert_eq!(sim.qubit(wire) & live, 0, "gated divisor dirty");
+            }
+            for &wire in &carries {
+                assert_eq!(sim.qubit(wire) & live, 0, "borrowed carry dirty");
+            }
+            for (shot, &(_low_value, divisor_value, branch_value, next_divisor)) in
+                chunk.iter().enumerate()
+            {
+                assert_eq!(get_reg(&sim, &low_path, shot), divisor_value);
+                assert_eq!(get_reg(&sim, &divisor, shot), next_divisor);
+                assert_eq!((sim.qubit(branch) >> shot) & 1, branch_value);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_centered_row_transition_fit_stays_inside_round714_envelope() {
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_row_transition_fit_bench_phase_resources();
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+        let hmr_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::Hmr))
+            .count();
+
+        assert_eq!(regs.len(), 4);
+        assert_eq!(num_registers, 4);
+        assert_eq!(num_bits as usize, 4 * N - 1);
+        assert_eq!(
+            num_qubits as usize,
+            2 * N + DIRECT_CENTERED_BRANCH_SIDECAR_COMPONENT_SCRATCH_BITS
+        );
+        assert_eq!(peak_qubits as usize, num_qubits as usize);
+        assert_eq!(toffoli_ops, 2 * N - 1);
+        assert_eq!(hmr_ops, N - 1 + N);
+        assert_eq!(peak_phase, "direct_centered_row_transition_alloc_envelope");
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_row_transition_abs_add"));
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_row_transition_swap_next_state"));
+    }
+
+    #[test]
+    fn direct_centered_branch_replay_finalizer_fit_stays_inside_round714_envelope() {
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_branch_replay_finalizer_fit_bench_phase_resources();
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+
+        assert_eq!(regs.len(), 4);
+        assert_eq!(num_registers, 4);
+        assert_eq!(
+            num_bits as usize,
+            2 * N + DIRECT_CENTERED_EXPLICIT_BRANCH_HISTORY_BITS * N + (N - 1)
+        );
+        assert_eq!(
+            num_qubits as usize,
+            2 * N + DIRECT_CENTERED_BRANCH_SIDECAR_COMPONENT_SCRATCH_BITS
+        );
+        assert_eq!(peak_qubits as usize, num_qubits as usize);
+        assert_eq!(
+            toffoli_ops,
+            DIRECT_CENTERED_EXPLICIT_BRANCH_HISTORY_BITS * (3 * N - 2)
+                + (2 * DIRECT_CENTERED_EXPLICIT_BRANCH_HISTORY_BITS)
+                + (3 * N - 1)
+        );
+        assert_eq!(
+            peak_phase,
+            "direct_centered_branch_replay_finalizer_alloc_envelope"
+        );
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_replay_clear_nonfinal_history"));
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_retained_fast_finalizer_subtract"));
+    }
+
+    #[test]
+    fn direct_centered_predicate_replay_finalizer_fit_materializes_full_tail_projection() {
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_predicate_replay_finalizer_fit_bench_phase_resources();
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+
+        let predicate_toggle_t = 2 * (N + 1);
+        let branch_digit_t = 3 * N - 2;
+        let finalizer_t = 3 * N - 1;
+        let expected_tail_t = DIRECT_CENTERED_EXPLICIT_BRANCH_HISTORY_BITS
+            * (2 * predicate_toggle_t + branch_digit_t)
+            + finalizer_t;
+
+        assert_eq!(regs.len(), 4);
+        assert_eq!(num_registers, 4);
+        assert_eq!(
+            num_bits as usize,
+            2 * N + DIRECT_CENTERED_EXPLICIT_BRANCH_HISTORY_BITS * N + (N - 1)
+        );
+        assert_eq!(
+            num_qubits as usize,
+            2 * N + DIRECT_CENTERED_BRANCH_SIDECAR_COMPONENT_SCRATCH_BITS
+        );
+        assert_eq!(peak_qubits as usize, num_qubits as usize);
+        assert_eq!(toffoli_ops, expected_tail_t);
+        assert_eq!(toffoli_ops, 210_665);
+        assert_eq!(
+            peak_phase,
+            "direct_centered_predicate_replay_finalizer_alloc_envelope"
+        );
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_predicate_compare"));
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_retained_fast_finalizer_subtract"));
+    }
+
+    #[test]
+    fn direct_centered_sidecar_finalizer_fit_stays_inside_round714_envelope() {
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_sidecar_finalizer_fit_bench_phase_resources();
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+
+        assert_eq!(regs.len(), 4);
+        assert_eq!(num_registers, 4);
+        assert_eq!(num_bits as usize, 2 * N);
+        assert_eq!(
+            num_qubits as usize,
+            2 * N + DIRECT_CENTERED_BRANCH_SIDECAR_COMPONENT_SCRATCH_BITS
+        );
+        assert_eq!(peak_qubits as usize, num_qubits as usize);
+        assert_eq!(toffoli_ops, 4 * N - 2);
+        assert_eq!(
+            peak_phase,
+            "direct_centered_sidecar_finalizer_alloc_envelope"
+        );
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_retained_finalizer_gate_divisor"));
+    }
+
+    #[test]
+    fn direct_centered_sidecar_fast_finalizer_fit_stays_inside_round714_envelope() {
+        let (ops, phases, peak_qubits, peak_phase) =
+            build_direct_centered_sidecar_fast_finalizer_fit_bench_phase_resources();
+        let (num_qubits, num_bits, num_registers, regs) = analyze_ops(ops.iter().copied());
+        let toffoli_ops = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OperationType::CCX | OperationType::CCZ))
+            .count();
+
+        assert_eq!(regs.len(), 4);
+        assert_eq!(num_registers, 4);
+        assert_eq!(num_bits as usize, 2 * N + N - 1);
+        assert_eq!(
+            num_qubits as usize,
+            2 * N + DIRECT_CENTERED_BRANCH_SIDECAR_COMPONENT_SCRATCH_BITS
+        );
+        assert_eq!(peak_qubits as usize, num_qubits as usize);
+        assert_eq!(toffoli_ops, 3 * N - 1);
+        assert_eq!(
+            peak_phase,
+            "direct_centered_sidecar_fast_finalizer_alloc_envelope"
+        );
+        assert!(phases
+            .iter()
+            .any(|row| row.phase == "direct_centered_branch_retained_fast_finalizer_subtract"));
+    }
 }

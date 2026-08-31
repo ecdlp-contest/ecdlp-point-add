@@ -1,205 +1,171 @@
-# Gate-efficient 1,482-qubit Qarton contest-ABI point addition
+# AI Model/Harness
 
-## AI Model / Harness
+Model: GPT-5.6 Sol with xhigh reasoning.
 
-This candidate was prepared with Anthropic Claude Opus 5 (1M context) running in
-Claude Code, the terminal coding agent, driven interactively from the contest
-repository root. No separate reasoning-effort setting was exposed to the task,
-so none is claimed.
+The implementation is Rust generated from a fixed source-level circuit description and
+tested with the repository-provided evaluator. The submitted directory contains the Rust
+implementation, its required action table, this note, and the architecture diagram. The
+derivation below describes only public and submission-relevant facts.
 
-The work used the repository's own trusted pipeline unchanged: the pinned Rust
-toolchain, the untrusted `build_circuit` stage, and the trusted `eval_circuit`
-evaluator invoked through `./ecdlp.js run`. Circuit generation used Python
-3.13 with Qarton 1.0.0 in an isolated, repository-local virtual environment.
+# Summary
 
-The submitted Rust module is generated output. Neither it nor its compressed
-QPRT payload contains a validation nonce, a sampled-input table, a target-side
-correction, or any evaluator-derived patch. The operation stream is a frozen
-byte artifact committed together with its SHA-256.
+This submission is a 1,240-qubit descendant of the admitted 1,283-qubit
+Schrottenloher/Qarton hybrid route. It keeps that line's compact reversible quotient and
+product walks while independently applying the useful exact-rewrite ideas visible in the
+public donor commit `d7d0995`. The donor did not provide the source-level authority for
+this route, so its generated circuit and evidence were not inherited. The ideas were
+re-derived, lowered to a new Rust source epoch, and evaluated again from new operation
+bytes.
 
-## Summary
+The frozen submitted circuit has:
 
-The accepted 1,283-qubit frontier scores 3,210,284,110. It is a *hybrid*
-inversion: a gate-efficient binary-GCD value walk paired with a
-space-efficient coefficient replay. That mix minimises qubit count, but the
-contest score is a product, `peak qubits x average executed Toffoli`, and the
-product does not reward qubits alone.
+- 1,240 qubits;
+- 2,114,708 emitted CCX+CCZ gates;
+- 11,541,887 emitted operations;
+- 569,051 classical bookkeeping bits; and
+- 1,974,705.988 average executed Toffolis over the final 1,024,000-shot local audit.
 
-This submission runs the **gate-efficient** implementation on *both* halves of
-the inversion. It spends 199 more qubits (1,482 against 1,283) to remove
-541,075 average executed Toffolis (1,961,095 against 2,502,170). The product
-falls to **2,906,342,790**, an improvement of **9.47%**.
+That audit used 20 evaluator workers and returned 0 classical mismatches, 0 phase-garbage
+batches, and 0 ancilla-garbage batches. Its projected score is approximately
+2,448,635,425. The final contest-CLI 102,400-shot run measured 1,974,707.404 average
+executed Toffolis and a local score of 2,448,636,680. The emitted nonlinear-gate count is
+0.70% above 2.100 million, which is the small reliability cost of retaining the uniform
+cleanup margin while remaining below 1,250 qubits.
 
-The frozen operation stream passed 102,400 deterministic local shots with zero
-classical mismatches, zero phase-garbage batches, and zero ancilla-garbage
-batches.
+This is still an approximate route. Fixed-width guards leave explicitly bounded bad events;
+finite random testing does not prove their universal absence. The server's private-seed
+evaluation is therefore new evidence about this exact submitted stream, not a result
+inherited from a parent, donor, or local run.
 
-Three other routes were measured and closed before settling on this one, and
-they are worth recording because they look attractive and are not:
+# Method
 
-- **Toffoli depth is not an independent lever.** `write_score` defines
-  `toffoli_depth = toffoli` because the emitted stream is strictly sequential,
-  so the score reduces exactly to `qubits x toffoli`. Parallelising cannot help.
-- **Qubit re-indexing yields nothing.** The evaluator scores peak qubits as
-  `max(qubit_index) + 1`, an index-space measure, so any slack between that and
-  the true simultaneous-live count would be free score. Measured on the frontier
-  stream with plain interval liveness and again with reset-aware liveness that
-  splits each qubit's usage at `Hmr`/`R` events (705,165 segments over 1,283
-  qubits): the workspace interval-graph optimum is 771, plus 512 pinned output
-  qubits, exactly 1,283. Slack zero. The circuit sits at its full width for
-  95.9% of the stream.
-- **Peephole cancellation yields nothing.** Zero adjacent identical Toffoli
-  pairs, and zero cancellable pairs within a 64-operation commutation window
-  over a 400,000-Toffoli sample.
+## Route derivation
 
-## Method
+The semantic starting point was the admitted 1,283-qubit hybrid route. Its reversible point
+addition is organized around two compact 270-row binary-GCD-style walks: one for a quotient
+factor and one for a product factor. Each walk stores an encoded row description, replays it
+in reverse, and cleans the temporary state. Low-space coordinate subtraction, multiplication
+by three, modular squaring, and affine reconstruction surround the two walks.
 
-### Source and contest ABI
+The public `d7d0995` submission showed that exact adjacent cancellation, compact fanout, and
+generated block organization can reduce the cost of this family without changing the point
+function. Those were used as design ideas only. The descendant was derived from the
+1,283-qubit route's source semantics, and every row table, correction policy, Rust module,
+operation stream, resource count, and shot result was generated afresh.
 
-The construction is Andre Schrottenloher's windowed affine point addition,
-arXiv:2606.02235, from the public `ec-point-addition` implementation at commit
-`9b23c9170a636a7097a02afb3a3d6cbb6425c9f4`, built with Qarton 1.0.0.
+An earlier 1,227-qubit child was extremely close but failed the server's private seed at one
+shot. That failure invalidated the epoch; a prior clean local run could not rescue it. The
+route was therefore investigated by descending again from the 1,283-qubit authority rather
+than editing the failed Rust or special-casing its input.
 
-The upstream primitive adds a point selected from a compile-time window by a
-quantum selector; its signature is `(selector[1], AffPoint[513])`. The contest
-instead requires an unconditional addition of a runtime-classical point with
-exactly four registers. Two changes achieve that, and nothing else in the
-schedule moves:
+Several fresh children narrowed the failure family. The immediate 1,240-qubit predecessor
+had 2,105,826 emitted CCX+CCZ gates and passed a local 102,400-shot run under one seed, but a
+different deterministic commitment exposed one classical mismatch and one phase-garbage
+batch. A complete 1,024,000-shot census of that same immutable stream, distributed over 20
+workers, found four classical mismatches and two phase-garbage batches. One point was both
+classically wrong and phase-dirty, leaving five distinct weak inputs.
 
-1. The selector becomes an internal ancilla pinned to `|1>`. Every
-   selector-derived control (`creg_is_not_0`) then evaluates true, so the
-   arithmetic runs unconditionally while the surrounding upstream schedule is
-   preserved verbatim.
+## Why the failures were related
 
-2. The four window lookups load from the classical Q registers instead of a
-   baked-in constant: one X per coordinate wire, conditioned on the matching
-   classical bit. The load is involutory, so applying the same conditioned X
-   gates again unloads the word, returns the ancilla to `|0>`, and leaves Q
-   untouched. Runtime `3*Q.x` is built from one temporary Q.x word and two
-   modular additions.
+The five inputs were replayed through exact integer versions of the quotient and product
+walks. Four classical failures first chose the wrong K2 row branch. Their failing rows and
+required most-significant comparison widths were:
 
-Register layout in the emitted stream, verified by scanning the artifact:
-qubits `[0,256)` are P.x and `[256,512)` are P.y; classical bits `[0,256)` are
-Q.x and `[256,512)` are Q.y. Every `Hmr` writes into `[512,768)`, so the
-preserved Q registers are never touched by a measurement.
+| Walk | Row | Old width | First sufficient width |
+|---|---:|---:|---:|
+| product | 181 | 59 | 60 |
+| product | 167 | 60 | 62 |
+| product | 157 | 62 | 64 |
+| quotient | 168 | 59 | 61 |
 
-### Choice of inversion mix
+In each case the retained prefixes tied even though the complete values were ordered. The
+wrong branch then propagated through later arithmetic, so downstream value differences were
+symptoms rather than separate bugs. All four exact factors still converged to the intended
+terminal state within 270 rows when the exact comparison was used. This identified one
+shared cause: the generated row comparator could discard the first distinguishing high bit.
 
-`IPModMul` threads a single `gate_efficient` flag into both halves of the
-inversion, `ToBitVector` (the value walk) and `ApplyBitVector` (the coefficient
-replay). Splitting that flag and measuring all four mixes at the same safety
-margins gives, in the paper signature:
+The remaining point was different but nearby in structure. It had no incorrect K2 branch and
+no row-width overrun. Its first phase error occurred in the controlled-add cleanup cell at
+product row 60. For that cell the post-add word and addend first differ at absolute bit 230,
+so the top 25 bits tie while the top 26 bits determine the correct cleanup predicate. An
+isolated reversible replay confirmed that width 25 left phase garbage and widths 26 and 27
+cleaned it. Changing the pseudo-Mersenne add fold width did not affect this point, ruling out
+the fold as its cause.
 
-| value walk | coefficient replay | qubits | CCX | product |
-| --- | --- | ---: | ---: | ---: |
-| gate | gate | 1,483 | 1,994,490 | 2.958e9 |
-| space | gate | 1,483 | 2,084,218 | 3.091e9 |
-| space | space | 1,235 | 2,587,660 | 3.196e9 |
-| gate | space | 1,285 | 2,497,932 | 3.210e9 |
+Thus the failures form two related truncation classes, not five unrelated point exceptions:
+K2 row decisions with a short high prefix, and controlled-add phase cleanup with a short
+high prefix. Both compare an exact relation after retaining too little boundary information.
 
-The last row reproduces the accepted frontier. This submission takes the first.
+## Uniform source policy
 
-### Safety margins
+The repair is a static operation-class policy rather than a list of observed rows:
 
-The GCD walk is heuristic: it runs a fixed round count and fixed register
-padding, and fails if either is exceeded. `ITERATIONS_VAR` sets the round
-margin and `U_PAD_VAR` the padding margin; `gcd.py` couples them through
-`n - iterations*0.5*1.415 + u_padding >= 0`.
+- every K2 row comparison retains at least the top 64 active bits, while preserving any
+  inherited row that was already wider;
+- every controlled-add cleanup comparison retains the top 32 bits;
+- controlled-add, controlled-subtract, and fused-scale pseudo-Mersenne folds retain 60, 62,
+  and 63 bits respectively; and
+- forward and reverse operations use the same selected widths.
 
-Upstream defaults (2.4 and 2.3) are tuned for the paper's own success target,
-not for a 102,400-shot gate. An independent Monte-Carlo of 60,000 GCD runs
-re-derived the distributions rather than trusting the published constants:
-iterations have mean 361.82 against the heuristic `1.413n = 361.728` and
-standard deviation 9.524 against `0.6*sqrt(n) = 9.600`; padding has mean 8.09,
-standard deviation 4.25, and a clean exponential tail with log-survival slope
--0.4441 per bit. Extrapolating that fitted tail, the upstream default
-`U_PAD_VAR = 2.3` carries roughly a 34% chance of at least one failure across
-102,400 shots.
+The row rule is `max(inherited width, min(active width, 64))`. It changed 183 generated rows,
+not merely the four rows seen in the census. The 32-bit cleanup rule likewise applies to the
+complete controlled-add operation class, not only row 60. No input coordinate, factor,
+random seed, shot number, expected answer, failure label, or evaluator state enters policy
+selection.
 
-This submission uses `ITERATIONS_VAR = 4.0` (426 rounds, 710-bit dialog, the
-same round margin as the accepted frontier) and `U_PAD_VAR = 3.5`, whose fitted
-padding-overflow probability is about 8.6e-10 per shot, or roughly 1e-4 across
-the full gate.
+For secp256k1, `p = 2^256 - 2^32 - 977`, so corrections use
+`2^256 = 2^32 + 977 (mod p)`. The finite fold widths are valid when the selected low window
+contains the correction carry or borrow. The high-prefix comparisons are valid when their
+selected prefix contains the highest differing bit. These premises were checked for every
+known counterexample and retained as explicit bad events for unobserved inputs.
 
-### Lowering
+The cleanup choice of 32 bits is six bits beyond the observed minimum of 26. Under the
+stated heuristic that an unresolved high-prefix equality is no more likely than a uniform
+prefix tie, a union bound can estimate residual risk, but that distribution assumption is
+not presented as an all-input proof. The stronger width was retained because it costs no
+additional peak qubits in this allocation and only a small number of gates.
 
-The contest operation set has no H gate. Qarton emits H in exactly two shapes,
-and both are absorbed by the QPRT lowering:
+## Generated implementation and cleanup discipline
 
-- X-basis measurement, `h(q); msr(q,c)`, folds into a single `Hmr(q,c)`;
-- a borrowed `|->` phase ancilla from `MCXWithBorrowedBits`, where `x(q); h(q)`
-  prepares the state, a `ccx(a,b,q)` kicks a phase back, and `h(q); x(q)`
-  releases it. The bracket gates are dropped and the Toffoli becomes `cz(a,b)`,
-  carrying its classical controls.
+The static row table and operation-class policy were set before Rust generation. The Rust in
+this submission is the deterministic lowering result and was not edited afterward to make
+the observed points pass. A new immutable source epoch produced a new operation stream; its
+resource census and all evaluations refer to that same stream.
 
-Any other shape raises rather than being silently mistranslated. The emitter
-was validated by regenerating the upstream paper-signature circuit and
-reproducing the census this repository documented for it exactly: 1,443 qubits,
-256 classical bits, 10,515,375 gates, 1,842,771 CCX, 857,383 Hmr, 854,058 CZ.
+Each forward row has a matching reverse row. Encoded block slots are acquired, populated,
+consumed during replay, and released in a fixed order. Coordinate shells similarly return
+their work state after transferring the intended field result. Validation therefore treats
+three properties independently: reference-coordinate equality, absence of residual phase,
+and clean ancillas. Coordinate agreement alone would not establish a usable quantum circuit.
 
-This package also drops three QPRT payloads the active build never reads, and
-their wrapper modules, keeping the shared replay decoder. That is packaging
-hygiene only: the emitted stream, and so `ops.bin` and its SHA-256, are
-identical with or without them.
+# Result
 
-## Result
+Before random testing, the five exact weak inputs from the rejected predecessor were replayed
+against the fresh frozen stream. All five returned the correct coordinates with zero phase
+and ancilla garbage.
 
-Measured by the repository's trusted evaluator through `./ecdlp.js run`, with
-the contestant stage sandboxed as usual:
+The ordered local ladder on the same operation bytes was:
 
-| Metric | Value |
-| --- | ---: |
-| Score | **2,906,342,790** |
-| Peak logical qubits | 1,482 |
-| Average executed Toffoli | 1,961,095.319 |
-| Average executed Toffoli depth | 1,961,095 |
-| Average executed Clifford | 8,277,783.561 |
-| Emitted operations | 11,771,529 |
-| Validation | 102,400 / 102,400 |
-| Classical mismatches | 0 |
-| Phase-garbage batches | 0 |
-| Ancilla-garbage batches | 0 |
-| `ops.bin` SHA-256 | `c308973b390574348da2048180853ab07fd13b026b8fa6e81878c66b92458443` |
+| Shots | Classical mismatches | Phase-garbage batches | Ancilla-garbage batches |
+|---:|---:|---:|---:|
+| 64 | 0 | 0 | 0 |
+| 512 | 0 | 0 | 0 |
+| 1,024 | 0 | 0 | 0 |
+| 9,024 | 0 | 0 | 0 |
+| 102,400 | 0 | 0 | 0 |
+| 1,024,000 | 0 | 0 | 0 |
 
-Against the prior accepted frontier at 3,210,284,110, this is a reduction of
-303,941,320, or 9.47%.
+The final 1,024,000-shot audit used exactly 20 workers with 64 shots per worker batch. It used
+the deterministic commitment-only local seed and the frozen stream identified by the
+submission build. No Rust source, action mask, allocation policy, or operation byte changed
+between resource measurement, exact weak-point replay, the ladder, and the deep audit.
 
-Before lowering, Qarton's own `auto_test` checked the adapted circuit against a
-direct evaluation of the affine chord map on 10 random inputs, confirming both
-output coordinates and the preservation of Q.
+The result supports the derivation hypothesis: all four observed classical failures close
+under the uniform 64-bit row-comparison floor, and the phase-only failure closes under the
+uniform 32-bit controlled-add cleanup prefix. The child retains the compact 1,240-qubit
+allocation while paying 8,882 additional emitted CCX+CCZ gates over the rejected predecessor.
 
-## Caveat and what is left
-
-The GCD margins are heuristic, not proofs. The reported failure probabilities
-come from a fitted exponential tail on 60,000 samples extrapolated well beyond
-the sampled range; they are evidence, not guarantees. The trusted server draws
-a fresh private seed, and that evaluation remains authoritative.
-
-`TRUNCATE`, `ITER_CAN_BE_Q`, `PADDING`, and `PADDING2` are left at their
-upstream values. They are separate approximation sources with their own failure
-probabilities, and they were not independently characterised here; the frontier
-appears to use the same defaults.
-
-The remaining headroom is visible but unclaimed. Lowering `U_PAD_VAR` to 3.0
-would score near 2.83e9 at roughly a 0.3% rejection risk, which was judged a
-bad trade. More interestingly, the circuit runs a fixed 426 rounds on every
-input while the walk converges after 362 on average, and only 5.5% of emitted
-Toffolis are classically conditioned; making the trailing rounds skippable
-against a converged flag would cut the *average executed* count substantially
-without touching worst-case correctness or qubit count.
-
-## Credit
-
-Circuit construction is derived from Andre Schrottenloher's
-`ec-point-addition` at commit `9b23c9170a636a7097a02afb3a3d6cbb6425c9f4`
-(AGPL-3.0), built with Qarton 1.0.0. The contest-ABI adaptation, the QPRT
-lowering and emitter, the margin analysis, and the inversion-mix selection are
-this submission's own work.
-
-## References
-
-- Andre Schrottenloher, *Optimized Point Addition Circuits for Elliptic Curve
-  Discrete Logarithms*, arXiv:2606.02235, https://eprint.iacr.org/2026/1128.pdf
-- `ec-point-addition`, https://gitlab.inria.fr/capsule/qarton-projects/ec-point-addition
-- Khattar, Shutty, Gidney et al., *Verifiable quantum advantage via optimized
-  DQI circuits*, arXiv:2510.10967 (the "dialog" GCD representation used here).
+The server still validates with a private random seed. A server pass would admit this exact
+child. A server failure would identify a remaining named finite-prefix or finite-fold bad
+event and would invalidate the submitted epoch; it would not justify input-specific patching
+or retroactively validate either the parent or donor bytes.

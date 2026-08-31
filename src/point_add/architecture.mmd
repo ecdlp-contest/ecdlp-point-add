@@ -1,44 +1,42 @@
-flowchart TD
-    Target["Target primitive: quantum P plus classical Q on secp256k1"]
-    Algorithm["Algorithm"]
-    Optimization["Optimization"]
-    ABI["Four-register ABI: quantum P.x/P.y and preserved classical Q.x/Q.y"]
-    Load["Classically conditioned X load and unload of Q; involutory, so Q is preserved"]
-    ThreeX["Runtime 3*Q.x from one temporary Q.x word and two modular additions"]
-    Affine["Schrottenloher mixed affine point-add schedule, three Q loads"]
-    Walk["Gate-efficient fixed 426-round binary-GCD value walk"]
-    Replay["Gate-efficient coefficient replay, 710-bit packed dialog"]
-    Arithmetic["Special-prime modular add, negate, square-add, multiply, and divide"]
-    Source["Pinned Qarton 1.0.0 generation at ec-point-addition 9b23c917"]
-    Margins["Safety margins ITERATIONS_VAR 4.0 and U_PAD_VAR 3.5"]
-    Mix["Gate-efficient inversion on BOTH halves, not the hybrid split"]
-    Lower["Deterministic QPRT lowering: H;MSR to HMR, phase CCX into minus-state to CZ"]
-    Rust["Generated Rust replay wrapper plus compressed immutable QPRT payload"]
-    Census["1,482 peak qubits; 1,961,095.319 average executed Toffoli and depth"]
-    Hash["ops.bin SHA-256 c308973b390574348da2048180853ab07fd13b026b8fa6e81878c66b92458443"]
-    Shots["Frozen-byte local evaluation: 102,400 shots, 0 classical / 0 phase / 0 ancilla"]
-    Score["Balanced score: 2,906,342,790"]
-    Prior["Prior accepted frontier: 3,210,284,110; improvement 9.47 percent"]
-    Risk["Heuristic GCD margins; server-private seed validation remains authoritative"]
+flowchart LR
+    ROOT["Target primitive: quantum P plus classical Q on secp256k1"]
+    ALG["Algorithm"]
+    OPT["Optimization"]
+    BASE["1,283-qubit admitted hybrid route"]
+    DONOR["Public d7d0995 rewrite ideas"]
+    DERIVE["Independent source-level derivation"]
+    PRE["Reversible coordinate shells"]
+    QW["270-row quotient walk"]
+    QR["Encoded block replay and uncompute"]
+    SQ["Low-space modular square"]
+    PW["270-row product walk"]
+    PR["Encoded block replay and uncompute"]
+    POLICY["Static operation-class policy"]
+    RC["K2 comparisons: at least 64 high bits"]
+    AC["Controlled-add cleanup: 32 high bits"]
+    FW["Add/subtract/fused folds: 60/62/63 bits"]
+    OUT["Affine point P plus Q; work state clean"]
 
-    Target --> Algorithm
-    Target --> Optimization
-    Algorithm --> ABI
-    ABI --> Load
-    Load --> ThreeX
-    ThreeX --> Affine
-    Affine --> Walk
-    Walk --> Replay
-    Replay --> Arithmetic
-    Optimization --> Mix
-    Mix --> Margins
-    Margins --> Source
-    Source --> Lower
-    Lower --> Rust
-    Rust --> Census
-    Census --> Hash
-    Hash --> Shots
-    Shots --> Score
-    Score --> Prior
-    Optimization --> Risk
-    Risk --> Shots
+    ROOT --> ALG
+    ROOT --> OPT
+    ALG --> BASE
+    OPT --> DONOR
+    BASE --> DERIVE
+    DONOR --> DERIVE
+    DERIVE --> PRE
+    PRE --> QW
+    QW --> QR
+    QR --> SQ
+    SQ --> PW
+    PW --> PR
+    PR --> OUT
+    DERIVE --> POLICY
+    POLICY --> RC
+    POLICY --> AC
+    POLICY --> FW
+    RC --> QW
+    RC --> PW
+    AC --> QW
+    AC --> PW
+    FW --> QW
+    FW --> PW
