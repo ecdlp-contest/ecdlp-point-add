@@ -3,21 +3,23 @@ flowchart LR
     ALG["Algorithm"]
     OPT["Optimization"]
     SHELL["Reversible coordinate shell: subtract Q, times-3 add, Solinas square, reconstruct"]
-    DWALK["Divide walk: 816-round signed binary-GCD on (p, Qx - Px), one sign qubit per round"]
-    MWALK["Multiply walk: 816-round signed walk on (p, Px - x3)"]
-    TAPE["Sign tape (816 qubits per traversal)"]
+    DWALK["Divide walk: 790-round signed binary-GCD on (p, Qx - Px), one sign qubit per round"]
+    MWALK["Multiply walk: 790-round signed walk on (p, Px - x3)"]
+    TAPE["Sign tape (790 qubits per traversal)"]
     REPLAY["Interleaved coefficient replay (checkpoints R1/R2, chunked measured adds)"]
     WBACK["Reverse walk: restores denominator, clears tape"]
     OUT["Affine point P plus Q; work state clean"]
     HARD["Exact-hardening: all measured-erasure windows restored"]
-    W1["Chunk-boundary erase compares full 96-bit chunks"]
-    W2["Fold windows 96 bits; endpoint folds full 64-bit slice; flag compares 64 bits"]
+    W1["Chunk-boundary erase compares full-width (scheduled chunks <= 64 bits)"]
+    W2["Fold windows 80 bits; endpoint folds full 64-bit slice; flag compares 56 bits"]
     W3["Shell reduction compares full 256 bits; square guard widened"]
-    DEPTH["+120 walk rounds per traversal: worst observed need 747 over 2.46M samples"]
-    BIAS["+8-bit uniform width-schedule guard band (peak-neutral)"]
-    MODEL["Exact classical model: 60 fresh 102,400-shot draws, zero failures"]
+    DEPTH["Walk depth 790: worst observed need 747 over 2.46M samples, margin >= 43 rounds"]
+    BIAS["+6-bit uniform width-schedule guard band (peak-neutral; failure needs never-observed schedule+7)"]
+    TRIM["Margin trims under continuous zero-failure re-verification"]
+    PASS["Stream passes evaluated: zero yield on this stream, not shipped"]
+    MODEL["Exact classical model: 60 fresh 102,400-shot draws per kept trim, zero failures"]
     EVAL["Trusted eval: deterministic + 8 fresh-seed 102,400-shot draws, 0/0/0"]
-    METRICS["1,427 qubits x 1,232,534 Toffoli = 1,758,826,018"]
+    METRICS["1,385 qubits x 1,163,310 Toffoli = 1,611,184,350"]
 
     ROOT --> ALG
     ROOT --> OPT
@@ -34,6 +36,8 @@ flowchart LR
     HARD --> W3
     HARD --> DEPTH
     HARD --> BIAS
+    OPT --> TRIM
+    TRIM --> PASS
     DEPTH --> DWALK
     DEPTH --> MWALK
     BIAS --> DWALK
@@ -41,5 +45,6 @@ flowchart LR
     W1 --> REPLAY
     W2 --> REPLAY
     HARD --> MODEL
+    TRIM --> MODEL
     MODEL --> EVAL
     EVAL --> METRICS

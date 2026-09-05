@@ -2691,11 +2691,11 @@ pub fn build() -> Vec<Op> {
     // gets deep convergence margin. Measured over 102,400-shot fresh draws with
     // an exact classical model of the circuit (tools validated shot-for-shot
     // against eval_circuit): zero failures.
-    set_default_env("SUB4_PP_ROUNDS", "816");
-    set_default_env("SUB4_PP_ROUNDS_MUL", "816");
+    set_default_env("SUB4_PP_ROUNDS", "790");
+    set_default_env("SUB4_PP_ROUNDS_MUL", "790");
     // Uniform widening of the sampled width schedule: closes the residual
     // excess-width population that the sparse WIDTH_REPAIR cover misses.
-    set_default_env("SUB4_PP_SCHED_BIAS", "8");
+    set_default_env("SUB4_PP_SCHED_BIAS", "6");
     set_default_env("SUB4_PP_R1", "335");
     // R1MUL-326: multiply-side round-1 split point. The response curve is JAGGED, not
     // monotone (324 -> -189 CCX, 325 -> +113, 326 -> -231, 327 -> +74), so this is a discrete
@@ -2703,19 +2703,19 @@ pub fn build() -> Vec<Op> {
     // -231 CCX deterministic on every seed; peak unchanged. Measured lambda-free.
     set_default_env("SUB4_PP_R1_MUL", "326");
     set_default_env("SUB4_PP_R2", "645");
-    set_default_env("SUB4_PP_PEAK", "1397");
-    set_default_env("SUB4_PP_WALK_PEAK", "1397");
+    set_default_env("SUB4_PP_PEAK", "1371");
+    set_default_env("SUB4_PP_WALK_PEAK", "1371");
     set_default_env("SUB4_PP_REPLAY_CHUNK", "96");
     set_default_env("SUB4_PP_REPLAY_CHUNK_COMPARE", "96");
-    set_default_env("SUB4_PP_REPLAY_FOLD_WINDOW", "96");
-    set_default_env("SUB4_PP_REPLAY_FOLD_WINDOW_MUL", "96");
+    set_default_env("SUB4_PP_REPLAY_FOLD_WINDOW", "80");
+    set_default_env("SUB4_PP_REPLAY_FOLD_WINDOW_MUL", "80");
     set_default_env("SUB4_PP_ENDPOINT_FOLD_WINDOW", "64");
     // MERGE: the level-2 Karatsuba square (ours) needs 6 more live wires in
     // the replay cell than the canonical-residue frame does, and those 6 wires
     // are exactly what pins the peak at 1273. Canonical residues cost ~628 T
     // and buy the peak down to 1267 -- 105 T/wire against a ~716 break-even.
     set_default_env("SUB4_PP_SIGNED_FRAME", "0");
-    set_default_env("SUB4_PP_REPLAY_FLAG_COMPARE", "64");
+    set_default_env("SUB4_PP_REPLAY_FLAG_COMPARE", "56");
     // Shell reduction compares full-width (they run far below the global peak).
     set_default_env("TLM_MSBS", "256");
     set_default_env("SUB4_PP_SIGN1_FREE", "1");
