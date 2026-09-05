@@ -9,9 +9,9 @@ use super::super::{arith, comparator, B, BExt};
 use crate::circuit::{OperationType, QubitId, QubitOrBit};
 
 const N: usize = 256;
-const LSBS: usize = 56;
-const MSBS: usize = 24;
-const GUARD: usize = 24;
+const LSBS: usize = 96;
+const MSBS: usize = 64;
+const GUARD: usize = 48;
 const F_NAF: [(usize, bool); 5] = [
     (0, false),
     (4, false),
@@ -100,7 +100,7 @@ fn row_addsub(
     circ.zero_and_free(pad);
 }
 
-pub(crate) fn tri_square(circ: &mut B, x: &[QubitId], product: &[QubitId], inverse: bool) {
+fn tri_square(circ: &mut B, x: &[QubitId], product: &[QubitId], inverse: bool) {
     let m = x.len();
     assert_eq!(product.len(), 2 * m);
     if m == 0 {

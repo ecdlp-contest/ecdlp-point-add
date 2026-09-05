@@ -449,7 +449,7 @@ pub const F_BITLEN: usize = 33;
 
 pub const PAD: usize = 19;
 
-pub const LSBS: usize = 20 + F_BITLEN;
+pub const LSBS: usize = 63 + F_BITLEN;
 
 pub const MSBS: usize = PAD;
 
@@ -1508,7 +1508,7 @@ fn controlled_add_carry_msbs_conditional(circ: &mut B, ctrl: Option<&QubitId>, a
     circ.pop_condition();
 }
 
-pub fn controlled_mod_add_k_window(circ: &mut B, ctrl: &QubitId, x: &[QubitId], y: &[QubitId], sched_k: Option<usize>, ffg_g: Option<usize>, fold_window: usize, cleanup_compare_bits: usize) {
+pub fn controlled_mod_add_k(circ: &mut B, ctrl: &QubitId, x: &[QubitId], y: &[QubitId], sched_k: Option<usize>, ffg_g: Option<usize>) {
     let n = x.len();
     assert_eq!(y.len(), n, "x,y must both be n=256 bits");
     assert_eq!(n, 256, "secp256k1 controlled_mod_add expects n=256");
@@ -1526,11 +1526,11 @@ pub fn controlled_mod_add_k_window(circ: &mut B, ctrl: &QubitId, x: &[QubitId], 
     }
 
     circ.set_phase("tlm_apply_forward_mod_add_fold");
-    add_f_window(circ, &anc, y, fold_window, &f_bytes, ffg_g);
+    add_f_window(circ, &anc, y, LSBS, &f_bytes, ffg_g);
 
 
     circ.set_phase("tlm_apply_forward_mod_add_clean");
-    controlled_lt_msbs_conditional(circ, Some(ctrl), &y[..n], &x[..n], cleanup_compare_bits, anc);
+    controlled_lt_msbs_conditional(circ, Some(ctrl), &y[..n], &x[..n], msbs(), anc);
 }
 
 pub fn mod_sub(circ: &mut B, x: &[QubitId], y: &[QubitId]) {
@@ -2086,9 +2086,4 @@ pub fn mod_double_reverse(circ: &mut B, a: &[QubitId]) {
 
 pub fn add_f_window_pub(circ: &mut B, ctrl: &QubitId, reg: &[QubitId], lsbs: usize, c: &[u8], g_sched: Option<usize>) {
     add_f_window(circ, ctrl, reg, lsbs, c, g_sched);
-}
-
-
-pub fn controlled_mod_add_k(circ: &mut B, ctrl: &QubitId, x: &[QubitId], y: &[QubitId], sched_k: Option<usize>, ffg_g: Option<usize>) {
-    controlled_mod_add_k_window(circ, ctrl, x, y, sched_k, ffg_g, 60, 32);
 }

@@ -1864,7 +1864,7 @@ fn trace_fold_alloc(circ: &B, name: &str, stage: &str, i: usize) {
     }
 }
 
-pub fn fused_double_cdouble_window(circ: &mut B, s2: &QubitId, y: &[QubitId], fold_window: usize) {
+pub fn fused_double_cdouble(circ: &mut B, s2: &QubitId, y: &[QubitId]) {
     let shift_call_index = next_fused_cdouble_fwd_shift_call_index();
     maybe_run_gradual_fold_nonlinear_control_hmr_selftest();
     let n = 256usize;
@@ -1895,8 +1895,8 @@ pub fn fused_double_cdouble_window(circ: &mut B, s2: &QubitId, y: &[QubitId], fo
         crate::point_add::restore_op_trace_context(old_context);
     }
 
-    let borrow: Vec<QubitId> = y[fold_window..2 * fold_window - 1].to_vec();
-    fused_fold(circ, &w[n], &w[n + 1], &y[..fold_window], &borrow);
+    let borrow: Vec<QubitId> = y[LSBS..2 * LSBS - 1].to_vec();
+    fused_fold(circ, &w[n], &w[n + 1], &y[..LSBS], &borrow);
 
     circ.cx(y[0], w[n]);
     clear_and(circ, &w[n + 1], s2, &y[1]);
@@ -1920,7 +1920,7 @@ pub fn fused_double_only(circ: &mut B, y: &[QubitId]) {
     circ.zero_and_free(hi);
 }
 
-pub fn fused_double_cdouble_reverse_window(circ: &mut B, s2: &QubitId, y: &[QubitId], fold_window: usize) {
+pub fn fused_double_cdouble_reverse(circ: &mut B, s2: &QubitId, y: &[QubitId]) {
     let shift_call_index = next_fused_cdouble_rev_shift_call_index();
     maybe_run_gradual_fold_nonlinear_control_hmr_selftest();
     let n = 256usize;
@@ -1937,12 +1937,12 @@ pub fn fused_double_cdouble_reverse_window(circ: &mut B, s2: &QubitId, y: &[Qubi
     circ.ccx(*s2, y[1], w[n + 1]);
     circ.cx(y[0], w[n]);
 
-    let borrow: Vec<QubitId> = y[fold_window..2 * fold_window - 1].to_vec();
-    for q in &y[..fold_window] {
+    let borrow: Vec<QubitId> = y[LSBS..2 * LSBS - 1].to_vec();
+    for q in &y[..LSBS] {
         circ.x(*q);
     }
-    fused_fold(circ, &w[n], &w[n + 1], &y[..fold_window], &borrow);
-    for q in &y[..fold_window] {
+    fused_fold(circ, &w[n], &w[n + 1], &y[..LSBS], &borrow);
+    for q in &y[..LSBS] {
         circ.x(*q);
     }
 
@@ -2081,13 +2081,4 @@ mod tests {
     fn gradual_fold_nonlinear_control_hmr_cleanup_is_exact() {
         gradual_fold_nonlinear_control_hmr_selftest();
     }
-}
-
-
-pub fn fused_double_cdouble(circ: &mut B, s2: &QubitId, y: &[QubitId]) {
-    fused_double_cdouble_window(circ, s2, y, 63);
-}
-
-pub fn fused_double_cdouble_reverse(circ: &mut B, s2: &QubitId, y: &[QubitId]) {
-    fused_double_cdouble_reverse_window(circ, s2, y, 63);
 }

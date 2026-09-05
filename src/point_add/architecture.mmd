@@ -2,41 +2,44 @@ flowchart LR
     ROOT["Target primitive: quantum P plus classical Q on secp256k1"]
     ALG["Algorithm"]
     OPT["Optimization"]
-    BASE["1,283-qubit admitted hybrid route"]
-    DONOR["Public d7d0995 rewrite ideas"]
-    DERIVE["Independent source-level derivation"]
-    PRE["Reversible coordinate shells"]
-    QW["270-row quotient walk"]
-    QR["Encoded block replay and uncompute"]
-    SQ["Low-space modular square"]
-    PW["270-row product walk"]
-    PR["Encoded block replay and uncompute"]
-    POLICY["Static operation-class policy"]
-    RC["K2 comparisons: at least 64 high bits"]
-    AC["Controlled-add cleanup: 32 high bits"]
-    FW["Add/subtract/fused folds: 60/62/63 bits"]
+    SHELL["Reversible coordinate shell: subtract Q, times-3 add, Solinas square, reconstruct"]
+    DWALK["Divide walk: 816-round signed binary-GCD on (p, Qx - Px), one sign qubit per round"]
+    MWALK["Multiply walk: 816-round signed walk on (p, Px - x3)"]
+    TAPE["Sign tape (816 qubits per traversal)"]
+    REPLAY["Interleaved coefficient replay (checkpoints R1/R2, chunked measured adds)"]
+    WBACK["Reverse walk: restores denominator, clears tape"]
     OUT["Affine point P plus Q; work state clean"]
+    HARD["Exact-hardening: all measured-erasure windows restored"]
+    W1["Chunk-boundary erase compares full 96-bit chunks"]
+    W2["Fold windows 96 bits; endpoint folds full 64-bit slice; flag compares 64 bits"]
+    W3["Shell reduction compares full 256 bits; square guard widened"]
+    DEPTH["+120 walk rounds per traversal: worst observed need 747 over 2.46M samples"]
+    BIAS["+8-bit uniform width-schedule guard band (peak-neutral)"]
+    MODEL["Exact classical model: 60 fresh 102,400-shot draws, zero failures"]
+    EVAL["Trusted eval: deterministic + 8 fresh-seed 102,400-shot draws, 0/0/0"]
+    METRICS["1,427 qubits x 1,232,534 Toffoli = 1,758,826,018"]
 
     ROOT --> ALG
     ROOT --> OPT
-    ALG --> BASE
-    OPT --> DONOR
-    BASE --> DERIVE
-    DONOR --> DERIVE
-    DERIVE --> PRE
-    PRE --> QW
-    QW --> QR
-    QR --> SQ
-    SQ --> PW
-    PW --> PR
-    PR --> OUT
-    DERIVE --> POLICY
-    POLICY --> RC
-    POLICY --> AC
-    POLICY --> FW
-    RC --> QW
-    RC --> PW
-    AC --> QW
-    AC --> PW
-    FW --> QW
-    FW --> PW
+    ALG --> SHELL
+    SHELL --> DWALK
+    DWALK --> TAPE
+    TAPE --> REPLAY
+    REPLAY --> MWALK
+    MWALK --> WBACK
+    WBACK --> OUT
+    OPT --> HARD
+    HARD --> W1
+    HARD --> W2
+    HARD --> W3
+    HARD --> DEPTH
+    HARD --> BIAS
+    DEPTH --> DWALK
+    DEPTH --> MWALK
+    BIAS --> DWALK
+    BIAS --> MWALK
+    W1 --> REPLAY
+    W2 --> REPLAY
+    HARD --> MODEL
+    MODEL --> EVAL
+    EVAL --> METRICS

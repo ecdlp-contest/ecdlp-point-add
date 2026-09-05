@@ -1825,7 +1825,7 @@ fn apply_step_reverse(
     }
 }
 
-pub(crate) fn controlled_mod_sub_vented(circ: &mut B, ctrl: &QubitId, x: &[QubitId], y: &[QubitId], sched_k: Option<usize>) {
+fn controlled_mod_sub_vented(circ: &mut B, ctrl: &QubitId, x: &[QubitId], y: &[QubitId], sched_k: Option<usize>) {
     let n = x.len();
     assert_eq!(y.len(), n, "x,y equal width");
     let f_bytes = F_SECP256K1.to_le_bytes();
@@ -1841,31 +1841,37 @@ pub(crate) fn controlled_mod_sub_vented(circ: &mut B, ctrl: &QubitId, x: &[Qubit
     }
 
     circ.set_phase("tlm_apply_inverse_mod_sub_fold");
-    for q in &y[..62] {
+    for q in &y[..arith::LSBS] {
         circ.x(*q);
     }
     let ffg = super::next_ffg();
-    arith::add_f_window_pub(circ, &anc, y, 62, &f_bytes, Some(ffg));
-    for q in &y[..62] {
+    arith::add_f_window_pub(circ, &anc, y, arith::LSBS, &f_bytes, Some(ffg));
+    for q in &y[..arith::LSBS] {
         circ.x(*q);
     }
 
-    circ.set_phase("native265_fullwidth_inverse_mod_sub_phase_clean");
-    let k = 19usize.min(n);
+    circ.set_phase("tlm_apply_inverse_mod_sub_clean");
+    let k = arith::msbs().min(n);
+    let lo = n - k;
     let ctrl = *ctrl;
     let bit = circ.alloc_bit();
     circ.hmr(anc, bit);
     circ.zero_and_free(anc);
     circ.push_condition(bit);
-    let yt: Vec<QubitId> = y.to_vec();
-    let xt: Vec<QubitId> = x.to_vec();
-    for q in &xt { circ.x(*q); }
+    let yt: Vec<QubitId> = y[lo..n].to_vec();
+    let xt: Vec<QubitId> = x[lo..n].to_vec();
+    for q in &xt {
+        circ.x(*q);
+    }
+
     let flag = circ.alloc_qubit();
     super::comparator::compare_geq_chunked_middle(circ, &yt, &xt, &flag, |c, fl| {
         c.cz(ctrl, *fl);
     }, k);
     circ.zero_and_free(flag);
-    for q in &xt { circ.x(*q); }
+    for q in &xt {
+        circ.x(*q);
+    }
     circ.pop_condition();
 }
 

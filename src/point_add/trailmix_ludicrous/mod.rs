@@ -1,15 +1,15 @@
 
-pub(crate) mod arith;
+mod arith;
 mod codec;
 mod comparator;
 pub(crate) mod constprop;
 pub mod ec_add;
-pub(crate) mod fused;
-pub(crate) mod gcd;
+mod fused;
+mod gcd;
 mod gidney;
 mod mcx;
 pub mod schedule;
-pub(crate) mod square;
+mod square;
 
 pub(crate) fn product_register_square_selfcheck() {
     square::product_register_selfcheck();

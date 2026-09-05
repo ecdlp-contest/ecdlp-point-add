@@ -3,7 +3,7 @@ use super::arith::{self, cuccaro_carry, mod_add_lowpeak, mod_add_shifted_low, mo
 use super::{B, BExt};
 use crate::circuit::{QubitId};
 
-pub(crate) mod product_register;
+mod product_register;
 
 const N: usize = 256;
 
