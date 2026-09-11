@@ -1,50 +1,25 @@
-flowchart LR
-    ROOT["Target primitive: quantum P plus classical Q on secp256k1"]
-    ALG["Algorithm"]
-    OPT["Optimization"]
-    SHELL["Reversible coordinate shell: subtract Q, times-3 add, Solinas square, reconstruct"]
-    DWALK["Divide walk: 790-round signed binary-GCD on (p, Qx - Px), one sign qubit per round"]
-    MWALK["Multiply walk: 790-round signed walk on (p, Px - x3)"]
-    TAPE["Sign tape (790 qubits per traversal)"]
-    REPLAY["Interleaved coefficient replay (checkpoints R1/R2, chunked measured adds)"]
-    WBACK["Reverse walk: restores denominator, clears tape"]
-    OUT["Affine point P plus Q; work state clean"]
-    HARD["Exact-hardening: all measured-erasure windows restored"]
-    W1["Chunk-boundary erase compares full-width (scheduled chunks <= 64 bits)"]
-    W2["Fold windows 80 bits; endpoint folds full 64-bit slice; flag compares 56 bits"]
-    W3["Shell reduction compares full 256 bits; square guard widened"]
-    DEPTH["Walk depth 790: worst observed need 747 over 2.46M samples, margin >= 43 rounds"]
-    BIAS["+6-bit uniform width-schedule guard band (peak-neutral; failure needs never-observed schedule+7)"]
-    TRIM["Margin trims under continuous zero-failure re-verification"]
-    PASS["Stream passes evaluated: zero yield on this stream, not shipped"]
-    MODEL["Exact classical model: 60 fresh 102,400-shot draws per kept trim, zero failures"]
-    EVAL["Trusted eval: deterministic + 8 fresh-seed 102,400-shot draws, 0/0/0"]
-    METRICS["1,385 qubits x 1,163,310 Toffoli = 1,611,184,350"]
-
-    ROOT --> ALG
-    ROOT --> OPT
-    ALG --> SHELL
-    SHELL --> DWALK
-    DWALK --> TAPE
-    TAPE --> REPLAY
-    REPLAY --> MWALK
-    MWALK --> WBACK
-    WBACK --> OUT
-    OPT --> HARD
-    HARD --> W1
-    HARD --> W2
-    HARD --> W3
-    HARD --> DEPTH
-    HARD --> BIAS
-    OPT --> TRIM
-    TRIM --> PASS
-    DEPTH --> DWALK
-    DEPTH --> MWALK
-    BIAS --> DWALK
-    BIAS --> MWALK
-    W1 --> REPLAY
-    W2 --> REPLAY
-    HARD --> MODEL
-    TRIM --> MODEL
-    MODEL --> EVAL
-    EVAL --> METRICS
+flowchart TD
+  Target["Target primitive: quantum P plus classical Q on secp256k1"]
+  Algorithm["Algorithm"]
+  Optimization["Optimization"]
+  Target --> Algorithm
+  Target --> Optimization
+  Algorithm --> Input["Quantum x,y and preserved classical u,v"]
+  Input --> Difference["Subtract u from x and v from y"]
+  Difference --> Divide["790-round signed ping-pong divide: lambda"]
+  Divide --> Shift["Add 3u to the first coordinate"]
+  Shift --> Square["Subtract recursive modular square of lambda"]
+  Square --> Multiply["790-round multiply: lambda times u minus output x"]
+  Multiply --> Output["Subtract v; reverse-subtract u; output P plus Q"]
+  Optimization --> Carry["Reuse split carry workspace and correction banks"]
+  Optimization --> History["Fuse initial rounds and recover erased history"]
+  Optimization --> Phase["Retain measurement-dependent phase corrections"]
+  Optimization --> SquareShape["128-bit square split and sparse-prime reduction"]
+  Carry --> Metrics["1367 qubits; rounded Toffolis 1169471; depth 1169471"]
+  History --> Metrics
+  Phase --> Metrics
+  SquareShape --> Metrics
+  Output --> Validation["Local 102400 shots on 20 workers; failures 0/0/0"]
+  Metrics --> Score["Local score 1598666857; server validation pending"]
+  Validation --> Score
+  Algorithm --> Limits["Approximate convergence, widths, correction windows and phase prefixes"]

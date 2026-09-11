@@ -1,151 +1,179 @@
 # AI Model/Harness
 
-Model: Kimi (Moonshot AI), running as the Kimi Code CLI agent, high effort, on a single
-Windows workstation (24 threads). No cloud compute. The implementation is Rust contestant
-code under `src/point_add/`; all validation used the repository's trusted
-`build_circuit` / `eval_circuit` flow directly (the bundled `benchmark.sh` picks a broken
-compiler path on Windows; the two-binary flow is identical in content). An exact classical
-model of the circuit (see Method) was built as research tooling and used only to size
-margins; every reported score number comes from the trusted evaluator.
+Model: GPT-6. Harness: Codex. This submission was developed with AI assistance.
+No numerical effort setting is claimed. The report below describes the circuit,
+its measured behavior, its limitations, and the public architecture it builds on.
 
 # Summary
 
-This is an exact-hardened, margin-trimmed descendant of the public ecdsa.fail ping-pong
-division head (1,263 qubits / ~914k executed Toffoli as measured on this repo's harness).
-That circuit is nonce-ground: on this harness's deterministic 102,400-shot draw it
-produces 230 classical mismatches and 169 phase-garbage batches, and similar counts on
-fresh seeds. This submission keeps the architecture, removes the approximation (every
-measured-erasure window restored to full or measured-envelope width), then trims the
-margins back toward the measured envelope under continuous re-verification.
+This candidate implements mixed affine secp256k1 point addition with 1,367 peak
+logical qubits. The local 102,400-shot result is 1,169,471 rounded executed
+Toffolis and 1,169,471 rounded Toffoli depth, giving a score of 1,598,666,857.
+The local evaluation found no classical, phase, or ancilla failures. These are
+local measurements; acceptance requires the contest's independent server run.
 
-The frozen submitted circuit (baked defaults, no environment dependence):
+The architectural reference is the public 1,385-qubit signed ping-pong entry by
+Vasily Gnuchev, published under the GitHub username gnuchev. Its ranked score is
+1,611,199,585. This candidate reduces peak width by 18 qubits while allowing a
+small increase in executed arithmetic. The resulting local score is about
+0.778% lower. Qubit count alone is not the objective: the extra carry work is
+useful only because the combined qubit and executed-resource score improves.
 
-- 1,385 qubits;
-- 16,744,146 emitted operations;
-- 1,163,310.460 average executed Toffolis on the deterministic 102,400-shot draw;
-- score 1,611,184,350 (= 1,385 x 1,163,310; the op stream is serial, so executed
-  Toffoli depth equals executed Toffoli count);
-- `ops.bin` SHA-256 `c5c98a6a50d1d745c29ada53b09c949936d3fc3887d8188774b14af2a95b7399`.
-
-That is 34.2% below the previous leader's 2,448,636,680.
-
-Fresh-draw evidence (the property this contest actually gates on): zero classical
-mismatches, zero phase-garbage batches, zero ancilla-garbage batches on the deterministic
-draw plus 8 independent fresh `ECDLP_VALIDATION_SEED` draws (8 x 102,400 shots) of the
-final stream, and the same on intermediate trims. Additionally, an exact classical model
-of the circuit (validated shot-for-shot against `eval_circuit` on four separate eval
-outcomes, including two single-shot failure identifications) predicts zero failures and
-zero phase-residual events on 60 independent fresh 102,400-shot draws (6.1 million shots)
-of the final configuration, and the same at each kept trim.
+The arithmetic is approximate. Finite iteration schedules, signed widths,
+correction windows and measured comparison prefixes carry explicit limitations.
+The successful local sample is evidence about one fixed circuit, not a proof
+that every possible input is handled correctly. No private-seed success is
+claimed in this note before the server has evaluated the submission.
 
 # Method
 
-## Architecture (unchanged from the public lineage)
+## Affine computation
 
-Affine point add P += Q with Q classical. The coordinate shell (modular subtract of Q,
-times-three add, Solinas square, final reconstruction) surrounds two ping-pong
-traversals: a signed binary-GCD-style value walk on (p, denominator) records one sign
-qubit per round; a coefficient replay consumes that tape once; a reverse walk restores
-the denominator and clears the tape. The divide traversal computes
-lambda = (Qy - Py)/(Qx - Px) in place; the multiply traversal applies
-lambda * (Px - x3). The replay is interleaved with the walk at checkpoints R1/R2 so the
-replay executes while the tape is short; the peak is set by tape + two 256-bit
-coefficient registers + walk registers + a headroom-scheduled carry ladder.
+Let P=(x,y) be the quantum point and Q=(u,v) the classical point, with field
+arithmetic modulo p=2^256-2^32-977. The four 256-bit interfaces are quantum x,
+quantum y, classical u and classical v. The classical point is preserved. For
+the supported nonexceptional inputs, the secant slope is
+lambda=(y-v)/(x-u), and the result is x'=lambda^2-x-u,
+y'=lambda*(x-x')-y.
 
-## Exact-hardening
+The reversible schedule first subtracts u from x and v from y. A divide
+campaign turns the second quantum coordinate into the slope while retaining
+the denominator needed by the inverse replay. The first coordinate then adds
+3u and subtracts the slope square, yielding x+2u-lambda^2, which equals u-x'.
+The multiply campaign multiplies the slope by that value. Subtracting v gives
+lambda*(u-x')-v, which is y' on the same secant line. A final reverse
+subtraction of u produces x'. This ordering keeps the intermediate values in
+the two existing coordinate registers instead of allocating a third persistent
+field register.
 
-The public head ships every guard as a finite truncation and grinds the Fiat-Shamir
-nonce until one draw passes. Each truncation is a knob with a measured failure rate
-(lambda, expected failing shots per draw). The failure channels were identified and
-closed as follows:
+## Signed ping-pong division and multiplication
 
-1. Measured-erasure windows restored. `REPLAY_CHUNK_COMPARE` 21 -> 96 (full chunk: a
-   tie now means equality; the scheduled chunk widths are <= 64 so this is exact),
-   `REPLAY_FLAG_COMPARE` 20 -> 56, `REPLAY_FOLD_WINDOW` (+MUL) 53 -> 80,
-   `ENDPOINT_FOLD_WINDOW` 18 -> 64 (full 64-bit slice), shell fold window `LSBS`
-   53 -> 96, shell reduction compares `TLM_MSBS` 19 -> 256 (full width), square
-   overflow compare 24 -> 64 and pad guard 24 -> 48. `TLM_COUT_ERASE_CAP` was verified
-   dead in this composition (disabling it is byte-identical).
-2. Walk convergence depth. At the shipped 696/694 rounds the walk non-convergence tail
-   dominates (lambda ~ 100 per 102,400-shot draw).
-3. Width-schedule guard band. The sampled per-round width schedule is fitted; rare
-   shots need up to schedule+4 bits (worst case over 2.46M traversal samples).
-   A uniform `SCHED_BIAS` closes that population and is peak-qubit-neutral.
+Both arithmetic campaigns use 790 scheduled signed rounds. The walk alternates
+the roles of its working registers and records the decisions needed for later
+replay. Forward computation, application to the target, and inverse cleanup
+are distinct parts of the schedule. The narrowing signed-width table and the
+termination conditions are assumptions of the approximate construction; the
+fixed round count is not asserted to establish universal convergence.
 
-## Margin trims (this revision)
+Initial rounds use their known starting values to combine initialization with
+the first walk operations. Recoverable history information is erased when the
+retained state determines it, then reconstructed at the point required by
+reverse replay. The divide and multiply campaigns retain their respective
+sign-erasure and parity-recovery arrangements. The implementation does not
+replace a signed-walk width schedule with an unsigned inversion schedule.
 
-With the envelope measured, margins were trimmed back under continuous verification
-(each step: trusted deterministic + fresh-seed evals, plus 60 fresh 102,400-shot draws
-under the exact classical model, all zero before the trim was kept):
+The width reduction comes from scheduling carry workspace and modular
+correction banks so that storage can be reused across nonoverlapping stages.
+Split carry layouts preserve the arithmetic correction windows. At each
+composition boundary, temporary storage must be released consistently before
+the next arithmetic stage uses those wires. Reducing the declared width by
+discarding live state would not be a valid optimization.
 
-- ROUNDS 816 -> 790 both traversals: worst observed convergence need is 747 rounds
-  (over 2.46M traversal samples; 733 in the 790-round schedule's own envelope scan),
-  so 790 keeps >= 43 rounds of margin. -72.6M score.
-- SCHED_BIAS 8 -> 6: the worst observed width need (schedule+6 in the 790-round
-  rescale) sits at slack 0 and survives by the walk's self-healing; a failure requires
-  a never-observed need of schedule+7. -12.0M.
-- REPLAY_FOLD_WINDOW 96 -> 80: the fold carry ladder sets the replay cell's width, so
-  this also frees 16 qubits. Residual: carry escape needs 47 consecutive ones past the
-  33-bit addend, ~2e-9 per draw across all folds. -54.3M.
-- REPLAY_FLAG_COMPARE 64 -> 56: phase-only repair; a mis-repair needs a 56-bit tie,
-  ~6e-9 per draw. -8.7M.
-- REPLAY_CHUNK_COMPARE reviewed: no-op at 64 vs 96 (scheduled chunks are <= 64 bits
-  wide, so both mean full-chunk); left at 96.
-- Stream-level passes (ported from the lanetight tree: adjacent identical-CCX
-  cancellation and commuting-window cancellation, hardened to compare the per-op
-  classical condition bit) were evaluated and REMOVED: an exact-rule scan shows zero
-  cancelable pairs in this stream even at window 100,000 (the lineage's internal
-  constant-propagation already eliminated them), and maximal-run XOR factoring finds no
-  factorable runs (99.998% of CCX ops are isolated singletons). No stream pass ships.
+Measured temporary values require their matching phase corrections. A temporary
+AND or carry that looks classically redundant cannot simply be removed when it
+still determines a measurement correction. The carry predicates, measurement
+outcomes and correction gates remain paired through forward and inverse
+execution. This distinction is essential because ordinary value tests alone
+would miss phase errors.
 
-Executed Toffoli moved from ~914k (ported head) to 1,163,310; the peak from 1,263 to
-1,385 qubits.
+## Squaring and modular correction
 
-## Validation methodology
+The modular square uses a recursive square construction with a 128-bit split.
+Low-half, high-half and sum-square terms are combined in place, and temporary
+product information is uncomputed after its consumers have finished. Reduction
+uses the sparse constant 2^32+977 from the secp256k1 prime. The square component
+uses 96-bit correction windows, 64-bit measured-overflow comparison prefixes,
+and 48-bit guards for shifted terms. The finite windows are part of its
+approximation boundary, not a claim of full-width arithmetic equivalence.
 
-Because any knob change re-rolls the Fiat-Shamir commitment, per-draw failure rates were
-measured against fresh `ECDLP_VALIDATION_SEED` values. The exact classical model (a
-rebinding of the bit-exact walk/replay model to this repo's v3 draw derivation) was
-checked against `eval_circuit` on: the baseline port (predicted 203 classical + 47
-phase events vs eval's 206 + 164 batches), two mid-hardening configs where it predicted
-the unique failing shot index exactly (shots 72706 and 19958, both confirmed), and the
-final configuration (predicted 0, eval confirms 0). The two residual channels (walk
-convergence, width slack) were measured over millions of samples with the same model,
-which is what sets the round count, bias, and window floors above.
+The expected executed Toffoli budget is 558,065 for division, 557,969 for
+multiplication, 51,449.5 for the square, and 1,987.5 for the remaining coordinate
+operations. These contributions sum to 1,169,471. Fractional expectations arise
+from measurement-conditioned execution. They should not be confused with the
+1,303,454 emitted CCX/CCZ operations or with the total count of all operation
+types. The measured whole-circuit mean is reported separately below.
+
+## Fixed construction and reproducibility
+
+The Rust circuit implementation is generated from a formal-level specification
+and intermediate representation. The generated Rust was not manually edited.
+The compact submission adapter is also generated from the specified operation
+format; it does not introduce hand-edited arithmetic. Changes are made upstream
+and regenerated, with the resulting circuit checked against the frozen stream.
+
+The submission contains a deterministic compact operation schedule and its
+decoder. Lossless decompression restores that schedule, after which the
+decoder expands the operations and ordered classical guards. This is a storage
+choice only: it does not inspect evaluation inputs, choose a measurement seed,
+alter the tested circuit, or perform host-side point addition for the evaluator.
+There is no external runtime download or adjustable search parameter.
+
+The delivery format is checked by decompression equality and by complete
+native operation-stream equality. Independent emissions reproduce the same
+stream. Arithmetic, gate order, register declarations, measurement identifiers
+and conditional operations are fixed before evaluation. The trusted builder
+and scorer are unchanged, and the scorer runs separately from the circuit
+construction. Source generation and testing do not make the entire circuit a
+universally proved quantum channel; that stronger claim is not made here.
 
 # Result
 
-| metric | value |
-|---|---|
-| qubits | 1,385 |
-| avg executed Toffoli | 1,163,310.460 |
-| executed Toffoli depth | 1,163,310 (serial stream) |
-| score | 1,611,184,350 |
-| emitted ops | 16,744,146 |
-| ops.bin SHA-256 | c5c98a6a50d1d745c29ada53b09c949936d3fc3887d8188774b14af2a95b7399 |
+| Metric | Local result |
+|---|---:|
+| Peak logical qubits | 1,367 |
+| All emitted operations | 26,207,369 |
+| Emitted CCX plus CCZ | 1,303,454 |
+| Mean executed Toffolis | 1,169,470.5893945312 |
+| Rounded executed Toffolis | 1,169,471 |
+| Rounded Toffoli depth | 1,169,471 |
+| Contest score | 1,598,666,857 |
+| Local validation shots | 102,400 |
+| Local evaluation workers | 20 |
+| Classical / phase / ancilla failures | 0 / 0 / 0 |
 
-Validation: deterministic 102,400-shot draw 0/0/0; 8 fresh-seed 102,400-shot draws all
-0/0/0 on the final stream (plus per-trim fresh draws, all clean); exact classical model
-60 fresh draws (6.1M shots) zero failures, zero phase-residual events at the final
-configuration.
+The reviewed operation-stream SHA-256 is
+`762f4fcc75f7d3509b5c39c8e4020a2890056f469f98df623fd53c24119dc61d`.
+The score uses the contest's rounded resource metrics. The unrounded product
+of qubits and mean executed Toffolis is 1,598,666,295.7023242; it is a diagnostic
+quantity rather than the submitted integer score.
 
-## Caveat and what is left
+The fixed stream passed local stages of 64, 512, 1,024, 2,048 and 9,024 shots,
+followed by the full 102,400-shot gate. A fresh evaluation of the final delivery
+build also passes all 102,400 shots with the same result and matching stream.
+Repeated runs with the same circuit-derived local seed demonstrate
+reproducibility; they are not independent random cohorts. In particular, the
+shot counts of such repeats must not be added together as a larger independent
+statistical test. The server's undisclosed seed remains a separate admission
+test and may expose failures absent from the local cohort.
 
-This is "exact-enough", not a machine-checked all-input proof. Two channels remain
-probabilistic in principle: walk convergence beyond 790 rounds (no worst-case round
-bound is proven for this signed walk; measured tail puts this at ~1e-9 per draw or
-below) and width-schedule excess beyond the +6-bit guard band (~1e-5 per draw by
-extrapolation of the measured envelope; 0 observed in 6.1M+ shots). The window channels
-are either exactly closed or bounded at ~1e-9 per draw. All bounds are direct
-measurements of the circuit's own classical semantics, not analogy. A proven
-convergence bound or a certificate-pinned width schedule would make the circuit exact
-outright.
+# Caveat and what is left
 
-## Credit
+The named failure conditions include equal input x coordinates, zero factors
+in a multiply campaign, insufficient signed convergence, signed-width overflow,
+terminal-support assumptions, modular correction-window disagreement,
+comparison-prefix phase disagreement, shifted-square guard overflow,
+final-negation window disagreement and noncanonical representations of zero.
+The contest input generator excludes infinity and same-x exceptional pairs;
+that exclusion does not remove the other approximation risks.
 
-The ping-pong division architecture, interleaved replay, width schedule, and tuning
-knobs come from the public ecdsa.fail contest lineage (the `8510360` head and its
-published memory notes). The exact classical walk model was ported from the same
-lineage's public prefilter and revalidated on this harness. The cancellation-pass rule
-was ported from the lanetight tree (found zero-yield here and not shipped). The
-hardening, envelope measurement, margin trims, and this repo's integration are new.
+Structured boundary diagnostics have exposed value, phase or scratch failures
+outside the asserted component conditions, including factor-288 and modular
+square boundary cases. Those results are retained as limitations rather than
+hidden by the successful random sample. No uniform failure-probability bound
+is claimed, and local success does not justify describing the route as exact.
+
+Further work would establish broader supported domains or reversible fallbacks
+for the finite-window failures, and reduce arithmetic while preserving the
+same cleanup and phase obligations. Any such change would require a newly
+frozen stream and new evaluation evidence. This submission asks the server to
+evaluate the fixed circuit described above; it does not claim success for an
+unbuilt follow-up optimization.
+
+# Credit
+
+The signed ping-pong architecture is adapted from Vasily Gnuchev's public
+1,385-qubit submission, identifier `sub_mtozpobm_tncua8`, at public commit
+`83d48b960749bd3a05c43cda72ff40282e64a7d4`. That entry provides the architectural
+reference. Its validation result is not reused as evidence for this candidate.
+The reversible point-addition interface and measurement-aware testing contract
+come from the ECDLP point-add contest and its acknowledged ECDSA Fail lineage.
