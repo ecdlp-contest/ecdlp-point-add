@@ -1,25 +1,48 @@
-flowchart TD
-  Target["Target primitive: quantum P plus classical Q on secp256k1"]
-  Algorithm["Algorithm"]
-  Optimization["Optimization"]
-  Target --> Algorithm
-  Target --> Optimization
-  Algorithm --> Input["Quantum x,y and preserved classical u,v"]
-  Input --> Difference["Subtract classical coordinates"]
-  Difference --> Divide["760-round signed ping-pong divide: lambda"]
-  Divide --> Shift["Add 3u to first coordinate"]
-  Shift --> Square["Subtract recursive modular square"]
-  Square --> Multiply["760-round multiply by u minus output x"]
-  Multiply --> Output["Subtract v; reverse-subtract u; output P plus Q"]
-  Optimization --> High["Preserve live high information across replay boundaries"]
-  Optimization --> Width["Size work from input, prior output and carry requirements"]
-  Optimization --> Fold["68-bit ordinary correction and 36-bit phase prefix"]
-  Optimization --> Phase["Keep measurement phase consumers and inverse cleanup"]
-  High --> Metrics["1337 qubits; rounded Toffolis and depth 1068707"]
-  Width --> Metrics
-  Fold --> Metrics
-  Phase --> Metrics
-  Output --> Validation["Local 102400 and 1024000 shots; each 0/0/0; overlapping cohorts"]
-  Metrics --> Score["Local score 1428861259; independent server test pending"]
-  Validation --> Score
-  Algorithm --> Limits["Approximate convergence, widths, correction windows and prefixes"]
+flowchart LR
+    ROOT["Target primitive: quantum P plus classical Q on secp256k1"]
+    ALG["Algorithm"]
+    OPT["Optimization"]
+    SHELL["Reversible coordinate shell: subtract Q, times-3 add, Solinas square, reconstruct"]
+    DWALK["Divide walk: 760-round signed binary-GCD on (p, Qx - Px), rigid alternation, one sign qubit per round"]
+    MWALK["Multiply walk: 760-round signed walk on (p, Px - x3)"]
+    TAPE["Sign tape (760 qubits per traversal; 758 live at the peak)"]
+    REPLAY["Interleaved coefficient replay: per round one 256-bit chunked Gidney add, boundary carry erases, pseudo-Mersenne fold, flag phase repair"]
+    WBACK["Reverse walk: restores denominator, clears tape"]
+    OUT["Affine point P plus Q; work state clean"]
+    PEAKQ["Peak = tape 758 + coefficient registers 512 + carry ladder 64 + 9 = 1,343 qubits"]
+    BUDGET["Calibrated per-draw failure budget ~7e-3 (rounds 3.9e-3, chunk 1.6e-3, fold 1.3e-3, flag 3e-4)"]
+    CAL["Each window calibrated on the trusted evaluator at small widths; measured 2^-w scaling"]
+    K1["Chunk-boundary erase comparator 96 -> 34 bits (27 x 2^(20-k) failures/draw; ~1.2 T/round/bit)"]
+    K2["Fold windows 80 -> 68 bits (1,396 x 2^(48-w) failures/draw; ~1.0 T/round/bit)"]
+    K3["Flag comparator 56 -> 36 bits (~25 x 2^(20-k) failures/draw; ~0.5 T/round/bit)"]
+    ROUNDS["Rounds 790 -> 760: exact walk model, 4.1M fresh shots per traversal, mean 620.6, max 744, tail x0.2 per 10 rounds; 3.9e-3 per draw"]
+    ALLOC["Widths set so marginal failure per Toffoli saved is equal across windows"]
+    EVAL["Trusted eval: deterministic 102,400-shot draw 0/0/0 plus 4 fresh-seed draws 0/0/0"]
+    METRICS["1,343 qubits x 1,046,054 executed Toffoli = 1,404,850,522 (Toffoli depth = count, serial stream)"]
+
+    ROOT --> ALG
+    ROOT --> OPT
+    ALG --> SHELL
+    SHELL --> DWALK
+    DWALK --> TAPE
+    TAPE --> REPLAY
+    REPLAY --> MWALK
+    MWALK --> WBACK
+    WBACK --> OUT
+    TAPE --> PEAKQ
+    OPT --> BUDGET
+    BUDGET --> CAL
+    CAL --> K1
+    CAL --> K2
+    CAL --> K3
+    BUDGET --> ROUNDS
+    CAL --> ALLOC
+    K1 --> REPLAY
+    K2 --> REPLAY
+    K3 --> REPLAY
+    ROUNDS --> DWALK
+    ROUNDS --> MWALK
+    ROUNDS --> PEAKQ
+    BUDGET --> EVAL
+    EVAL --> METRICS
+    PEAKQ --> METRICS
