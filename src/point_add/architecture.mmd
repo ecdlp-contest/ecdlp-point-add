@@ -5,21 +5,21 @@ flowchart TD
   Target --> Algorithm
   Target --> Optimization
   Algorithm --> Input["Quantum x,y and preserved classical u,v"]
-  Input --> Difference["Subtract u from x and v from y"]
-  Difference --> Divide["790-round signed ping-pong divide: lambda"]
-  Divide --> Shift["Add 3u to the first coordinate"]
-  Shift --> Square["Subtract recursive modular square of lambda"]
-  Square --> Multiply["790-round multiply: lambda times u minus output x"]
+  Input --> Difference["Subtract classical coordinates"]
+  Difference --> Divide["760-round signed ping-pong divide: lambda"]
+  Divide --> Shift["Add 3u to first coordinate"]
+  Shift --> Square["Subtract recursive modular square"]
+  Square --> Multiply["760-round multiply by u minus output x"]
   Multiply --> Output["Subtract v; reverse-subtract u; output P plus Q"]
-  Optimization --> Carry["Reuse split carry workspace and correction banks"]
-  Optimization --> History["Fuse initial rounds and recover erased history"]
-  Optimization --> Phase["Retain measurement-dependent phase corrections"]
-  Optimization --> SquareShape["128-bit square split and sparse-prime reduction"]
-  Carry --> Metrics["1367 qubits; rounded Toffolis 1169471; depth 1169471"]
-  History --> Metrics
+  Optimization --> High["Preserve live high information across replay boundaries"]
+  Optimization --> Width["Size work from input, prior output and carry requirements"]
+  Optimization --> Fold["68-bit ordinary correction and 36-bit phase prefix"]
+  Optimization --> Phase["Keep measurement phase consumers and inverse cleanup"]
+  High --> Metrics["1337 qubits; rounded Toffolis and depth 1068707"]
+  Width --> Metrics
+  Fold --> Metrics
   Phase --> Metrics
-  SquareShape --> Metrics
-  Output --> Validation["Local 102400 shots on 20 workers; failures 0/0/0"]
-  Metrics --> Score["Local score 1598666857; server validation pending"]
+  Output --> Validation["Local 102400 and 1024000 shots; each 0/0/0; overlapping cohorts"]
+  Metrics --> Score["Local score 1428861259; independent server test pending"]
   Validation --> Score
-  Algorithm --> Limits["Approximate convergence, widths, correction windows and phase prefixes"]
+  Algorithm --> Limits["Approximate convergence, widths, correction windows and prefixes"]

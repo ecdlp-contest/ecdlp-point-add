@@ -1,12 +1,18 @@
 use quantum_ecc::circuit::*;
 
 pub fn build() -> Vec<Op> {
-    let bytes = zstd::stream::decode_all(&include_bytes!("circuit.dat")[..])
+    let mut bytes = zstd::stream::decode_all(&include_bytes!("circuit.dat")[..])
         .expect("invalid circuit encoding");
-    assert_eq!(bytes.len(), 422355672);
+    assert_eq!(bytes.len(), 375721848);
     assert_eq!(bytes.len() % 24, 0);
-    let mut result = Vec::with_capacity(26207369);
+    let mut result = Vec::with_capacity(21213277);
     let records = bytes.len() / 24;
+    for j in 0..24 {
+        let base = j * records;
+        for i in 1..records {
+            bytes[base + i] = bytes[base + i].wrapping_add(bytes[base + i - 1]);
+        }
+    }
     for i in 0..records {
         let cell = |j| bytes[j * records + i];
         let word16 = |j| u16::from_le_bytes([cell(j), cell(j + 1)]) as u64;
@@ -49,6 +55,6 @@ pub fn build() -> Vec<Op> {
             result.push(o);
         }
     }
-    assert_eq!(result.len(), 26207369);
+    assert_eq!(result.len(), 21213277);
     result
 }

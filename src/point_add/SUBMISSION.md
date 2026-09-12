@@ -1,179 +1,177 @@
 # AI Model/Harness
 
 Model: GPT-6. Harness: Codex. This submission was developed with AI assistance.
-No numerical effort setting is claimed. The report below describes the circuit,
-its measured behavior, its limitations, and the public architecture it builds on.
+No numerical effort setting is claimed. This report describes the fixed circuit,
+its source-level construction, measured resources, and approximation limits.
 
 # Summary
 
-This candidate implements mixed affine secp256k1 point addition with 1,367 peak
-logical qubits. The local 102,400-shot result is 1,169,471 rounded executed
-Toffolis and 1,169,471 rounded Toffoli depth, giving a score of 1,598,666,857.
-The local evaluation found no classical, phase, or ancilla failures. These are
-local measurements; acceptance requires the contest's independent server run.
+This candidate implements mixed affine secp256k1 point addition with 1,337 peak
+logical qubits. The local 102,400-shot result is 1,068,707 rounded executed
+Toffolis and 1,068,707 rounded Toffoli depth, giving a score of 1,428,861,259.
+The local stock evaluation and a 1,024,000-shot diagnostic audit both found
+zero classical, phase, and ancilla failures on the same fixed operation stream.
+Independent server evaluation remains a separate requirement.
 
-The architectural reference is the public 1,385-qubit signed ping-pong entry by
-Vasily Gnuchev, published under the GitHub username gnuchev. Its ranked score is
-1,611,199,585. This candidate reduces peak width by 18 qubits while allowing a
-small increase in executed arithmetic. The resulting local score is about
-0.778% lower. Qubit count alone is not the objective: the extra carry work is
-useful only because the combined qubit and executed-resource score improves.
+The selected predecessor uses 1,367 qubits and has a local score of
+1,598,666,857. This child saves 30 qubits and 169,805,598 score units, a local
+score reduction of approximately 10.62%. The change is made in the formal
+representation and its source-level generators. The submitted circuit is
+generated from that representation and checked against the sealed stream.
 
-The arithmetic is approximate. Finite iteration schedules, signed widths,
-correction windows and measured comparison prefixes carry explicit limitations.
-The successful local sample is evidence about one fixed circuit, not a proof
-that every possible input is handled correctly. No private-seed success is
-claimed in this note before the server has evaluated the submission.
+The arithmetic remains approximate. Finite iteration schedules, signed-width
+assumptions, correction windows and measured comparison prefixes impose named
+conditions. Successful shots provide evidence about the frozen circuit; they
+do not prove correctness for every input or establish a uniform failure bound.
 
 # Method
 
-## Affine computation
+## Affine schedule
 
-Let P=(x,y) be the quantum point and Q=(u,v) the classical point, with field
-arithmetic modulo p=2^256-2^32-977. The four 256-bit interfaces are quantum x,
-quantum y, classical u and classical v. The classical point is preserved. For
-the supported nonexceptional inputs, the secant slope is
-lambda=(y-v)/(x-u), and the result is x'=lambda^2-x-u,
-y'=lambda*(x-x')-y.
+Let P=(x,y) be the quantum point and Q=(u,v) the preserved classical point. All
+field operations use p=2^256-2^32-977. The public interface consists of two
+256-bit quantum coordinates and two 256-bit classical coordinates. On supported
+nonexceptional inputs, the slope is lambda=(y-v)/(x-u), and the answer obeys
+x'=lambda^2-x-u and y'=lambda*(x-x')-y.
 
-The reversible schedule first subtracts u from x and v from y. A divide
-campaign turns the second quantum coordinate into the slope while retaining
-the denominator needed by the inverse replay. The first coordinate then adds
-3u and subtracts the slope square, yielding x+2u-lambda^2, which equals u-x'.
-The multiply campaign multiplies the slope by that value. Subtracting v gives
-lambda*(u-x')-v, which is y' on the same secant line. A final reverse
-subtraction of u produces x'. This ordering keeps the intermediate values in
-the two existing coordinate registers instead of allocating a third persistent
-field register.
+The reversible circuit first subtracts u from x and v from y. Division turns
+the second coordinate into the slope. The first coordinate then adds 3u and
+subtracts the slope square, producing x+2u-lambda^2=u-x'. Multiplication applies
+the slope to that value. Subtracting v gives lambda*(u-x')-v=y', and a final
+reverse subtraction produces x'. Keeping these intermediates in the coordinate
+registers avoids a third persistent field register. The outer coordinate and
+square blocks are retained from the selected predecessor.
 
-## Signed ping-pong division and multiplication
+## Signed walk and coefficient replay
 
-Both arithmetic campaigns use 790 scheduled signed rounds. The walk alternates
-the roles of its working registers and records the decisions needed for later
-replay. Forward computation, application to the target, and inverse cleanup
-are distinct parts of the schedule. The narrowing signed-width table and the
-termination conditions are assumptions of the approximate construction; the
-fixed round count is not asserted to establish universal convergence.
+Division and multiplication use 760 scheduled signed ping-pong rounds. Their
+forward walks, coefficient application, and inverse cleanup are distinct
+stages. The two campaigns retain different initial conditions and history
+recovery schedules. Their finite round budget is part of the approximation
+contract; it is not a universal convergence theorem.
 
-Initial rounds use their known starting values to combine initialization with
-the first walk operations. Recoverable history information is erased when the
-retained state determines it, then reconstructed at the point required by
-reverse replay. The divide and multiply campaigns retain their respective
-sign-erasure and parity-recovery arrangements. The implementation does not
-replace a signed-walk width schedule with an unsigned inversion schedule.
+The ordinary coefficient fold uses a 68-bit correction window and a 36-bit
+phase-comparison prefix limit. Initial and special operations retain their
+separate wider windows. The fixed schedule determines these choices before
+evaluation. No runtime search or input-dependent circuit selection occurs.
+The source representation records carry capacity, input and output widths,
+and retained high information at the boundaries where replay changes shape.
 
-The width reduction comes from scheduling carry workspace and modular
-correction banks so that storage can be reused across nonoverlapping stages.
-Split carry layouts preserve the arithmetic correction windows. At each
-composition boundary, temporary storage must be released consistently before
-the next arithmetic stage uses those wires. Reducing the declared width by
-discarding live state would not be a valid optimization.
+A preceding width-trimming experiment passed the smaller local cohort but
+failed the deeper audit. Diagnosis found that a high bit discarded at a replay
+boundary could still carry information required by a later operation. The
+current construction preserves that information in its representation. The
+repair was made upstream and a new circuit was generated and frozen. The failed
+candidate's passing receipts are not used as evidence for this submission.
 
-Measured temporary values require their matching phase corrections. A temporary
-AND or carry that looks classically redundant cannot simply be removed when it
-still determines a measurement correction. The carry predicates, measurement
-outcomes and correction gates remain paired through forward and inverse
-execution. This distinction is essential because ordinary value tests alone
-would miss phase errors.
+For a raw half step, output capacity follows the retained raw word rather than
+an optimistic estimate of its numerical width. For supported even inputs, the
+post-half physical capacity is the preceding raw capacity minus one. Temporary
+arithmetic width is chosen from the maximum of the input width, previous output
+width, and new output width plus its required carry. This avoids automatically
+adding an extra wire to whichever width happens to be largest, while preserving
+the actual carry obligation. These identities are applied with explicit local
+preconditions; the complete circuit is measured after composition.
 
-## Squaring and modular correction
+Temporary measured values retain their matching phase corrections. A carry
+that seems redundant for classical arithmetic may still influence phase, so
+it cannot be deleted solely because a value test passes. Measurement consumers,
+inverse replay, and release of temporary wires are checked separately. The
+source-level changes preserve the existing outer arithmetic blocks and the
+fixed measurement semantics of the generated operation schedule.
 
-The modular square uses a recursive square construction with a 128-bit split.
-Low-half, high-half and sum-square terms are combined in place, and temporary
-product information is uncomputed after its consumers have finished. Reduction
-uses the sparse constant 2^32+977 from the secp256k1 prime. The square component
-uses 96-bit correction windows, 64-bit measured-overflow comparison prefixes,
-and 48-bit guards for shifted terms. The finite windows are part of its
-approximation boundary, not a claim of full-width arithmetic equivalence.
+## Square and resource accounting
 
-The expected executed Toffoli budget is 558,065 for division, 557,969 for
-multiplication, 51,449.5 for the square, and 1,987.5 for the remaining coordinate
-operations. These contributions sum to 1,169,471. Fractional expectations arise
-from measurement-conditioned execution. They should not be confused with the
-1,303,454 emitted CCX/CCZ operations or with the total count of all operation
-types. The measured whole-circuit mean is reported separately below.
+The modular square retains the recursive 128-bit split and sparse-prime
+reduction. Low-half, high-half, and sum-square terms are combined with cleanup
+after their consumers finish. Its 96-bit correction windows, 64-bit measured
+comparison prefixes, and 48-bit shifted-term guards remain finite assumptions.
+This child does not claim that retaining that block removes its boundary cases.
 
-## Fixed construction and reproducibility
+The source census gives expected executed Toffoli contributions of 507,453.5
+for division, 507,817 for multiplication, 51,449.5 for the square, and 1,987.5 for
+coordinate operations. Their sum is 1,068,707.5. Fractional values reflect
+measurement-conditioned execution. They differ from the 1,141,863 emitted
+CCX/CCZ operations and from the total count of all operation types. The stock
+evaluator's measured mean and rounded score are reported separately below.
+
+## Generation and delivery
 
 The Rust circuit implementation is generated from a formal-level specification
 and intermediate representation. The generated Rust was not manually edited.
 The compact submission adapter is also generated from the specified operation
-format; it does not introduce hand-edited arithmetic. Changes are made upstream
-and regenerated, with the resulting circuit checked against the frozen stream.
+format. Arithmetic changes occur in the formal source layer and are regenerated;
+generated candidate Rust is never used as an editable arithmetic template.
 
-The submission contains a deterministic compact operation schedule and its
-decoder. Lossless decompression restores that schedule, after which the
-decoder expands the operations and ordered classical guards. This is a storage
-choice only: it does not inspect evaluation inputs, choose a measurement seed,
-alter the tested circuit, or perform host-side point addition for the evaluator.
-There is no external runtime download or adjustable search parameter.
+The submission contains a fixed compact operation schedule and a decoder.
+Lossless decompression and per-plane byte prefix sums modulo 256 restore the
+byte planes. Their inverse permutation reconstructs the intermediate records, then
+the decoder expands their gates and ordered classical guards. This changes
+storage only. It does not inspect evaluation inputs, choose measurement seeds,
+perform host-side point addition, or download circuit data at runtime.
 
-The delivery format is checked by decompression equality and by complete
-native operation-stream equality. Independent emissions reproduce the same
-stream. Arithmetic, gate order, register declarations, measurement identifiers
-and conditional operations are fixed before evaluation. The trusted builder
-and scorer are unchanged, and the scorer runs separately from the circuit
-construction. Source generation and testing do not make the entire circuit a
-universally proved quantum channel; that stronger claim is not made here.
+Full inverse-permutation equality checks the compressed schedule. Two native
+emissions from the delivery build match the sealed operation stream byte
+for byte. The stock builder and scorer remain unchanged. A fresh full stock
+evaluation of the delivery build also passes all 102,400 shots. Source reproduction,
+local semantic contracts, bounded checks, owner traces, and shot results are
+separate evidence layers. No whole-circuit universal quantum-channel proof is
+claimed by combining those layers.
 
 # Result
 
 | Metric | Local result |
 |---|---:|
-| Peak logical qubits | 1,367 |
-| All emitted operations | 26,207,369 |
-| Emitted CCX plus CCZ | 1,303,454 |
-| Mean executed Toffolis | 1,169,470.5893945312 |
-| Rounded executed Toffolis | 1,169,471 |
-| Rounded Toffoli depth | 1,169,471 |
-| Contest score | 1,598,666,857 |
-| Local validation shots | 102,400 |
-| Local evaluation workers | 20 |
-| Classical / phase / ancilla failures | 0 / 0 / 0 |
+| Peak logical qubits | 1,337 |
+| All emitted operations | 21,213,277 |
+| Emitted CCX plus CCZ | 1,141,863 |
+| Mean executed Toffolis, stock cohort | 1,068,707.4720507814 |
+| Rounded executed Toffolis | 1,068,707 |
+| Rounded Toffoli depth | 1,068,707 |
+| Contest score | 1,428,861,259 |
+| Stock validation shots | 102,400 |
+| Diagnostic audit shots | 1,024,000 |
+| Workers per evaluation | 20 |
+| Classical / phase / ancilla failures, each run | 0 / 0 / 0 |
 
-The reviewed operation-stream SHA-256 is
-`762f4fcc75f7d3509b5c39c8e4020a2890056f469f98df623fd53c24119dc61d`.
-The score uses the contest's rounded resource metrics. The unrounded product
-of qubits and mean executed Toffolis is 1,598,666,295.7023242; it is a diagnostic
-quantity rather than the submitted integer score.
+The operation-stream SHA-256 is
+`877af1c65265b5cdda96694366d5e2b3d4162a4f9972bbe641bda6071c9392e2`.
+The unrounded product of qubits and the stock mean is 1,428,861,890.1318946.
+That diagnostic quantity differs from the submitted score, which uses rounded
+resource metrics. The deterministic source expectation also differs slightly
+from the finite cohort's measurement-conditioned mean.
 
-The fixed stream passed local stages of 64, 512, 1,024, 2,048 and 9,024 shots,
-followed by the full 102,400-shot gate. A fresh evaluation of the final delivery
-build also passes all 102,400 shots with the same result and matching stream.
-Repeated runs with the same circuit-derived local seed demonstrate
-reproducibility; they are not independent random cohorts. In particular, the
-shot counts of such repeats must not be added together as a larger independent
-statistical test. The server's undisclosed seed remains a separate admission
-test and may expose failures absent from the local cohort.
+The fixed circuit passed local stages of 64, 512, 1,024, 2,048, and 9,024 shots,
+then the full stock cohort and the deeper diagnostic audit. The deep audit used
+the same immutable operation bytes. Its local cohort overlaps the stock cohort;
+the counts must not be added as independent evidence. Repeated stock evaluation
+on a delivery decoder likewise establishes reproduction, not a new independent
+statistical cohort. The server's undisclosed inputs and seed remain separate.
 
-# Caveat and what is left
+# Caveat and remaining work
 
-The named failure conditions include equal input x coordinates, zero factors
-in a multiply campaign, insufficient signed convergence, signed-width overflow,
-terminal-support assumptions, modular correction-window disagreement,
-comparison-prefix phase disagreement, shifted-square guard overflow,
-final-negation window disagreement and noncanonical representations of zero.
-The contest input generator excludes infinity and same-x exceptional pairs;
-that exclusion does not remove the other approximation risks.
+Named failure conditions include equal input x coordinates, zero multiplication
+factors, insufficient signed convergence, signed-width overflow, terminal
+support failures, correction-window disagreement, comparison-prefix phase
+disagreement, shifted-square overflow, final-negation disagreement, and
+noncanonical zero. Local contracts have explicit assumptions. Preserved
+structured boundary diagnostics outside those conditions include failures in
+arithmetic components; passing random shots does not erase those limitations.
 
-Structured boundary diagnostics have exposed value, phase or scratch failures
-outside the asserted component conditions, including factor-288 and modular
-square boundary cases. Those results are retained as limitations rather than
-hidden by the successful random sample. No uniform failure-probability bound
-is claimed, and local success does not justify describing the route as exact.
-
-Further work would establish broader supported domains or reversible fallbacks
-for the finite-window failures, and reduce arithmetic while preserving the
-same cleanup and phase obligations. Any such change would require a newly
-frozen stream and new evaluation evidence. This submission asks the server to
-evaluate the fixed circuit described above; it does not claim success for an
-unbuilt follow-up optimization.
+The corrected retained-high representation addresses the diagnosed truncation
+mechanism and passes the new audit. It does not prove that every remaining
+approximation is harmless. Universal channel and allocator correctness and
+uniform probability bounds remain open. Broader domains, reversible fallbacks,
+or further gate reductions would require changed formal artifacts, regeneration,
+and a new fixed circuit with its own evaluation evidence.
 
 # Credit
 
-The signed ping-pong architecture is adapted from Vasily Gnuchev's public
-1,385-qubit submission, identifier `sub_mtozpobm_tncua8`, at public commit
-`83d48b960749bd3a05c43cda72ff40282e64a7d4`. That entry provides the architectural
-reference. Its validation result is not reused as evidence for this candidate.
-The reversible point-addition interface and measurement-aware testing contract
-come from the ECDLP point-add contest and its acknowledged ECDSA Fail lineage.
+The selected predecessor reconstructs the public signed ping-pong architecture
+of Vasily Gnuchev's 1,385-qubit entry, submission `sub_mtozpobm_tncua8`, associated
+with public commit `83d48b960749bd3a05c43cda72ff40282e64a7d4`. This descent also
+investigates donor techniques from the public ECDSA Fail work, including Teddy's
+commit `897dda2b0cf267151ecd973252d2a5078cbf1b63`. Architectural ideas are reused;
+donor validation receipts do not certify this generated child. The reversible
+point-addition interface and measurement-aware evaluation contract come from
+the ECDLP point-add contest and its acknowledged ECDSA Fail lineage.
