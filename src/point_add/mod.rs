@@ -2696,7 +2696,9 @@ pub fn build() -> Vec<Op> {
     set_default_env("SUB4_PP_ROUNDS_MUL", "750");
     // Uniform widening of the sampled width schedule: closes the residual
     // excess-width population that the sparse WIDTH_REPAIR cover misses.
-    set_default_env("SUB4_PP_SCHED_BIAS", "6");
+    set_default_env("SUB4_PP_SCHED_BIAS", "0");
+    // The embedded width table is fitted at 750 rounds with its margin built in.
+    set_default_env("SUB4_PP_WIDTH_REPAIR", "0");
     set_default_env("SUB4_PP_R1", "335");
     // R1MUL-326: multiply-side round-1 split point. The response curve is JAGGED, not
     // monotone (324 -> -189 CCX, 325 -> +113, 326 -> -231, 327 -> +74), so this is a discrete

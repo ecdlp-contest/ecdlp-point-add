@@ -9,8 +9,9 @@ tooling, not shipped) was used only to measure the round-count convergence tail.
 # Summary
 
 This revision keeps the public signed ping-pong architecture of our previous entries
-(`83d48b9`, `ec7638d`) under a **calibrated per-draw failure budget**, moved one step
-further along the measured convergence tail (750 rounds) than the accepted 760-round entry. Every finite window in the replay cell was
+(`83d48b9`, `ec7638d`) under a **calibrated per-draw failure budget** (750 rounds), and replaces the
+walk's width schedule -- a 704-round table stretched to the current depth, carrying 15-16
+bits of slack per register late in the walk -- with one fitted directly at 750 rounds. Every finite window in the replay cell was
 calibrated on the trusted evaluator at small widths, where failures are countable, and
 the measured 2^-w scaling was used to set each width; the walk round count was set from
 the exact model's convergence tail over 4.1 million fresh-draw shots per traversal. One knob that had
@@ -21,14 +22,14 @@ Toffoli per bit per round.
 Frozen submitted circuit (baked defaults, no environment dependence):
 
 - 1,333 qubits;
-- 14,371,165 emitted operations;
-- 1,032,513.000 average executed Toffolis on the deterministic 102,400-shot draw;
-- score 1,376,339,829 (= 1,333 x 1,032,513; the op stream is serial, so executed
+- 14,267,316 emitted operations;
+- 1,025,791.245 average executed Toffolis on the deterministic 102,400-shot draw;
+- score 1,367,379,403 (= 1,333 x 1,025,791; the op stream is serial, so executed
   Toffoli depth equals executed Toffoli count);
-- `ops.bin` SHA-256 `1d30abddc4fb64070d8cf542ae100529338943d8ec34bb74b3d2febfce0d20c5`.
+- `ops.bin` SHA-256 `0f0a3d80e40bab94a4390b56c0dba7f7a56410fe7c299f04b4296347b78b025f`.
 
-Against the current leader (1,299 x 1,074,110 = 1,395,267,591) this is 1.4% lower; against
-our accepted 760-round entry (1,404,859,923) it is 2.0% lower.
+Against jackylee0424's 1,299 x 1,074,110 = 1,395,267,591 this is 2.0% lower; against our
+accepted 750-round entry (1,376,335,830) it is 0.65% lower.
 
 # Method
 
@@ -58,6 +59,7 @@ qubits ~= 585 + rounds.
 | `REPLAY_FLAG_COMPARE` | 56 | 36 | ~0.5 T/round/bit |
 | `REPLAY_CHUNK_COMPARE` | 96 (exact) | 33 | ~1.2 T/round/bit (-44k measured at 96 -> 40) |
 | `PEAK`/`WALK_PEAK` budget | 1371 | 1331 | follows the tape |
+| width schedule | rescaled 704-round table + bias 6 + sparse repair | fitted at 750 rounds, margin 8 | -7.0k T (walk + walk-back on narrower registers) |
 
 Everything else (width schedule bias 6, R1/R2 interleave points, shell and square
 windows, all lineage micro-optimizations) is unchanged: the source diff against the
@@ -83,8 +85,12 @@ trusted evaluator at widths small enough to count failures on the deterministic 
   (4.1M shots per traversal): mean 620.6 rounds, sd 21.7, max 737 (divide) / 744
   (multiply); the tail falls x0.2 per 10 rounds. Per-draw non-convergence, both
   traversals: 1.8e-2 at 750 rounds (3.9e-3 at 760, 8.5e-4 at 770).
-- width-schedule slack at bias 6: constant 2 across all 4.1M shots (binding at a fixed
-  round), left unchanged.
+- width schedule: the per-round maximum signed width needed by the walk was measured on
+  the exact model over the same 40 draws (4.1M shots per traversal); the shipped table is
+  that envelope plus a uniform 8-bit margin, never wider than the previous table (early
+  rounds keep their previous 6-8 bits of slack; late rounds drop from 15-16 to 8). The
+  per-draw maximum varies with a standard deviation of ~2.4 bits late in the walk; the
+  8-bit margin over a 40-draw envelope is estimated at ~1e-4 failures per draw.
 
 Widths were allocated so that each window's marginal failure per Toffoli saved is
 equal (fold : flag : chunk risk in proportion to 1520 : 760 : 1840 T per bit).
@@ -94,21 +100,21 @@ equal (fold : flag : chunk risk in proportion to 1520 : 760 : 1840 T per bit).
 | metric | value |
 |---|---|
 | qubits | 1,333 |
-| avg executed Toffoli | 1,032,513.000 |
-| executed Toffoli depth | 1,032,513 (serial stream) |
-| score | 1,376,339,829 |
-| emitted ops | 14,371,165 |
-| ops.bin SHA-256 | 1d30abddc4fb64070d8cf542ae100529338943d8ec34bb74b3d2febfce0d20c5 |
+| avg executed Toffoli | 1,025,791.245 |
+| executed Toffoli depth | 1,025,791 (serial stream) |
+| score | 1,367,379,403 |
+| emitted ops | 14,267,316 |
+| ops.bin SHA-256 | 0f0a3d80e40bab94a4390b56c0dba7f7a56410fe7c299f04b4296347b78b025f |
 
 Validation: deterministic 102,400-shot draw, 0 classical / 0 phase / 0 ancilla failures,
-all 102,400 shots OK; 1 fresh `ECDLP_VALIDATION_SEED` 102,400-shot draw of the same
-stream, 0/0/0 (executed Toffoli 1,032,515.2).
+all 102,400 shots OK; 2 fresh `ECDLP_VALIDATION_SEED` 102,400-shot draws of the same
+stream, both 0/0/0 (executed Toffoli 1,025,788.4 and 1,025,794.2).
 
 ## Caveat and what is left
 
 This circuit is deliberately approximate with a stated budget: the summed per-draw
 failure expectation is about 2.3e-2 (rounds 1.8e-2, chunk 3.2e-3, fold 1.3e-3, flag
-3e-4), i.e. roughly one failed 102,400-shot validation per ~45 draws; the round count is
+3e-4, width margin ~1e-4), i.e. roughly one failed 102,400-shot validation per ~45 draws; the round count is
 the deliberate purchase (about 0.2% of score per round on this architecture). Each component is
 a direct measurement of this circuit's own semantics on the trusted evaluator or the
 validated walk model, extrapolated on the measured 2^-w scaling; none is a proof. The

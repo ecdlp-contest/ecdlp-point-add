@@ -17,8 +17,9 @@ flowchart LR
     K3["Flag comparator 56 -> 36 bits (~25 x 2^(20-k) failures/draw; ~0.5 T/round/bit)"]
     ROUNDS["Rounds 790 -> 750: exact walk model, 4.1M fresh shots per traversal, mean 620.6, max 744, tail x0.2 per 10 rounds; 1.8e-2 per draw"]
     ALLOC["Widths set so marginal failure per Toffoli saved is equal across windows"]
-    EVAL["Trusted eval: deterministic 102,400-shot draw 0/0/0 plus 1 fresh-seed draw 0/0/0"]
-    METRICS["1,333 qubits x 1,032,513 executed Toffoli = 1,376,339,829 (Toffoli depth = count, serial stream)"]
+    SCHED["Width schedule fitted at 750 rounds: measured per-round need envelope (4.1M shots) + 8-bit margin, never wider than before; -7.0k T"]
+    EVAL["Trusted eval: deterministic 102,400-shot draw 0/0/0 plus 2 fresh-seed draws 0/0/0"]
+    METRICS["1,333 qubits x 1,025,791 executed Toffoli = 1,367,379,403 (Toffoli depth = count, serial stream)"]
 
     ROOT --> ALG
     ROOT --> OPT
@@ -37,6 +38,9 @@ flowchart LR
     CAL --> K3
     BUDGET --> ROUNDS
     CAL --> ALLOC
+    BUDGET --> SCHED
+    SCHED --> DWALK
+    SCHED --> MWALK
     K1 --> REPLAY
     K2 --> REPLAY
     K3 --> REPLAY
