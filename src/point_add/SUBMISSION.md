@@ -1,61 +1,65 @@
-# Generated 1298-qubit arithmetic point addition
+# Square correction with direct reuse of the lowest carry
 
 ## AI Model/Harness
 
-GPT-5.6-Sol (High) produced and reviewed this implementation. The Rust arithmetic routines were generated from an upstream formal/source representation and were not edited by hand. Executing those routines constructs the arithmetic circuit and emits its operations. The implementation does not decode a stored whole-circuit schedule or substitute a precomputed gate array for arithmetic construction. Reviewed constants describe widths, checkpoints and layouts used by the builders.
+GPT-6 through Codex desktop inspected the parent, derived and reviewed the rewrite, and prepared the Rust change. The harness used the repository builder and unchanged evaluator, with independent Python gate-program checks. 
 
-The evidence is deliberately separated by scope. Kernel-checked contracts cover selected signed-representation, prefix-ordering, resource and control-lifetime identities. Complete operation comparison binds the source execution to the native builder output. The trusted evaluator supplies resource measurements and sampled accuracy for the frozen circuit. These layers support an artifact-specific approximate claim; none is presented as a universal proof of the complete quantum channel.
+The parent is commit `b436000fe15aff093a9e1c653cc40a5cc1f0346a` in `ecdlp-contest/ecdlp-point-add`. Its arithmetic Rust was generated from an upstream formal/source representation. This candidate applies a manual, limited specialization to that generated Rust. The parent's statement that all emitted operations were compared with its upstream representation is not a binding proof for this modified artifact. Evidence for the change consists of the stated local contract, its algebraic and phase argument, independent gate-level tests, and the candidate-specific build and evaluation results below.
 
 ## Summary
 
-This circuit adds a quantum point P to a classical point Q on secp256k1. Its local trusted resource tuple is 1,298 peak logical qubits, 1,031,994 rounded executed Toffolis, 1,031,994 in the benchmark Toffoli-depth metric, and score 1,339,528,212. The score is 471,788 below 1,340,000,000.
+The triangular-square correction recomputes a lowest-bit carry already available as the input's lowest bit. The replacement passes that wire to the higher-bit adder and uses one CNOT to write or clear the lowest product bit, removing one CCX and HMR per call.
 
-The exact circuit passed the stock 102,400-shot evaluation and a separate fresh 1,024,000-shot diagnostic audit, both using 20 CPU workers. Each run observed zero classical mismatches, zero phase-garbage batches and zero ancilla-garbage batches. Server-private evaluation remains pending at submission time.
+For the unchanged recursion schedule, nine square leaves are computed and subsequently uncomputed. Independent full-stream counting confirms 18 fewer unconditional CCX operations and 18 fewer HMR operations. This structural difference does not imply that two finite-sample mean Toffoli measurements differ by exactly 18. Removing HMR changes the evaluator's subsequent random-stream alignment, and later classically conditioned gates can have different sample counts.
 
-The construction descends from the accepted 1,299-qubit arithmetic-builder architecture. It reduces the fixed signed walk from 750 to 741 rounds and uses a pointwise capacity profile. An initial 741-round candidate passed the stock cohort but failed the fresh million-shot audit. The defect was structural: a signed multiplication target needed more bits than its frame supplied. Widening only the first failing row merely moved the first overflow to a later row. The submitted candidate instead repairs the complete observed failing trajectory, regenerates the builders, and repeats all binding and accuracy checks on the new bytes.
+The only circuit-implementation change is `arithmetic_75_adjust` in `src/point_add/arithmetic.rs`; its pads and cleanup remain. Round counts, capacity profiles, fold and phase windows, recursion threshold, coordinate schedule and trusted evaluation code are unchanged. No validation seed or nonce was searched.
 
 ## Method
 
-The field modulus is p = 2^256 - 2^32 - 977. On the supported ordinary affine domain, the slope is (Py - Qy)/(Px - Qx). The new x coordinate is the slope squared minus Px minus Qx, and the new y coordinate follows from the slope and the old-to-new x difference. Reversible coordinate translations, division, squaring and multiplication implement this calculation and restore temporary state. The unchanged benchmark defines the reference behavior and tested input domain.
+Write the leaf input width as m and its lowest bit as a. The correction addend is the existing 2m-bit register `wide = x + pads`, with concatenation in little-endian order. In particular, its numeric value has the form `wide = a + 2W`. The original implementation invokes a full-width add or subtract on the 2m-bit product. The replacement operates on `wide[1..]` and `product[1..]`, passes `x[0]` as the carry input of the existing `chunk_add`, and applies `CX(x[0], product[0])`.
 
-Division and multiplication use an alternating signed binary-GCD recurrence with 741 fixed rounds and coefficient replay. After the initial lift, an odd residual y is replaced by (y + k*x)/2 for another odd residual x and a sign k in {-1,+1}. Low bits select k so that the next residual is odd. Reverse execution reconstructs the preceding residual from the quotient, the other residual and the retained decision. Forward traversal, reverse traversal, retained controls, coefficient replay, cleanup and measurement-phase correction are emitted by explicit arithmetic routines.
+There are two different input contracts. During forward construction the product's lowest bit is zero when subtraction begins. During inverse construction the product's lowest bit equals a when addition begins. These statements require clean workspace and the retained-product contract. Runtime allocation does not reset an arbitrary dirty qubit. Equivalence is not claimed on dirty allocations or arbitrary product low bits.
 
-The signed registers follow a per-round capacity profile rather than retaining the initial width for all 741 rounds. Widths can shrink and later regrow because every transition must still contain its signed inputs, doubled intermediate and signed output. Removing a bit without that support would lose information needed by reversal. The representation contracts establish encode/decode round trips inside the declared signed radius and relate a valid successor to its predecessor. They do not assert that every possible benchmark input remains inside every chosen radius.
+The forward contract follows from the square construction: the leaf product starts clean, triangular rows act only on slices starting at bit `2*i+1`, and `spread` calls `zero_low_add`, which skips bit zero. None of these operations changes the lowest product bit before the forward adjustment. The inverse contract follows from `product = x*x`, hence `product[0] = x[0]`. Recursive inverse construction first reverses the combination of subproducts and then uncomputes each leaf. It relies on the square consumers preserving the retained product and its input until that inverse. This is a local construction contract, not a new proof of the inherited whole-circuit workspace invariant on every benchmark input.
 
-The rejected predecessor exposed that distinction. At diagnostic shot 86,868, the multiply walk reached round 152 with a 221-bit signed target in a 220-bit frame. A one-row repair made round 154 the next overflow. Replaying the entire failing trajectory identified nine required frame changes: rounds 152 and 154 use 221 bits; rounds 159 and 160 use 219; round 162 uses 218; rounds 163, 164 and 165 use 217, 216 and 217; and round 168 uses 215. These requirements were applied upstream to every forward, replay and cleanup use of the affected frames. The resulting complete source price, rather than an isolated patch estimate, is used here.
+For the forward case let `product = 2P`. Then, modulo `2^(2m)`,
 
-The fixed-depth choice also received a fresh scalar holdout containing 4,193,658 rows. It observed one capacity failure, and that row was also the sole terminal-convergence failure; no capacity failure occurred among rows that reached the required terminal state. This finite observation helps separate the chosen capacity envelope from the declared 741-round nonconvergence event. It is empirical evidence, not a uniform convergence or capacity theorem.
+`2P - (a + 2W) = a + 2(P - W - a)`.
 
-Raw residual traversal and coefficient replay have separate state and lifetimes. Division uses checkpoints at rounds 17 and 728; multiplication uses checkpoints at rounds 354 and 728. Contiguous replay groups are fitted to the declared capacities and available scratch. The complete tariff charges retained history, live coefficients, forward and inverse raw work, replay, modular correction, phase recovery and terminal cleanup. The expected source cost is 1,031,993 Toffolis under the measurement-guard model; the trusted evaluator's rounded executed value is 1,031,994.
+The low result is a, and the high result subtracts W with borrow a. The original subtractor is implemented by complementing the target, adding the source, then complementing the target again. The replacement keeps those complements on the high target and supplies carry a directly to the high adder. The CNOT changes the clean lowest product bit from zero to a.
 
-Control-lifetime checking requires every ordinary retained decision to be created before use, consumed by its replay owner, and released only after its final consumer. Both traversal directions satisfy the clean schedule, while deliberately injected use-before-create and premature-release schedules fail. A conditional commutation contract permits independent raw and coefficient actions to change order only when ownership and shared-control premises hold. This establishes the scoped logical schedule; physical allocation for all possible executions remains a separate open obligation.
+For the inverse case let `product = a + 2P`. Then
 
-Compact modular arithmetic providers use rolling carries and deferred phase recovery to share scratch. The ordinary modular path retains its 68-bit correction window and 36-bit phase-prefix limit. A separate signed-depth selection uses a 34-bit retained-prefix condition: distinct high prefixes determine unsigned order, while equal prefixes remain an explicit support obligation. Square and coordinate layers also retain their declared finite correction and prefix conditions. The final operation stream includes all guards, measurements, inverse work and cleanup required by these choices.
+`(a + 2P) + (a + 2W) = 2(P + W + a)`.
 
-Two independent source-to-Rust generations agree byte for byte. Two executions of the generated native builder emit identical circuit bytes. Decompressing and comparing all 21,064,276 serialized operation records reproduces the complete source operation stream, including classical guards and measurements. The generated Rust therefore remains an output of the source representation rather than an input to it.
+The low result is zero, and the high result receives carry a. The same high adder with carry input `x[0]` applies, followed by the CNOT that clears the lowest product bit. The addend remains 2m bits wide, including its pads; no range or approximation window is narrowed.
 
-The stock evaluator measured the frozen circuit over 102,400 deterministic commitment-derived shots. After that gate passed, a fresh locally seeded diagnostic evaluated 1,024,000 shots with the same simulator and validity checks, adding only a larger shot count, progress reporting and failure-input capture. The fresh seed was fixed before execution without favorable-seed retries. Diagnostic resource output does not replace the packaged stock score.
+In the original forward low-bit carry step the relevant AND is `a AND 1`; in the inverse step it is `a AND a`. Either writes a to a clean carry wire. Higher stages only use that carry as a control, so using `x[0]` in its place preserves their action and leaves the input bit unchanged. HMR of the old carry contributes `(-1)^(r*a)` for outcome r. The conditional CZ has controls `(a,1)` forward or `(a,a)` inverse, contributing the same phase. They cancel for either outcome, which is otherwise unused. Deleting this block preserves the local quantum channel on the stated subspace, including inputs entangled with external registers. The square stage has no pending deferred carry phase.
+
+The structural count uses the parent threshold of 128 and its strict `m < threshold` leaf test. Each of the two 128-bit products has leaves of widths 64, 64 and 65. The 129-bit sum product has leaves of widths 64, 65 and 66. Nine leaves, each adjusted once forward and once backward, give the measured structural reduction of 18 CCX. Shortening a local carry lifetime does not establish a lower global Q; measure the completed stream.
 
 ## Result
 
-| Quantity | Local result |
-|---|---:|
-| Peak logical qubits | 1,298 |
-| Expected source Toffolis | 1,031,993 |
-| Rounded executed Toffolis | 1,031,994 |
-| Benchmark Toffoli-depth metric | 1,031,994 |
-| Stock score | 1,339,528,212 |
-| Headroom below 1.34B | 471,788 |
-| Complete serialized operations | 21,064,276 |
-| Stock shots on 20 workers | 102,400 |
-| Stock classical / phase / ancilla errors | 0 / 0 / 0 |
-| Fresh diagnostic shots on 20 workers | 1,024,000 |
-| Diagnostic classical / phase / ancilla errors | 0 / 0 / 0 |
+The unchanged parent was reproduced locally with the original evaluator on two predetermined cohorts of 102,400 shots each. Both passed. The published-server-seed reproduction had mean executed Toffoli count 1,031,988.115, rounded count 1,031,988, 1,298 qubits, and Q times rounded count 1,339,520,424. The independently precommitted fresh cohort had mean 1,031,986.502, rounded count 1,031,987, the same 1,298 qubits, and product 1,339,519,126. These are local baseline measurements; they are not new private-server results for the candidate.
 
-The source interpreter and generated Rust construction agree over every serialized operation record. Repeated generation and repeated native emission are deterministic. The trusted evaluator, simulator, reference arithmetic, benchmark manifest, dependencies and scoring formula are unchanged.
+The independent local kernel check passed 78,984 gate-program simulations. For adjustment widths m=1 through 5, it tested every input x and every product high word satisfying the applicable low-bit contract, for both add and subtract. For complete triangular squares at m=1 through 9, it tested every x in both forward construction from zero and inverse cleanup from the square. It checked the exact output, restoration of input bits, every scratch release, and all remaining scratch bits at completion.
+
+The phase check represents each independent HMR outcome by a symbolic variable over GF(2). These local programs use outcomes only as single classical guards on CZ gates, so the phase expression is linear in those variables. Requiring its coefficient bitset to be zero checks all measurement assignments for each tested basis input, rather than sampling measurement branches. Each old/new pair also had exactly one fewer CCX and HMR per adjustment. These are independently transcribed Python gate programs based on the parent arithmetic and simulator semantics. They are not an exhaustive execution of the patched Rust, and the small-width tests are not a full-size point-add proof.
+
+Candidate-specific artifact and evaluation results:
+
+- Candidate commit or immutable source identity: arithmetic.rs SHA-256 `d94d8247509b54131a4247aa1cdbc75a052017704dd6b6eeb136dfd160d14685`.
+- Emitted stream SHA-256: `89971d50f27ebb8f1f29e664cb5a6eeb2b9af069ae77f79e0053d17c22ab05f2`.
+- Build and static stream audit: release build passed; 21,064,168 records, 36,270,492 bytes; static CCX 1,111,810 to 1,111,792, all 18 removed CCX unconditional; CCZ remains zero; Q remains 1,298.
+- Fresh cohort, 102,400 shots: PASS; zero coordinate mismatches, phase-garbage batches or ancilla-garbage batches; Q1298, rounded T1031975, benchmark depth1031975, score1339503550.
+- Stock commitment-derived cohort, 102,400 shots: PASS; zero coordinate mismatches, phase-garbage batches or ancilla-garbage batches; Q1298, rounded T1031981, benchmark depth1031981, score1339511338.
+- Final Q times rounded mean Toffoli comparison: stock local score is 9086 below the published parent score1,339,520,424; this is a finite-sample comparison, separate from the structural18-CCX reduction.
+- Private-server status: pending at submission; no candidate server acceptance is claimed.
 
 ## Caveat and what is left
 
-This remains approximate. Named bad events include signed-capacity overflow outside the finite envelope, failure to converge within 741 rounds, disagreement or equality in shortened prefix predicates, modular-correction-window support failure, shifted-term guard failure, noncanonical intermediate results, and exceptional affine inputs outside the declared support. Zero sampled errors do not establish a uniform failure probability.
+The parent uses approximate bounded arithmetic. Keeping its parameters does not establish that every secp256k1 input remains inside every inherited signed capacity, carry window, or convergence bound. The local channel argument is conditional on clean scratch and the specified product relation. It does not turn finite validation into a universal correctness or allocation proof for the complete point-add circuit. The unchanged evaluator checks coordinates, phase and final ancillary storage; no additional full reverse pass was performed here. Its depth field equals the rounded Toffoli count, not an independently measured parallel depth. Acceptance requires the server rerun. Deleted measurements change RNG alignment. Changing the operation commitment also changes the sampled inputs; parent/candidate results are not a paired-input comparison.
 
-Universal channel refinement, universal physical-allocation refinement, a uniform convergence bound and caller-level discharge of every conditional support premise remain open. The local resource and sampled-accuracy claims apply only to this exact generated artifact. Any further width, schedule or gate change requires a new source epoch, deterministic regeneration, complete resource measurement and fresh validation.
+## Credit
+
+[Jackie Chia-Hsun Lee and the accepted parent contributors](https://github.com/ecdlp-contest/ecdlp-point-add/commit/b436000fe15aff093a9e1c653cc40a5cc1f0346a) supply the point-add architecture, signed arithmetic, measurement-assisted cleanup, square decomposition, compiler runtime, parameter profiles and evaluation machinery. The parent submission identifies its model as GPT-5.6-Sol (High); that attribution is reported from the parent note. This contribution is limited to the lowest-carry specialization and its new review and verification evidence. It does not claim to originate the inherited arithmetic or the general technique of reusing a known value in reversible computation.

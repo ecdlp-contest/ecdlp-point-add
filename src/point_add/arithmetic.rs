@@ -1455,7 +1455,32 @@ bind(&e,args,&["subtract"],vec![]);
 let tmp_3764={let e=e.child();let mut tmp_3765=Vec::new();for tmp_3769 in iter(e.get("x")){e.set("_",tmp_3769);tmp_3765.push({let tmp_3766={let tmp_3768=V::Compiler;attribute(c,tmp_3768,"alloc")};let mut tmp_3767=Vec::new();invoke(c,tmp_3766,tmp_3767)});}vl(tmp_3765)};e.set("pads",tmp_3764.clone());
 for tmp_3770 in iter({let tmp_3771=e.get("zip");let mut tmp_3772=Vec::new();tmp_3772.push((String::new(),slice(e.get("x"),V::None,V::I(-integer(V::I(1i128))),V::None)));tmp_3772.push((String::new(),slice(e.get("pads"),V::None,V::I(-integer(V::I(1i128))),V::None)));invoke(c,tmp_3771,tmp_3772)}){let tmp_3773=tmp_3770;e.set("a",get(tmp_3773.clone(),V::I(0)));e.set("b",get(tmp_3773.clone(),V::I(1)));{let tmp_3774={let tmp_3776=V::Compiler;attribute(c,tmp_3776,"emit")};let mut tmp_3775=Vec::new();tmp_3775.push((String::new(),vs("cx")));tmp_3775.push((String::new(),e.get("a")));tmp_3775.push((String::new(),e.get("b")));invoke(c,tmp_3774,tmp_3775)};
 {let tmp_3777={let tmp_3779=V::Compiler;attribute(c,tmp_3779,"emit")};let mut tmp_3778=Vec::new();tmp_3778.push((String::new(),vs("x")));tmp_3778.push((String::new(),e.get("b")));invoke(c,tmp_3777,tmp_3778)};}
-{let tmp_3780=if truth(e.get("subtract")){e.get("sub_full")}else{e.get("add_full")};let mut tmp_3781=Vec::new();tmp_3781.push((String::new(),binary("add",e.get("x"),e.get("pads"))));tmp_3781.push((String::new(),e.get("product")));invoke(c,tmp_3780,tmp_3781)};
+// Exact local specialization: square correction has p[0] = 0 before
+// subtraction and p[0] = x[0] before addition. The low carry equals x[0].
+{
+    let square_wide = binary("add", e.get("x"), e.get("pads"));
+    let square_high = slice(e.get("product"), V::I(1), V::None, V::None);
+    let square_low = get(e.get("x"), V::I(0));
+    let square_emit = |c: &mut B, name: &str, qs: Vec<V>| {
+        let f = attribute(c, V::Compiler, "emit");
+        let mut args = vec![(String::new(), vs(name))];
+        args.extend(qs.into_iter().map(|q| (String::new(), q)));
+        invoke(c, f, args);
+    };
+    if truth(e.get("subtract")) {
+        for q in iter(square_high.clone()) { square_emit(c, "x", vec![q]); }
+    }
+    invoke(c, e.get("chunk_add"), vec![
+        (String::new(), slice(square_wide, V::I(1), V::None, V::None)),
+        (String::new(), square_high.clone()),
+        (String::new(), square_low.clone()),
+        (String::new(), V::None),
+    ]);
+    if truth(e.get("subtract")) {
+        for q in iter(square_high) { square_emit(c, "x", vec![q]); }
+    }
+    square_emit(c, "cx", vec![square_low, get(e.get("product"), V::I(0))]);
+}
 for tmp_3782 in iter({let tmp_3783=e.get("zip");let mut tmp_3784=Vec::new();tmp_3784.push((String::new(),slice(e.get("x"),V::None,V::I(-integer(V::I(1i128))),V::None)));tmp_3784.push((String::new(),slice(e.get("pads"),V::None,V::I(-integer(V::I(1i128))),V::None)));invoke(c,tmp_3783,tmp_3784)}){let tmp_3785=tmp_3782;e.set("a",get(tmp_3785.clone(),V::I(0)));e.set("b",get(tmp_3785.clone(),V::I(1)));{let tmp_3786={let tmp_3788=V::Compiler;attribute(c,tmp_3788,"emit")};let mut tmp_3787=Vec::new();tmp_3787.push((String::new(),vs("x")));tmp_3787.push((String::new(),e.get("b")));invoke(c,tmp_3786,tmp_3787)};
 {let tmp_3789={let tmp_3791=V::Compiler;attribute(c,tmp_3791,"emit")};let mut tmp_3790=Vec::new();tmp_3790.push((String::new(),vs("cx")));tmp_3790.push((String::new(),e.get("a")));tmp_3790.push((String::new(),e.get("b")));invoke(c,tmp_3789,tmp_3790)};}
 for tmp_3792 in iter(e.get("pads")){e.set("q",tmp_3792);{let tmp_3793={let tmp_3795=V::Compiler;attribute(c,tmp_3795,"release")};let mut tmp_3794=Vec::new();tmp_3794.push((String::new(),e.get("q")));invoke(c,tmp_3793,tmp_3794)};}

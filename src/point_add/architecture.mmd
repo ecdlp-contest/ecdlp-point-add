@@ -4,19 +4,16 @@ flowchart TD
   Optimization["Optimization"]
   Target --> Algorithm
   Target --> Optimization
-  Algorithm --> Affine["Reversible coordinate translation, division, squaring and multiplication"]
-  Affine --> GCD["Fixed 741-round signed binary GCD with coefficient replay"]
-  GCD --> Clean["Explicit inverse arithmetic, cleanup and measurement phase recovery"]
-  Optimization --> Width["Pointwise signed-capacity profile with nine-row failing-trajectory repair"]
-  Optimization --> Replay["Division checkpoints 17 and 728; multiplication checkpoints 354 and 728"]
-  Optimization --> Carry["Rolling carries, deferred phase recovery, 68-bit correction window"]
-  Width --> Prefix["34-bit signed-prefix condition; equal-prefix and convergence cases remain assumptions"]
-  Replay --> Metrics["1298 qubits; 1031994 rounded Toffolis; depth 1031994; score 1339528212"]
-  Carry --> Metrics
-  Clean --> Builder["Generated Rust arithmetic routines; no hand edits"]
-  Builder --> Binding["Two generations and two emissions agree; all 21064276 operations match source"]
-  Binding --> Stock["Stock 102400 shots on 20 workers: 0 classical, 0 phase, 0 ancilla errors"]
-  Stock --> Deep["Fresh 1024000-shot audit on 20 workers: 0 classical, 0 phase, 0 ancilla errors"]
-  Prefix --> Scope["Approximate artifact-specific evidence; server-private validation pending"]
-  Metrics --> Scope
-  Deep --> Scope
+  Algorithm --> Affine["Inherited reversible affine translation, division, squaring and multiplication"]
+  Affine --> GCD["Unchanged 741-round signed GCD and capacity profiles"]
+  GCD --> Cleanup["Inherited inverse arithmetic, cleanup and phase recovery"]
+  Optimization --> LowBit["Square correction reuses input bit x0 as known lowest carry"]
+  LowBit --> Contract["Forward p0=0; inverse p0=x0; clean-workspace lifetime contract"]
+  Contract --> Phase["Remove carry CCX, private HMR and matching phase correction"]
+  Phase --> Count["Measured static change: 18 fewer unconditional CCX and 18 fewer HMR; Q1298"]
+  Count --> Local["Independent small-width gate tests: 78984 simulations passed"]
+  Cleanup --> Stock["Stock102400 shots: zero coordinate, phase, ancilla errors"]
+  Local --> Stock
+  Stock --> Metrics["Q1298; rounded Toffoli1031981; depth field equals rounded T; parallel depth not measured; score1339511338"]
+  Metrics --> Fresh["Precommitted fresh102400 shots: zero errors; rounded Toffoli1031975; score1339503550"]
+  Fresh --> Scope["Inherited approximate arithmetic; local conditional channel equivalence; server validation pending"]
