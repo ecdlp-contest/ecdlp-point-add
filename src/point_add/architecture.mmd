@@ -8,15 +8,16 @@ flowchart TD
 
   %% Algorithm: the reversible point-add construction
   Phases["Affine P plus Q in eight in-place phases: x -= Qx, y -= Qy, y /= x gives lambda, x += 3Qx, x -= lambda squared, y *= x, y -= Qy, x = Qx - x"]
-  Coord["Coordinate blocks: classical-offset subtract, add 3Qx, final subtract and reverse subtract with windowed modular folds"]
-  Square["Low-space modular square: x -= lambda squared"]
-  DivLeg["Division leg: y /= x by the forward GCD Skywalk walk, 415 steps"]
-  MulLeg["Multiplication leg: y *= x by the reversed walk, 415 steps"]
-  Walk["GCD Skywalk walk: Stein binary GCD on signed rails holding u+v and u; parity routes the even rail to halving, one controlled rail exchange and one signed add per step, no magnitude compare"]
-  Tape["History tape: orientation and sign-flip bits take 3 joint values; 5 steps packed in 8 wires inside the freed rail top bits"]
-  Cells["Payload cells: Sigma and Delta frame, Sigma to Sigma -/+ Delta over 2 mod p then swap on sign flip; chunked adds with windowed carries, flags and folds"]
-  Cleanup["Cleanup: payloads coincide at the division endpoint and one is cleared with CNOTs; reversing the walk consumes the tape and restores the denominator; every phase returns scratch to zero"]
-  Post["Exact post-passes: redundant CCX removal on product, affine, quadratic and truth supports, measurement absorption; inherited 96-gate X identity tail"]
+  Coord["Coordinate blocks from Gold1298: classical-offset subtract, add 3Qx, final subtract and reverse subtract"]
+  Square["Modular square from Gold1298: Karatsuba down to 64-bit schoolbook triangles, folded with the signed digits of f = 2^32 + 977"]
+  DivLeg["Division leg: seed rails from x, P1 = y/2, 150 fused ticks (rails tick then payload tick), endpoint, rails walk back"]
+  MulLeg["Multiplication leg: rails-only forward walk, endpoint payload (s0 y, s1 y), 150 fused reverse ticks, clear P1 = P0/2"]
+  Walk["Leapfrog walk: two odd signed rails; per tick two forced add-halves, a deep or flat choice add-halve, then 0 to 3 extra halvings"]
+  Choice["Choice rule: deep if tz of the deep sum is 3 or 4, flat if 5 or more, else a sign test or a 22-bit magnitude window compare"]
+  Tape["History tape: one 5-bit letter per tick; the tick-0 letter is recomputed from the low 7 bits of R1 and erased early"]
+  Cells["Payload cells: P_i = mu R_i mod p; three signed modular add-halve cells per tick, chosen by free room"]
+  Rot["Extra shift: rotr_e(W) = (W + h(f-1)) 2^-e mod p; 80-bit fold, then three controlled reflections"]
+  Cleanup["Cleanup: at the endpoint the rails are plus or minus 1, so one payload is cleared against the other; reversing the walk consumes the tape and restores x; every phase returns scratch to zero"]
 
   Algorithm --> Phases
   Phases --> Coord
@@ -25,51 +26,56 @@ flowchart TD
   Phases --> MulLeg
   DivLeg --> Walk
   MulLeg --> Walk
+  Walk --> Choice
   Walk --> Tape
   Walk --> Cells
+  Cells --> Rot
   Tape --> Cleanup
-  Cells --> Cleanup
+  Rot --> Cleanup
   Coord --> Cleanup
   Square --> Cleanup
-  Cleanup --> Post
 
   %% Optimization: score and reliability decisions
-  Base["Base: GCD Skywalk by mochimodev, ecdsa.fail submission 4f0d213, with the 1164-qubit envelope buyback, ecdsa.fail submission 17250b2e; walk, tape, cells and formula unchanged"]
-  Tail["Walk tail: both legs 395 to 415 steps with new division, multiplication and proxy width rows; covers unfinished walks and row exceedances"]
-  Cap["Qubit cap 1214: the 415-step rows need at least 1194; the extra room gives the late replay cells full chunk-boundary windows"]
-  Windows["Widened windows: chunk boundary +20, +24 from round 675; overflow flags +15, +21 from round 675; fold windows 78; fold guard 33; rail fit 31; square tail 30; erase compares 31; terminal fold 55; prebias +12"]
-  Exact["Exact forms: multiply-leg rail split exact on every step; joint low-fold shortcut disabled, its low window raised by 20 bits so the regular fold is used; optional fused constructs switched off"]
-  Contract["Skywalk contract: error is only bought back, never traded for score; lambda far below 19.5 per 9,024 shots"]
+  Parent["Parent Gold1298, 1,298 x 1,031,988: shell, coordinates, square and payload cells kept; one-bit GCD rounds replaced by Leapfrog ticks"]
+  Source["Generated from a Python construction source: two generations byte-identical, native records equal to the source execution"]
+  Rows["Replica-sized widths: per-tick rows = max over 400M walks + 3; per-rail persistent widths = max over 200M walks + 4; checked on 400M independent walks"]
+  Room["Room levers: per-rail widths and the tick-0 letter erase free payload room at a 1,297-qubit cap"]
+  Chunks["Rail adds: the top chunk takes every free wire, so only small low chunks pay an exact boundary compare (-19.1k Toffolis)"]
+  Small["Smaller levers: 22-bit choice window (-4.6k), rotation of the low n-1 rail wires (-0.9k)"]
+  Horizon["Horizon 150 ticks: unparked walks 6.75e-8 per walk; width overflows estimated about 1e-8 per walk"]
 
-  Optimization --> Base
-  Optimization --> Tail
-  Optimization --> Cap
-  Optimization --> Windows
-  Optimization --> Exact
-  Optimization --> Contract
-  Base --> Walk
-  Tail --> DivLeg
-  Tail --> MulLeg
-  Cap --> Cells
-  Windows --> Cells
-  Windows --> Coord
-  Windows --> Square
-  Exact --> MulLeg
-  Exact --> Cells
+  Optimization --> Parent
+  Optimization --> Source
+  Optimization --> Rows
+  Optimization --> Room
+  Optimization --> Chunks
+  Optimization --> Small
+  Optimization --> Horizon
+  Parent --> Cells
+  Parent --> Square
+  Rows --> Walk
+  Room --> Cells
+  Chunks --> Walk
+  Small --> Choice
+  Small --> Walk
+  Horizon --> Walk
 
   %% Metrics, depth and validation evidence
-  Metrics["Metrics: 1,214 qubits; 1,063,436.582 average executed CCX+CCZ, rounded 1,063,437; 11,487,001 emitted operations"]
-  Depth["Toffoli depth 1,063,437: the stream is serial, so depth equals the executed count"]
-  Score["Score 1,214 x sqrt of 1,063,437 x 1,063,437 = 1,291,012,518; record 1,339,503,550"]
-  Validation["102,400-shot trusted evaluation: default draw 102,400 of 102,400 OK, 0 classical, 0 phase, 0 ancilla failures; 26 independent seeded draws all 0/0/0; 2,764,800 shots clean"]
-  Model["Modelled probability of any failure in one 102,400-shot draw: about 0.8 percent central, 1.3 percent upper; model figure, not a measurement"]
-  Artifact["ops.bin sha256 cd9bad00f51749d15bdb9fb966d364c3eda28f327ae9d667f546b75f02205549; identical from an empty environment and from a relocated tree"]
+  Metrics["Metrics: 1,297 qubits; 988,743.281 average executed CCX+CCZ, rounded 988,743; 16,979,143 emitted operations"]
+  Depth["Toffoli depth 988,743: the stream is serial, so depth equals the executed count"]
+  Score["Score 1,297 x sqrt of 988,743 x 988,743 = 1,282,399,671; record 1,291,013,732"]
+  Validation["102,400-shot trusted evaluation: 102,400 of 102,400 OK, 0 classical, 0 phase, 0 ancilla failures"]
+  Audit["Fresh-seed audit: 1,024,000 shots, 0 classical, 0 phase, 0 ancilla, 0 offset"]
+  Model["Modelled probability of any failure in one 102,400-shot draw: about 1.6 percent; model figure, not a measurement"]
+  Artifact["ops.bin sha256 4fede5f5a25ec04a2979463cc261f2006a5170c7e84ee99bba43e78f8d4ff619; two native emissions identical"]
 
-  Post --> Metrics
-  Cap --> Metrics
+  Cleanup --> Metrics
+  Room --> Metrics
   Metrics --> Depth
   Depth --> Score
   Score --> Validation
-  Contract --> Model
-  Validation --> Model
+  Validation --> Audit
+  Horizon --> Model
+  Audit --> Model
   Validation --> Artifact
+  Source --> Artifact
