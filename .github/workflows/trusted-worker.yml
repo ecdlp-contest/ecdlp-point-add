@@ -13,6 +13,10 @@ on:
         description: "Maximum pending submissions to process"
         required: false
         default: "1"
+      recovery_submission_id:
+        description: "Process only this already requeued submission through all trusted checks"
+        required: false
+        default: ""
 
 concurrency:
   group: trusted-worker-${{ github.ref }}
@@ -35,14 +39,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, pinned 2026-08-21
         with:
           toolchain: 1.93.0
+      - name: Test worker and CLI contracts
+        run: node --test tools/trusted-worker.test.mjs tools/ecdlp.test.cjs
       - name: Reproduce pending point-add submission
         env:
           ECDLP_API_URL: ${{ secrets.ECDLP_API_URL }}
           ECDLP_TRUSTED_WORKER_TOKEN: ${{ secrets.ECDLP_TRUSTED_WORKER_TOKEN }}
           ECDLP_WORKER_LIMIT: ${{ github.event.inputs.limit }}
+          ECDLP_WORKER_RECOVERY_SUBMISSION_ID: ${{ github.event.inputs.recovery_submission_id }}
           ECDLP_WORKER_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
           # The worker passes this token only to the final authenticated git push;
           # child build and evaluation environments are allowlisted in the worker.
           GITHUB_TOKEN: ${{ github.token }}
           ECDLP_REQUIRE_SANDBOX: "1"
         run: node tools/trusted-worker.mjs
+      - name: Preserve trusted success reports for callback recovery
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: trusted-worker-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .trusted-worker-reports/*.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 30

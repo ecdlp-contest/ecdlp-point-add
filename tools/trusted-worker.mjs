@@ -35,21 +35,32 @@ function run(command, args, options = {}) {
   if (result.status !== 0) throw new Error(command + " failed with exit code " + result.status + (result.stderr ? "\n" + result.stderr : ""));
   return result.stdout || "";
 }
-async function requestJson(url, options = {}) {
-  const response = await fetch(url, { ...options, headers: { "content-type": "application/json", "x-ecdlp-worker-token": WORKER_TOKEN, ...(options.headers || {}) } });
-  const text = await response.text();
-  let body = {};
-  if (text) {
+class ApiRequestError extends Error {}
+
+async function requestJson(url, options = {}, dependencies = {}) {
+  const fetchRequest = dependencies.fetch || fetch;
+  const sleep = dependencies.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const attempts = dependencies.attempts ?? 5;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let status;
     try {
-      body = JSON.parse(text);
-    } catch {
-      const firstLine = text.split(/\r?\n/).find(Boolean) || text;
-      const contentType = response.headers.get("content-type") || "unknown";
-      throw new Error("expected JSON from " + url + " but got HTTP " + response.status + " " + contentType + ": " + firstLine.slice(0, 160));
+      const response = await fetchRequest(url, { ...options, signal: AbortSignal.timeout(dependencies.timeoutMs ?? 30000), headers: { "content-type": "application/json", "x-ecdlp-worker-token": WORKER_TOKEN, ...(options.headers || {}) } });
+      status = response.status;
+      const text = await response.text();
+      let body;
+      try { body = text ? JSON.parse(text) : {}; }
+      catch { throw new Error(`expected JSON, got HTTP ${status} ${response.headers.get("content-type") || "unknown"}`); }
+      if (!response.ok) throw new Error(body.error || `HTTP ${status}`);
+      return body;
+    } catch (cause) {
+      const retryable = status === undefined || status === 408 || status === 429 || status >= 500 || cause instanceof TypeError || cause.name === "TimeoutError" || cause.name === "AbortError";
+      const detail = cause.cause?.code || cause.code || cause.name;
+      const error = new ApiRequestError(`${options.method || "GET"} ${url}: ${cause.message}${detail ? ` (${detail})` : ""}`, { cause });
+      if (!retryable || attempt === attempts) throw error;
+      console.warn(`${error.message}; retry ${attempt}/${attempts - 1}`);
+      await sleep(Math.min(1000 * 2 ** (attempt - 1), 10000));
     }
   }
-  if (!response.ok) throw new Error(body.error || "HTTP " + response.status);
-  return body;
 }
 function sha256(buffer) { return crypto.createHash("sha256").update(buffer).digest("hex"); }
 function assertEqual(label, actual, expected) { if (expected !== null && expected !== undefined && expected !== "" && actual !== expected) throw new Error(label + " mismatch: reproduced=" + actual + " submitted=" + expected); }
@@ -96,9 +107,14 @@ function removeSystemMetadataUnder(dirPath) {
 }
 async function downloadArchive(submission, targetPath) {
   if (!submission.archive_url) throw new Error("pending submission has no archive_url");
-  const response = await fetch(new URL(submission.archive_url, API_URL).toString(), { headers: { "x-ecdlp-worker-token": WORKER_TOKEN } });
-  if (!response.ok) throw new Error("archive download failed with HTTP " + response.status + ": " + await response.text().catch(() => ""));
-  const buffer = Buffer.from(await response.arrayBuffer());
+  let buffer;
+  try {
+    const response = await fetch(new URL(submission.archive_url, API_URL).toString(), { signal: AbortSignal.timeout(30000), headers: { "x-ecdlp-worker-token": WORKER_TOKEN } });
+    if (!response.ok) throw new Error("archive download failed with HTTP " + response.status);
+    buffer = Buffer.from(await response.arrayBuffer());
+  } catch (cause) {
+    throw new ApiRequestError("archive delivery failed: " + cause.message, { cause });
+  }
   assertEqual("archive_size_bytes", buffer.length, submission.archive_size_bytes);
   assertEqual("archive_sha256", sha256(buffer), submission.archive_sha256);
   fs.writeFileSync(targetPath, buffer);
@@ -187,7 +203,7 @@ function githubPushEnv() {
   };
 }
 function commitAndPush(submission, manifest, metadata) { for (const editablePath of manifest.editablePaths || []) run("git", ["add", editablePath]); if (!hasStagedChanges()) { console.log("No editable-path changes to commit; using current HEAD."); return currentCommit(); } run("git", ["config", "user.name", "ecdlp-trusted-worker"]); run("git", ["config", "user.email", "ecdlp-trusted-worker@users.noreply.github.com"]); run("git", ["commit", "-m", acceptCommitMessage(submission, metadata)]); run("git", ["push", "origin", "HEAD:main"], { env: githubPushEnv() }); return currentCommit(); }
-async function processSubmission(submission, manifest) {
+async function reproduceSubmission(submission, manifest) {
   console.log("\nProcessing " + submission.submission_id + " (" + submission.track_id + ")");
   const archivePath = path.join(ROOT_DIR, ".trusted-submission.tar.gz");
   await downloadArchive(submission, archivePath);
@@ -218,10 +234,32 @@ async function processSubmission(submission, manifest) {
   run(process.execPath, [path.join(ROOT_DIR, "ecdlp.js"), "validate", path.join(ROOT_DIR, "dist", "submission-metadata.json")]);
   const metadata = readJson(path.join(ROOT_DIR, "dist", "submission-metadata.json"));
   compareMetadata(metadata, submission);
+  return { metadata, validationSeed };
+}
+
+async function publishSubmission(submission, manifest, { metadata, validationSeed }) {
   if (DRY_RUN) { console.log("dry-run: not committing source or posting trusted-pass"); return; }
   const acceptedCommit = commitAndPush(submission, manifest, metadata);
-  const response = await requestJson(API_URL + "/api/submissions/" + encodeURIComponent(submission.submission_id) + "/trusted-pass", { method: "POST", body: JSON.stringify({ status: "passed", report: { worker: process.env.GITHUB_WORKFLOW || "contest-repo-trusted-worker", run_id: process.env.GITHUB_RUN_ID || null, accepted_repository: process.env.GITHUB_REPOSITORY || null, accepted_commit_sha: acceptedCommit, score: metadata.localScore, metrics: { score: metadata.localScore, logical_qubits: Math.round(Number(metadata.metrics?.qubits)), toffoli_count: Math.round(Number(metadata.metrics?.toffoli)) }, validation_seed: validationSeed, validation_seed_sha256: sha256(Buffer.from(validationSeed, "hex")), artifact_binary_sha256: metadata.artifactSha256, archive_sha256: submission.archive_sha256 || null } }) });
+  const payload = { status: "passed", report: { worker: process.env.GITHUB_WORKFLOW || "contest-repo-trusted-worker", run_id: process.env.GITHUB_RUN_ID || null, accepted_repository: process.env.GITHUB_REPOSITORY || null, accepted_commit_sha: acceptedCommit, score: metadata.localScore, metrics: { score: metadata.localScore, logical_qubits: Math.round(Number(metadata.metrics?.qubits)), toffoli_count: Math.round(Number(metadata.metrics?.toffoli)) }, validation_seed: validationSeed, validation_seed_sha256: sha256(Buffer.from(validationSeed, "hex")), artifact_binary_sha256: metadata.artifactSha256, archive_sha256: submission.archive_sha256 || null } };
+  const reportDir = path.join(ROOT_DIR, ".trusted-worker-reports");
+  fs.mkdirSync(reportDir, { recursive: true });
+  fs.writeFileSync(path.join(reportDir, encodeURIComponent(submission.submission_id) + ".json"), JSON.stringify({ submission_id: submission.submission_id, payload }, null, 2), { mode: 0o600 });
+  const response = await requestJson(API_URL + "/api/submissions/" + encodeURIComponent(submission.submission_id) + "/trusted-pass", { method: "POST", body: JSON.stringify(payload) });
+  if (response.status !== "ranked") throw new ApiRequestError("trusted-pass did not rank the submission: " + response.status);
   console.log("accepted " + response.submission_id + ": " + response.status + "/" + response.rank_status);
+}
+
+async function processSubmission(submission, manifest, dependencies = {}) {
+  let reproduced;
+  try {
+    reproduced = await (dependencies.reproduce || reproduceSubmission)(submission, manifest);
+  } catch (error) {
+    if (!(error instanceof ApiRequestError)) await (dependencies.reportFailure || reportTrustedFailure)(submission, error);
+    throw error;
+  }
+  // Publishing and reporting are outside the evaluation-failure handler. A
+  // rejected/lost callback or failed push cannot invalidate a verified circuit.
+  return (dependencies.publish || publishSubmission)(submission, manifest, reproduced);
 }
 async function reportTrustedFailure(submission, error) {
   if (DRY_RUN) return;
@@ -243,8 +281,35 @@ async function reportTrustedFailure(submission, error) {
     console.error("failed to report trusted-worker failure for " + submission.submission_id + ": " + reportError.message);
   }
 }
-async function main() { if (process.argv.includes("--help") || process.argv.includes("-h")) return; if (!API_URL) throw new Error("ECDLP_API_URL is required"); if (!WORKER_TOKEN) throw new Error("ECDLP_TRUSTED_WORKER_TOKEN is required"); const manifest = readJson(path.join(ROOT_DIR, "benchmark.json")); const pending = await requestJson(API_URL + "/api/trusted-worker/submissions/pending?track_id=" + encodeURIComponent(TRACK_ID) + "&limit=" + encodeURIComponent(String(LIMIT))); if (!pending.rows.length) { console.log("No pending trusted-worker submissions for " + TRACK_ID + "."); return; } const failures = []; for (const submission of pending.rows) { try { await processSubmission(submission, manifest); } catch (error) { await reportTrustedFailure(submission, error); failures.push({ submission_id: submission.submission_id, error: error.message }); console.error("failed " + submission.submission_id + ": " + error.message); } } if (failures.length > 0) { console.error(JSON.stringify({ failures }, null, 2)); process.exit(1); } }
+async function main() {
+  if (process.argv.includes("--help") || process.argv.includes("-h")) return;
+  if (!API_URL) throw new Error("ECDLP_API_URL is required");
+  if (!WORKER_TOKEN) throw new Error("ECDLP_TRUSTED_WORKER_TOKEN is required");
+  const recoveryId = process.env.ECDLP_WORKER_RECOVERY_SUBMISSION_ID;
+  if (recoveryId) {
+    if (DRY_RUN) throw new Error("recovery cannot be combined with dry-run");
+    const submission = await requestJson(API_URL + "/api/submissions/" + encodeURIComponent(recoveryId));
+    if (submission.track_id !== TRACK_ID) throw new Error("recovery submission belongs to a different track");
+    if (submission.status !== "submitted" && submission.status !== "ranked") throw new Error("recovery submission must first be requeued by an operator");
+  }
+  const manifest = readJson(path.join(ROOT_DIR, "benchmark.json"));
+  const pending = await requestJson(API_URL + "/api/trusted-worker/submissions/pending?track_id=" + encodeURIComponent(TRACK_ID) + "&limit=" + encodeURIComponent(String(recoveryId ? 50 : LIMIT)));
+  const rows = recoveryId ? pending.rows.filter((row) => row.submission_id === recoveryId) : pending.rows;
+  if (!rows.length) { console.log("No pending trusted-worker submissions for " + TRACK_ID + "."); return; }
+  const failures = [];
+  for (const submission of rows) {
+    try { await processSubmission(submission, manifest); }
+    catch (error) {
+      failures.push({ submission_id: submission.submission_id, error: error.message });
+      console.error("worker could not complete " + submission.submission_id + ": " + error.message);
+    }
+  }
+  if (failures.length) { console.error(JSON.stringify({ failures }, null, 2)); process.exit(1); }
+}
 export {
+  ApiRequestError,
+  processSubmission,
+  requestJson,
   acceptCommitMessage,
   assertArtifactCommitment,
   coAuthorTrailer,

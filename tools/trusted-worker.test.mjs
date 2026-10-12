@@ -10,6 +10,9 @@ import {
   assertArtifactCommitment,
   sanitizedChildEnv,
   validateArchiveEntries,
+  ApiRequestError,
+  processSubmission,
+  requestJson,
 } from "./trusted-worker.mjs";
 
 const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -103,14 +106,106 @@ test("archive validation accepts only regular editable-path entries", (t) => {
 test("worker orders artifact verification before private seed generation", () => {
   const worker = fs.readFileSync(path.join(ROOT_DIR, "tools", "trusted-worker.mjs"), "utf8");
   const processBody = worker.slice(
-    worker.indexOf("async function processSubmission"),
-    worker.indexOf("async function reportTrustedFailure"),
+    worker.indexOf("async function reproduceSubmission"),
+    worker.indexOf("async function publishSubmission"),
   );
   assert.ok(processBody.indexOf("assertArtifactCommitment(submission)") >= 0);
   assert.ok(
     processBody.indexOf("assertArtifactCommitment(submission)")
       < processBody.indexOf("crypto.randomBytes(32)"),
   );
+});
+
+test("success callback retries transport and HTTP failures with an identical report", async () => {
+  const requests = [];
+  const delays = [];
+  const options = { method: "POST", body: JSON.stringify({ status: "passed", report: { score: 42 } }) };
+  const result = await requestJson("https://contest.test/trusted-pass", options, {
+    sleep: async (ms) => delays.push(ms),
+    fetch: async (_url, init) => {
+      requests.push(init);
+      if (requests.length === 1) throw new TypeError("fetch failed", { cause: { code: "ECONNRESET" } });
+      if (requests.length === 2) return new Response("unavailable", { status: 503 });
+      return new Response(JSON.stringify({ status: "ranked" }));
+    },
+  });
+  assert.equal(result.status, "ranked");
+  assert.deepEqual(delays, [1000, 2000]);
+  assert.ok(requests.every((request) => request.body === options.body));
+});
+
+test("permanent HTTP rejection is not retried", async () => {
+  let calls = 0;
+  await assert.rejects(requestJson("https://contest.test/trusted-pass", {}, {
+    fetch: async () => { calls++; return new Response(JSON.stringify({ error: "token required" }), { status: 401 }); },
+    sleep: async () => assert.fail("should not retry"),
+  }), /token required/);
+  assert.equal(calls, 1);
+});
+
+test("retry exhaustion retains the underlying transport error", async () => {
+  let calls = 0;
+  await assert.rejects(requestJson("https://contest.test/trusted-pass", {}, {
+    attempts: 3, sleep: async () => {},
+    fetch: async () => { calls++; throw new TypeError("fetch failed", { cause: { code: "ENOTFOUND" } }); },
+  }), (error) => error instanceof ApiRequestError && /ENOTFOUND/.test(error.message));
+  assert.equal(calls, 3);
+});
+
+test("rate limiting and interrupted response bodies are retried", async () => {
+  let calls = 0;
+  await requestJson("https://contest.test/trusted-pass", {}, {
+    sleep: async () => {},
+    fetch: async () => {
+      calls++;
+      if (calls === 1) return new Response("{}", { status: 429 });
+      if (calls === 2) return { status: 200, ok: true, text: async () => { throw new TypeError("terminated"); } };
+      return new Response("{}");
+    },
+  });
+  assert.equal(calls, 3);
+});
+
+test("callback and push failures never send a failed evaluation report", async () => {
+  for (const failure of [new ApiRequestError("fetch failed"), new Error("git push failed"), new ApiRequestError("HTTP 400")]) {
+    await assert.rejects(processSubmission({}, {}, {
+      reproduce: async () => ({ metadata: { localScore: 42 } }),
+      publish: async () => { throw failure; },
+      reportFailure: async () => assert.fail("valid circuit must not be failed"),
+    }), (error) => error === failure);
+  }
+});
+
+test("actual reproduction failure still sends a failed evaluation report", async () => {
+  const failure = new Error("artifact commitment mismatch");
+  let reported;
+  await assert.rejects(processSubmission({}, {}, {
+    reproduce: async () => { throw failure; },
+    publish: async () => assert.fail("must not publish an invalid circuit"),
+    reportFailure: async (_submission, error) => { reported = error; },
+  }), /commitment mismatch/);
+  assert.equal(reported, failure);
+});
+
+test("archive delivery failure does not send a failed evaluation report", async () => {
+  await assert.rejects(processSubmission({}, {}, {
+    reproduce: async () => { throw new ApiRequestError("archive delivery failed"); },
+    publish: async () => assert.fail("must not publish without reproduction"),
+    reportFailure: async () => assert.fail("delivery failure must stay pending"),
+  }), /archive delivery failed/);
+});
+
+test("request timeouts are retried", async () => {
+  let calls = 0;
+  await requestJson("https://contest.test/trusted-pass", {}, {
+    sleep: async () => {},
+    fetch: async (_url, init) => {
+      assert.ok(init.signal instanceof AbortSignal);
+      if (++calls === 1) throw new DOMException("request timed out", "TimeoutError");
+      return new Response("{}");
+    },
+  });
+  assert.equal(calls, 2);
 });
 
 test("runtime sandbox clears the environment and mounts an isolated proc", () => {

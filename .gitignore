@@ -32,3 +32,4 @@ __pycache__/
 .AppleDouble/
 __MACOSX/
 *.tmp
+.trusted-worker-reports/
