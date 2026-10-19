@@ -8,16 +8,15 @@ flowchart TD
 
   %% Algorithm: the reversible point-add construction
   Phases["Affine P plus Q in eight in-place phases: x -= Qx, y -= Qy, y /= x gives lambda, x += 3Qx, x -= lambda squared, y *= x, y -= Qy, x = Qx - x"]
-  Coord["Coordinate blocks from Gold1298: classical-offset subtract, add 3Qx, final subtract and reverse subtract"]
-  Square["Modular square from Gold1298: Karatsuba down to 64-bit schoolbook triangles, folded with the signed digits of f = 2^32 + 977"]
-  DivLeg["Division leg: seed rails from x, P1 = y/2, 150 fused ticks (rails tick then payload tick), endpoint, rails walk back"]
-  MulLeg["Multiplication leg: rails-only forward walk, endpoint payload (s0 y, s1 y), 150 fused reverse ticks, clear P1 = P0/2"]
-  Walk["Leapfrog walk: two odd signed rails; per tick two forced add-halves, a deep or flat choice add-halve, then 0 to 3 extra halvings"]
-  Choice["Choice rule: deep if tz of the deep sum is 3 or 4, flat if 5 or more, else a sign test or a 22-bit magnitude window compare"]
-  Tape["History tape: one 5-bit letter per tick; the tick-0 letter is recomputed from the low 7 bits of R1 and erased early"]
-  Cells["Payload cells: P_i = mu R_i mod p; three signed modular add-halve cells per tick, chosen by free room"]
-  Rot["Extra shift: rotr_e(W) = (W + h(f-1)) 2^-e mod p; 80-bit fold, then three controlled reflections"]
-  Cleanup["Cleanup: at the endpoint the rails are plus or minus 1, so one payload is cleared against the other; reversing the walk consumes the tape and restores x; every phase returns scratch to zero"]
+  Coord["Coordinate blocks: classical-offset subtract, add 3Qx, final subtract and reverse subtract"]
+  Square["Modular square: Karatsuba down to 64-bit schoolbook triangles; diagonal spread as ripple carry-in; measured top bits"]
+  DivLeg["Division leg: seed rails from x, P1 = y/2, fused ticks to tick 136, late batch (rails alone, then payload with parked rails), endpoint, rails walk back"]
+  MulLeg["Multiplication leg: rails-only forward walk, endpoint payload, mirrored late batch and fused reverse ticks, clear P1 = P0/2"]
+  Walk["Leapfrog walk: two odd signed rails; per tick two forced add-halves, a deep or flat choice add-halve, then 0 to 3 extra halvings; 151 ticks, the last choice-only"]
+  Tape["History tape: one 5-bit letter per tick; letters allocated only when each choice needs them"]
+  Fused["Fused one-fold payload cell at room 60 or more: 17h = L + 17E - 16Nm mod 2^k; one 76-bit fold gives W* = W0 + jM - eps 2^k (F-1); E erased from a declared window; rotation by four"]
+  Narrow["Narrow-room cells: one-place rotations instead of controlled shifts; a doubling form gives the multiply a room-24 cell; decreasing-bank folds"]
+  Cleanup["Cleanup: rails parked at plus or minus 1 clear one payload against the other; reversing the walk consumes the tape and restores x; choice ancillas uncomputed by X measurement with phase repair; every phase returns scratch to zero"]
 
   Algorithm --> Phases
   Phases --> Coord
@@ -26,48 +25,43 @@ flowchart TD
   Phases --> MulLeg
   DivLeg --> Walk
   MulLeg --> Walk
-  Walk --> Choice
   Walk --> Tape
-  Walk --> Cells
-  Cells --> Rot
+  Walk --> Fused
+  Walk --> Narrow
   Tape --> Cleanup
-  Rot --> Cleanup
+  Fused --> Cleanup
+  Narrow --> Cleanup
   Coord --> Cleanup
   Square --> Cleanup
 
   %% Optimization: score and reliability decisions
-  Parent["Parent Gold1298, 1,298 x 1,031,988: shell, coordinates, square and payload cells kept; one-bit GCD rounds replaced by Leapfrog ticks"]
+  Parent["Parent: our accepted entry 1,297 x 988,743 (descent of Gold1298); every change lowers qubits or Toffolis and keeps accuracy"]
   Source["Generated from a Python construction source: two generations byte-identical, native records equal to the source execution"]
-  Rows["Replica-sized widths: per-tick rows = max over 400M walks + 3; per-rail persistent widths = max over 200M walks + 4; checked on 400M independent walks"]
-  Room["Room levers: per-rail widths and the tick-0 letter erase free payload room at a 1,297-qubit cap"]
-  Chunks["Rail adds: the top chunk takes every free wire, so only small low chunks pay an exact boundary compare (-19.1k Toffolis)"]
-  Small["Smaller levers: 22-bit choice window (-4.6k), rotation of the low n-1 rail wires (-0.9k)"]
-  Horizon["Horizon 150 ticks: unparked walks 6.75e-8 per walk; width overflows estimated about 1e-8 per walk"]
+  Rows["Replica-sized widths: per-tick rows = max over 400M walks + 4; per-rail widths = max + 5; checked on an independent sample of 400M or more walks"]
+  Windows["Declared windows priced from exact miss predicates: 40-bit compares, 38-bit carry prefixes, 76-bit fold, E windows"]
+  Exact["Exact cuts: forward chunk-boundary phase fixes paid at the walk-back subtract (-7.9k); bit-0 release of odd rails (-2 qubits); measured choice erase (-9.6k)"]
+  Room["Room levers: per-rail widths, just-in-time letters and narrow-room cells bring the cap to 1,286"]
 
   Optimization --> Parent
   Optimization --> Source
   Optimization --> Rows
+  Optimization --> Windows
+  Optimization --> Exact
   Optimization --> Room
-  Optimization --> Chunks
-  Optimization --> Small
-  Optimization --> Horizon
-  Parent --> Cells
-  Parent --> Square
+  Parent --> Walk
   Rows --> Walk
-  Room --> Cells
-  Chunks --> Walk
-  Small --> Choice
-  Small --> Walk
-  Horizon --> Walk
+  Windows --> Fused
+  Exact --> Walk
+  Room --> Narrow
 
   %% Metrics, depth and validation evidence
-  Metrics["Metrics: 1,297 qubits; 988,743.281 average executed CCX+CCZ, rounded 988,743; 16,979,143 emitted operations"]
-  Depth["Toffoli depth 988,743: the stream is serial, so depth equals the executed count"]
-  Score["Score 1,297 x sqrt of 988,743 x 988,743 = 1,282,399,671; record 1,291,013,732"]
+  Metrics["Metrics: 1,286 qubits; 960,091.439 average executed CCX+CCZ, rounded 960,091; 17,572,178 emitted operations"]
+  Depth["Toffoli depth 960,091: the stream is serial, so depth equals the executed count"]
+  Score["Score 1,286 x sqrt of 960,091 x 960,091 = 1,234,677,026; previous record 1,282,399,671"]
   Validation["102,400-shot trusted evaluation: 102,400 of 102,400 OK, 0 classical, 0 phase, 0 ancilla failures"]
   Audit["Fresh-seed audit: 1,024,000 shots, 0 classical, 0 phase, 0 ancilla, 0 offset"]
-  Model["Modelled probability of any failure in one 102,400-shot draw: about 1.6 percent; model figure, not a measurement"]
-  Artifact["ops.bin sha256 4fede5f5a25ec04a2979463cc261f2006a5170c7e84ee99bba43e78f8d4ff619; two native emissions identical"]
+  Model["Modelled residual about 8.7e-8 per shot (walk 7.0e-8, windows 1.7e-8): under 1 percent chance of any failure in one 102,400-shot draw; model figure, not a measurement"]
+  Artifact["ops.bin sha256 f68ae1f9a62fa8ead50db8cbc8718700c95db65dfe3f27ab52a849bc0f2f5980; two native emissions identical"]
 
   Cleanup --> Metrics
   Room --> Metrics
@@ -75,7 +69,8 @@ flowchart TD
   Depth --> Score
   Score --> Validation
   Validation --> Audit
-  Horizon --> Model
+  Rows --> Model
+  Windows --> Model
   Audit --> Model
   Validation --> Artifact
   Source --> Artifact
