@@ -7,70 +7,72 @@ flowchart TD
   Target --> Optimization
 
   %% Algorithm: the reversible point-add construction
-  Phases["Affine P plus Q in eight in-place phases: x -= Qx, y -= Qy, y /= x gives lambda, x += 3Qx, x -= lambda squared, y *= x, y -= Qy, x = Qx - x"]
-  Coord["Coordinate blocks: classical-offset subtract, add 3Qx, final subtract and reverse subtract"]
-  Square["Modular square: Karatsuba down to 64-bit schoolbook triangles; diagonal spread as ripple carry-in; measured top bits"]
-  DivLeg["Division leg: seed rails from x, P1 = y/2, fused ticks to tick 136, late batch (rails alone, then payload with parked rails), endpoint, rails walk back"]
-  MulLeg["Multiplication leg: rails-only forward walk, endpoint payload, mirrored late batch and fused reverse ticks, clear P1 = P0/2"]
-  Walk["Leapfrog walk: two odd signed rails; per tick two forced add-halves, a deep or flat choice add-halve, then 0 to 3 extra halvings; 151 ticks, the last choice-only"]
-  Tape["History tape: one 5-bit letter per tick; letters allocated only when each choice needs them"]
-  Fused["Fused one-fold payload cell at room 60 or more: 17h = L + 17E - 16Nm mod 2^k; one 76-bit fold gives W* = W0 + jM - eps 2^k (F-1); E erased from a declared window; rotation by four"]
-  Narrow["Narrow-room cells: one-place rotations instead of controlled shifts; a doubling form gives the multiply a room-24 cell; decreasing-bank folds"]
-  Cleanup["Cleanup: rails parked at plus or minus 1 clear one payload against the other; reversing the walk consumes the tape and restores x; choice ancillas uncomputed by X measurement with phase repair; every phase returns scratch to zero"]
+  Phases["Affine P plus Q in eight in-place phases: x -= Qx, y -= Qy, y /= x gives lambda, x += 3Qx, x -= lambda squared, y *= x, y -= Qy, x = Qx - x; the x steps fused into the walk seed and unseed"]
+  DivLeg["Division leg: y /= x by the forward Leapfrog walk, 156 ticks, payloads in place"]
+  Square["Chained-row square in the 2^128 frame: x -= lambda squared; every carry chain runs to the full accumulator; wrap witness and REDC frame slide"]
+  MulLeg["Multiplication leg: y *= x by the reversed walk; the tape is consumed"]
+  Walk["Leapfrog walk: two odd signed rails; per tick two forced add-halves T = (T +- B)/2, one deep-or-flat choice add-halve from the low bits and a top-bit compare, 0-3 extra halvings by a barrel"]
+  Tape["Tape: one 5-bit letter per tick; tick 0's letter re-derived at the end"]
+  Cells["Payload cells: P_i = mu R_i mod p follows the letters; one-fold and merged add-halve cells, chunked modular adds with windowed boundary carries, flags and folds"]
+  Cleanup["Cleanup: payloads coincide at the division endpoint and one is cleared; the reversed walk consumes the tape and restores the denominator; every phase returns scratch to zero"]
+  Post["Exact post-passes: redundant CCX removal on product, affine, quadratic and truth supports, measurement absorption, conditional and classical-factor passes; 96-gate X identity tail"]
 
   Algorithm --> Phases
-  Phases --> Coord
   Phases --> DivLeg
   Phases --> Square
   Phases --> MulLeg
   DivLeg --> Walk
   MulLeg --> Walk
   Walk --> Tape
-  Walk --> Fused
-  Walk --> Narrow
+  Walk --> Cells
   Tape --> Cleanup
-  Fused --> Cleanup
-  Narrow --> Cleanup
-  Coord --> Cleanup
+  Cells --> Cleanup
   Square --> Cleanup
+  Cleanup --> Post
 
   %% Optimization: score and reliability decisions
-  Parent["Parent: our accepted entry 1,297 x 988,743 (descent of Gold1298); every change lowers qubits or Toffolis and keeps accuracy"]
-  Source["Generated from a Python construction source: two generations byte-identical, native records equal to the source execution"]
-  Rows["Replica-sized widths: per-tick rows = max over 400M walks + 4; per-rail widths = max + 5; checked on an independent sample of 400M or more walks"]
-  Windows["Declared windows priced from exact miss predicates: 40-bit compares, 38-bit carry prefixes, 76-bit fold, E windows"]
-  Exact["Exact cuts: forward chunk-boundary phase fixes paid at the walk-back subtract (-7.9k); bit-0 release of odd rails (-2 qubits); measured choice erase (-9.6k)"]
-  Room["Room levers: per-rail widths, just-in-time letters and narrow-room cells bring the cap to 1,286"]
+  Base["Base: spookyfrog 14, ecdsa.fail 1829986, 1,234 qubits x 755,314 Toffolis at about 19 failing shots per 9,024; walk rule, cells and formula kept"]
+  Length["Walk length: 138 to 156 ticks; no-park tail below about 1e-8 per walk"]
+  Widths["Width table: per tick the 2e-8 quantile of 110 million random walks plus 6 bits; 1 of 100 million further walks exceeds it"]
+  Cap["Qubit cap 1,360: with the wider rows and longer tape, 1,350 does not fit (room of the one-fold tick 131)"]
+  Windows["Windows: chunk-boundary compares +12, narrowed-compare table off; flag compares +12; merged folds 70; cell fold floor 72; one-fold fold +12; erase compares 40; fold guard 32"]
+  SqExact["Square: exact carry tails, wrap witness 33 top bits, correction and REDC guard 36 bits, exact assembly tail"]
+  JointOff["Multiplication joint low-fold shortcut off: its room-dependent finite low cut is replaced by the regular fold"]
+  Unbound["Bound tables off: post-pass tables, allocator states and tick loans keyed to the base gate list"]
+  Contract["Inherited contract: error only bought back, about 0.001 failure events per 9,024 shots, no error-for-score trade"]
 
-  Optimization --> Parent
-  Optimization --> Source
-  Optimization --> Rows
+  Optimization --> Base
+  Optimization --> Length
+  Optimization --> Widths
+  Optimization --> Cap
   Optimization --> Windows
-  Optimization --> Exact
-  Optimization --> Room
-  Parent --> Walk
-  Rows --> Walk
-  Windows --> Fused
-  Exact --> Walk
-  Room --> Narrow
+  Optimization --> SqExact
+  Optimization --> JointOff
+  Optimization --> Unbound
+  Optimization --> Contract
+  Base --> Walk
+  Length --> DivLeg
+  Length --> MulLeg
+  Widths --> Walk
+  Cap --> Cells
+  Windows --> Cells
+  SqExact --> Square
+  Unbound --> Post
+  JointOff --> Cells
 
   %% Metrics, depth and validation evidence
-  Metrics["Metrics: 1,286 qubits; 960,091.439 average executed CCX+CCZ, rounded 960,091; 17,572,178 emitted operations"]
-  Depth["Toffoli depth 960,091: the stream is serial, so depth equals the executed count"]
-  Score["Score 1,286 x sqrt of 960,091 x 960,091 = 1,234,677,026; previous record 1,282,399,671"]
-  Validation["102,400-shot trusted evaluation: 102,400 of 102,400 OK, 0 classical, 0 phase, 0 ancilla failures"]
-  Audit["Fresh-seed audit: 1,024,000 shots, 0 classical, 0 phase, 0 ancilla, 0 offset"]
-  Model["Modelled residual about 8.7e-8 per shot (walk 7.0e-8, windows 1.7e-8): under 1 percent chance of any failure in one 102,400-shot draw; model figure, not a measurement"]
-  Artifact["ops.bin sha256 f68ae1f9a62fa8ead50db8cbc8718700c95db65dfe3f27ab52a849bc0f2f5980; two native emissions identical"]
+  Metrics["Metrics: 1,360 qubits; 863,767.128 average executed CCX+CCZ, rounded 863,767; 13,238,393 emitted operations"]
+  Depth["Toffoli depth 863,767: the stream is serial, so depth equals the executed count"]
+  Score["Score 1,360 x sqrt of 863,767 x 863,767 = 1,174,723,120; record 1,234,687,314"]
+  Validation["102,400-shot trusted evaluation: default draw 102,400 of 102,400 OK, 0 classical, 0 phase, 0 ancilla failures; 24 independent seeded draws all 0/0/0; 25 draws, 2,560,000 shots shots clean"]
+  Model["Modelled probability of any failure in one 102,400-shot draw: about 1.2%; model figure, not a measurement"]
+  Artifact["ops.bin sha256 ddfc74d829b7e2f1e89b4865bb711a9cdf48cc51802c3d091a16580cc97aaa3a; same from two independent Linux builds"]
 
-  Cleanup --> Metrics
-  Room --> Metrics
+  Post --> Metrics
+  Cap --> Metrics
   Metrics --> Depth
   Depth --> Score
   Score --> Validation
-  Validation --> Audit
-  Rows --> Model
-  Windows --> Model
-  Audit --> Model
+  Contract --> Model
+  Validation --> Model
   Validation --> Artifact
-  Source --> Artifact
